@@ -15,11 +15,11 @@ GitHub  ←(gh)—  watcher  →  rule matcher  →  dispatcher  →  BB agent
 
 ## Install
 
-Requires BB ≥ 0.34 and an authenticated [`gh`](https://cli.github.com) on the machine
+Requires BB ≥ 0.35 and an authenticated [`gh`](https://cli.github.com) on the machine
 running the BB server.
 
 ```sh
-bb plugin install git:https://github.com/SawyerHood/bb-slop-cop.git
+bb plugin install git:https://github.com/SawyerHood/bb-slop-cop.git@main
 ```
 
 ## Quick start
