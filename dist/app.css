@@ -341,6 +341,9 @@
     .w-10 {
       width: calc(var(--spacing) * 10);
     }
+    .w-24 {
+      width: calc(var(--spacing) * 24);
+    }
     .w-\[13px\] {
       width: 13px;
     }

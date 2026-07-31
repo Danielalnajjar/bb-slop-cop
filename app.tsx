@@ -273,6 +273,103 @@ function extractPromptText(input: unknown): string {
     .trim();
 }
 
+
+/**
+ * Run a rule against one PR on demand.
+ *
+ * Deliberately two-step: it checks first and reports the rule's own verdict,
+ * and only offers an override once the reason is on screen. A one-click force
+ * would make bypassing the trust gate as cheap as an ordinary run, which
+ * defeats the point of having one.
+ */
+function RunOnPr({ rule }: { rule: RuleView }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [pr, setPr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [blocked, setBlocked] = useState<string | null>(null);
+
+  const prNumber = Number.parseInt(pr, 10);
+  const valid = Number.isFinite(prNumber) && prNumber > 0;
+
+  const run = useCallback(
+    async (force: boolean) => {
+      setBusy(true);
+      try {
+        const result = await rpc.call("dispatchNow", {
+          ruleId: rule.id,
+          prNumber,
+          force,
+        });
+        if (result.blockedReason !== null) {
+          setBlocked(result.blockedReason);
+          return;
+        }
+        setBlocked(null);
+        setPr("");
+        toast.success(
+          force
+            ? `Forced ${rule.name} on #${prNumber} — the rule would have skipped it`
+            : `Running ${rule.name} on #${prNumber}`,
+        );
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [prNumber, rpc, rule.id, rule.name],
+  );
+
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-semibold text-muted-foreground">
+          Run on a PR now
+        </span>
+        <span className="flex-1" />
+        <Input
+          value={pr}
+          onChange={(event) => {
+            setPr(event.target.value.replace(/[^0-9]/g, ""));
+            setBlocked(null);
+          }}
+          placeholder="PR #"
+          className="h-7 w-24"
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!valid || busy}
+          onClick={() => void run(false)}
+        >
+          {rule.mode === "shadow" ? "Dry run" : "Run"}
+        </Button>
+      </div>
+      {blocked !== null ? (
+        <div className="rounded-md bg-surface-attention p-2 text-xs leading-relaxed">
+          <b className="text-warning-text">This rule would skip #{prNumber}:</b>{" "}
+          {blocked}
+          <div className="mt-2 flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => void run(true)}
+            >
+              Run anyway
+            </Button>
+            <span className="text-subtle-foreground">
+              {rule.mode === "live"
+                ? "Posts publicly, and the agent runs this PR's code."
+                : "The agent still checks out and runs this PR's code."}
+            </span>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function RuleEditor({
   rule,
   onDone,
@@ -514,6 +611,8 @@ function RuleEditor({
           onSubmit={handleSubmit}
         />
       </div>
+
+      {rule !== null ? <RunOnPr rule={rule} /> : null}
 
       <div className="flex items-center gap-2 border-t border-border pt-3">
         <div className="flex gap-1.5">

@@ -133,8 +133,16 @@ export const rpcContract = defineRpcContract({
     }),
   },
   dispatchNow: {
-    input: z.object({ ruleId: z.string(), prNumber: z.number().int() }),
-    output: z.object({ runId: z.string(), threadId: z.string().nullable() }),
+    input: z.object({
+      ruleId: z.string(),
+      prNumber: z.number().int(),
+      force: z.boolean().optional(),
+    }),
+    output: z.object({
+      runId: z.string().nullable(),
+      threadId: z.string().nullable(),
+      blockedReason: z.string().nullable(),
+    }),
   },
   status: {
     input: z.null(),
@@ -226,9 +234,14 @@ export default async function plugin(bb: BbPluginApi) {
   async function dispatch(
     rule: Rule,
     pullRequest: PullRequest,
+    options: { forcedReason?: string | null } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
     const runId = newId("run");
     const now = Date.now();
+    // A forced run bypassed a gate the rule would otherwise have honoured, so
+    // record why on the run itself — otherwise the activity feed shows a
+    // perfectly ordinary review and the override is invisible in hindsight.
+    const forcedReason = options.forcedReason ?? null;
     store.insertRun({
       id: runId,
       ruleId: rule.id,
@@ -240,7 +253,8 @@ export default async function plugin(bb: BbPluginApi) {
       headSha: pullRequest.headRefOid,
       status: "dispatched",
       mode: rule.mode,
-      detail: null,
+      detail:
+        forcedReason === null ? null : `forced past the gate — ${forcedReason}`,
       threadId: null,
       commentCount: 0,
       startedAt: now,
@@ -608,11 +622,18 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
 
-    dispatchNow: async ({ ruleId, prNumber }) => {
+    dispatchNow: async ({ ruleId, prNumber, force }) => {
       const rule = resolveRule(ruleId);
-      const pullRequest = await gh.getPullRequest(rule.repo, prNumber);
-      await hydrateFiles([rule], rule.repo, pullRequest);
-      return dispatch(rule, pullRequest);
+      const { pullRequest, result } = await checkPr(rule, prNumber);
+      if (!result.matched && force !== true) {
+        // Refuse rather than silently reviewing: the caller gets the reason and
+        // can re-issue with force once a human has judged it.
+        return { runId: null, threadId: null, blockedReason: result.reason };
+      }
+      const dispatched = await dispatch(rule, pullRequest, {
+        forcedReason: result.matched ? null : result.reason,
+      });
+      return { ...dispatched, blockedReason: null };
     },
 
     status: async () => {
@@ -1002,7 +1023,9 @@ export default async function plugin(bb: BbPluginApi) {
               `'${rule.name}' does not match PR #${prNumber}: ${result.reason}\nRe-run with --force to dispatch anyway.`,
             );
           }
-          const dispatched = await dispatch(rule, pullRequest);
+          const dispatched = await dispatch(rule, pullRequest, {
+            forcedReason: result.matched ? null : result.reason,
+          });
           return ok(
             json
               ? JSON.stringify(dispatched, null, 2)

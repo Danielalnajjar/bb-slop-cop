@@ -15566,8 +15566,16 @@ var rpcContract = defineRpcContract({
     })
   },
   dispatchNow: {
-    input: external_exports.object({ ruleId: external_exports.string(), prNumber: external_exports.number().int() }),
-    output: external_exports.object({ runId: external_exports.string(), threadId: external_exports.string().nullable() })
+    input: external_exports.object({
+      ruleId: external_exports.string(),
+      prNumber: external_exports.number().int(),
+      force: external_exports.boolean().optional()
+    }),
+    output: external_exports.object({
+      runId: external_exports.string().nullable(),
+      threadId: external_exports.string().nullable(),
+      blockedReason: external_exports.string().nullable()
+    })
   },
   status: {
     input: external_exports.null(),
@@ -15631,9 +15639,10 @@ async function plugin(bb) {
       );
     }
   }
-  async function dispatch(rule, pullRequest) {
+  async function dispatch(rule, pullRequest, options = {}) {
     const runId = newId("run");
     const now = Date.now();
+    const forcedReason = options.forcedReason ?? null;
     store.insertRun({
       id: runId,
       ruleId: rule.id,
@@ -15645,7 +15654,7 @@ async function plugin(bb) {
       headSha: pullRequest.headRefOid,
       status: "dispatched",
       mode: rule.mode,
-      detail: null,
+      detail: forcedReason === null ? null : `forced past the gate \u2014 ${forcedReason}`,
       threadId: null,
       commentCount: 0,
       startedAt: now,
@@ -15921,11 +15930,16 @@ async function plugin(bb) {
         association: String(pullRequest.authorAssociation)
       };
     },
-    dispatchNow: async ({ ruleId, prNumber }) => {
+    dispatchNow: async ({ ruleId, prNumber, force }) => {
       const rule = resolveRule(ruleId);
-      const pullRequest = await gh.getPullRequest(rule.repo, prNumber);
-      await hydrateFiles([rule], rule.repo, pullRequest);
-      return dispatch(rule, pullRequest);
+      const { pullRequest, result } = await checkPr(rule, prNumber);
+      if (!result.matched && force !== true) {
+        return { runId: null, threadId: null, blockedReason: result.reason };
+      }
+      const dispatched = await dispatch(rule, pullRequest, {
+        forcedReason: result.matched ? null : result.reason
+      });
+      return { ...dispatched, blockedReason: null };
     },
     status: async () => {
       const values = await readSettings();
@@ -16230,7 +16244,9 @@ ${bodies || "\n(no comments recorded)"}`);
 Re-run with --force to dispatch anyway.`
             );
           }
-          const dispatched = await dispatch(rule, pullRequest);
+          const dispatched = await dispatch(rule, pullRequest, {
+            forcedReason: result.matched ? null : result.reason
+          });
           return ok(
             json2 ? JSON.stringify(dispatched, null, 2) : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`
           );
