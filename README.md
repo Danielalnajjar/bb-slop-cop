@@ -1,0 +1,152 @@
+# 🚨 SlopCop
+
+A [BB](https://github.com/ymichael/bb) plugin that automatically reviews pull requests.
+
+Define **rules** — a name, a prompt, a repo, and some conditions — and SlopCop watches
+GitHub for PRs that match, dispatches a BB agent to review them, and posts the review
+with the `gh` CLI. Rules are configurable from a side panel or from the CLI, so other
+BB agents can set them up for you.
+
+```
+GitHub  ←(gh)—  watcher  →  rule matcher  →  dispatcher  →  BB agent
+                   │                                          │
+             plugin SQLite  ←—— verified runs ——  gh pr review / gh pr comment
+```
+
+## Install
+
+Requires BB ≥ 0.34 and an authenticated [`gh`](https://cli.github.com) on the machine
+running the BB server.
+
+```sh
+bb plugin install git:https://github.com/SawyerHood/bb-slop-cop.git
+```
+
+## Quick start
+
+New rules start in **shadow mode**: they run the full review and store the body, but
+post nothing. Read the result, then promote to live.
+
+```sh
+bb slopcop rules add \
+  --name security-sweep \
+  --repo owner/repo \
+  --project my-project \
+  --paths "src/auth/**,src/payments/**" \
+  --prompt "Review the diff for auth and payment issues. Post findings with gh pr review --comment."
+
+bb slopcop check security-sweep 482   # would it match? if not, exactly why not
+bb slopcop dispatch security-sweep 482
+bb slopcop show                       # the review it would have posted
+bb slopcop rules edit security-sweep --live
+```
+
+## Design notes
+
+Three decisions do most of the work.
+
+### The trust gate stops it running strangers' code
+
+Reviewing a PR means the agent runs `gh pr checkout` on that branch and reads the diff
+into its own prompt. For an untrusted PR that is arbitrary code execution plus a prompt
+injection surface, so rules default to **write access only**.
+
+GitHub's `authorAssociation` is the signal, and its naming is a trap: **`CONTRIBUTOR`
+means "has had a commit merged before", not write access.** A literal "contributors
+only" filter still runs on a drive-by who landed one typo fix a year ago. Only
+`OWNER` / `MEMBER` / `COLLABORATOR` imply write access, so only those are trusted by
+default. `--trust past_contributors` and `--trust anyone` exist and are named honestly.
+
+Note that BB's permission modes are `full`, `auto`, and `accept-edits` — **none is
+read-only**. There is no "run the agent sandboxed" option, so the trust gate is the
+real protection rather than one layer of several.
+
+### Comments are identifiable, and verified against GitHub
+
+Every posted body carries a visible header so humans know it is a bot and which rule
+wrote it, plus a hidden marker so SlopCop can find its own comments later:
+
+```markdown
+🚨 **SLOP COP** 🚨 · `security-sweep`
+
+Three findings, one blocking…
+
+<!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=summary -->
+```
+
+When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
+polls GitHub's three separate comment surfaces (issue comments, inline review comments,
+review bodies) and matches on the marker. A run that claims success but posted nothing
+is reported as `no_comment`, not as a success. If the header is present but the marker
+is missing, the comment is still attributed — and flagged as prompt drift.
+
+### Shadow mode makes a prompt change safe to test
+
+A rule's prompt is the whole product, and prompts drift. Shadow mode runs the real
+review against a real PR and stores the exact body it would have posted, so a prompt
+change can be dry-run before it is ever visible to your team.
+
+## Commands
+
+| | |
+|---|---|
+| `bb slopcop rules` | List rules |
+| `bb slopcop rules add\|edit <rule>` | Create or update (see flags below) |
+| `bb slopcop rules enable\|disable\|rm <rule>` | Toggle or delete |
+| `bb slopcop check <rule> <pr>` | Dry run — match, or the exact reason it did not |
+| `bb slopcop dispatch <rule> <pr> [--force]` | Run now |
+| `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
+| `bb slopcop show [run-id]` | A run and the review body it produced |
+| `bb slopcop verify [run-id]` | Re-check a live run's comments against GitHub |
+| `bb slopcop status` | gh auth, watched repos, poll interval |
+
+Rule flags: `--name --repo --project --provider --model --reasoning --permission
+--prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger
+--live --shadow --disabled --hidden --visible`. Add `--json` to any command.
+
+`check` answers "why didn't SlopCop review my PR?" with the single decisive reason.
+
+## Rules
+
+| Field | Meaning |
+|---|---|
+| `repo` | One `owner/repo` per rule |
+| `triggers` | `ready_for_review`, `new_commits` |
+| `conditions` | Changed paths, base branch, labels, author, title regex, diff size — ANDed |
+| `authorTrust` | `write_access` (default), `past_contributors`, `anyone` |
+| `mode` | `shadow` (default) or `live` |
+| `dedupe` | `once_per_pr` (default) or `once_per_head_sha` |
+| `visibility` | `visible` (default) or `hidden` review threads |
+
+### Run statuses
+
+`shadowed` · `commented` · `commented_partial` / `commented_unmarked` /
+`commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
+without posting) · `skipped` (matched nothing, e.g. blocked by the trust gate) ·
+`failed`.
+
+## Development
+
+```sh
+npm install
+npx vitest run     # matcher, markers, triggers, verification
+npx tsc --noEmit
+bb plugin install .
+bb plugin dev      # rebuild + reload on save
+```
+
+The interesting logic is pure and unit-tested: `lib/matcher.ts` (globs, trust gate,
+trigger edges), `lib/marker.ts` (header/marker attribution), `lib/verify.ts` (the two
+verification modes). `server.ts` is mostly wiring.
+
+Two things worth knowing before changing storage or GitHub reads:
+
+- **Migrations are keyed by statement index.** `MIGRATIONS` in `lib/db.ts` is strictly
+  append-only — an inserted statement inherits an already-applied index and is silently
+  skipped.
+- **`gh pr list --json` has no `authorAssociation` field.** It only exists in the REST
+  API, which is why all PR reads go through `gh api`.
+
+## License
+
+MIT

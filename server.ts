@@ -1,0 +1,1064 @@
+// SlopCop — configurable PR review rules that dispatch BB agents.
+//
+// Flow: a watcher polls each watched repo with `gh`, detects the
+// draft -> ready-for-review edge, matches PRs against enabled rules, and spawns
+// a review thread per match. When that thread goes idle, SlopCop verifies the
+// outcome against GitHub itself rather than trusting the agent's transcript.
+import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { z } from "zod";
+import { createGhClient, type GhClient } from "./lib/gh";
+import { createStore, MIGRATIONS, type Store } from "./lib/db";
+import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import {
+  computeTriggers,
+  describeTrust,
+  evaluateRule,
+  isDangerousCombination,
+} from "./lib/matcher";
+import { verifyLive, verifyShadow } from "./lib/verify";
+import {
+  authorTrustSchema,
+  conditionSchema,
+  dedupeSchema,
+  reviewStrategySchema,
+  ruleModeSchema,
+  threadRequestSchema,
+  triggerSchema,
+  visibilitySchema,
+  type PullRequest,
+  type Rule,
+  type Trigger,
+} from "./lib/types";
+
+const RUNS_CHANNEL = "runs-changed";
+
+const ruleInputSchema = z.object({
+  name: z.string().min(1),
+  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+  enabled: z.boolean().default(true),
+  mode: ruleModeSchema.default("shadow"),
+  triggers: z.array(triggerSchema).min(1).default(["ready_for_review"]),
+  conditions: z.array(conditionSchema).default([]),
+  authorTrust: authorTrustSchema.default("write_access"),
+  prompt: z.string().default(""),
+  request: threadRequestSchema.nullable().default(null),
+  dedupe: dedupeSchema.default("once_per_pr"),
+  reviewStrategy: reviewStrategySchema.default("update"),
+  visibility: visibilitySchema.default("visible"),
+});
+
+const ruleOutputSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  repo: z.string(),
+  enabled: z.boolean(),
+  mode: z.string(),
+  triggers: z.array(z.string()),
+  conditions: z.array(z.unknown()),
+  authorTrust: z.string(),
+  prompt: z.string(),
+  request: z.unknown().nullable(),
+  dedupe: z.string(),
+  reviewStrategy: z.string(),
+  visibility: z.string(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  dangerous: z.boolean(),
+});
+
+const runOutputSchema = z.object({
+  id: z.string(),
+  ruleId: z.string(),
+  ruleName: z.string(),
+  repo: z.string(),
+  prNumber: z.number(),
+  prTitle: z.string(),
+  prAuthor: z.string(),
+  headSha: z.string(),
+  status: z.string(),
+  mode: z.string(),
+  detail: z.string().nullable(),
+  threadId: z.string().nullable(),
+  commentCount: z.number(),
+  startedAt: z.number(),
+  finishedAt: z.number().nullable(),
+});
+
+const commentOutputSchema = z.object({
+  githubId: z.string().nullable(),
+  kind: z.string(),
+  path: z.string().nullable(),
+  line: z.number().nullable(),
+  url: z.string().nullable(),
+  bodyExcerpt: z.string(),
+  attribution: z.string(),
+});
+
+export const rpcContract = defineRpcContract({
+  listRules: {
+    input: z.null(),
+    output: z.object({ rules: z.array(ruleOutputSchema) }),
+  },
+  saveRule: {
+    input: z.object({ id: z.string().nullable(), rule: ruleInputSchema }),
+    output: z.object({ rule: ruleOutputSchema }),
+  },
+  deleteRule: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  setRuleEnabled: {
+    input: z.object({ id: z.string(), enabled: z.boolean() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  listRuns: {
+    input: z.object({
+      ruleId: z.string().nullable().optional(),
+      limit: z.number().int().positive().max(200).optional(),
+    }),
+    output: z.object({ runs: z.array(runOutputSchema) }),
+  },
+  getRunComments: {
+    input: z.object({ runId: z.string() }),
+    output: z.object({ comments: z.array(commentOutputSchema) }),
+  },
+  checkPr: {
+    input: z.object({ ruleId: z.string(), prNumber: z.number().int() }),
+    output: z.object({
+      matched: z.boolean(),
+      reason: z.string().nullable(),
+      prTitle: z.string(),
+      prAuthor: z.string(),
+      association: z.string(),
+    }),
+  },
+  dispatchNow: {
+    input: z.object({ ruleId: z.string(), prNumber: z.number().int() }),
+    output: z.object({ runId: z.string(), threadId: z.string().nullable() }),
+  },
+  status: {
+    input: z.null(),
+    output: z.object({
+      ghAvailable: z.boolean(),
+      ghLogin: z.string().nullable(),
+      watchedRepos: z.array(z.string()),
+      pollSeconds: z.number(),
+    }),
+  },
+});
+
+function newId(prefix: string): string {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+}
+
+function toRuleOutput(rule: Rule) {
+  return { ...rule, dangerous: isDangerousCombination(rule) };
+}
+
+export default async function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    pollSeconds: {
+      type: "string",
+      label: "Poll interval (seconds)",
+      default: "60",
+    },
+    maxConcurrentReviews: {
+      type: "string",
+      label: "Max concurrent review threads",
+      default: "3",
+    },
+    ghPath: { type: "string", label: "Path to the gh binary", default: "gh" },
+  });
+
+  const db = bb.storage.database();
+  bb.storage.migrate(db, MIGRATIONS);
+  const store: Store = createStore(db as never);
+
+  let gh: GhClient = createGhClient("gh");
+  let ghLogin: string | null = null;
+  let inFlight = 0;
+
+  const readSettings = async () => {
+    const values = await settings.get();
+    const poll = Number.parseInt(values.pollSeconds, 10);
+    const concurrency = Number.parseInt(values.maxConcurrentReviews, 10);
+    return {
+      pollSeconds: Number.isFinite(poll) && poll >= 15 ? poll : 60,
+      maxConcurrent:
+        Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 3,
+      ghPath: values.ghPath.trim() || "gh",
+    };
+  };
+
+  const announce = () => {
+    bb.realtime.publish(RUNS_CHANNEL, { at: Date.now() });
+  };
+
+  /**
+   * REST does not return a PR's changed files inline, so they are fetched only
+   * when a rule actually filters on paths — which keeps the common poll pass to
+   * a single API call per repo.
+   */
+  async function hydrateFiles(
+    rules: Rule[],
+    repo: string,
+    pullRequest: PullRequest,
+  ): Promise<void> {
+    const needsFiles = rules.some((rule) =>
+      rule.conditions.some((condition) => condition.kind === "paths"),
+    );
+    if (!needsFiles || pullRequest.files.length > 0) return;
+    try {
+      pullRequest.files = await gh.listFiles(repo, pullRequest.number);
+    } catch (error) {
+      bb.log.warn(
+        `could not list files for ${repo}#${pullRequest.number}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Creates the run row and spawns the review thread. Returns the run id so a
+   * manual dispatch can report it even when the spawn itself fails.
+   */
+  async function dispatch(
+    rule: Rule,
+    pullRequest: PullRequest,
+  ): Promise<{ runId: string; threadId: string | null }> {
+    const runId = newId("run");
+    const now = Date.now();
+    store.insertRun({
+      id: runId,
+      ruleId: rule.id,
+      ruleName: rule.name,
+      repo: rule.repo,
+      prNumber: pullRequest.number,
+      prTitle: pullRequest.title,
+      prAuthor: pullRequest.author?.login ?? "",
+      headSha: pullRequest.headRefOid,
+      status: "dispatched",
+      mode: rule.mode,
+      detail: null,
+      threadId: null,
+      commentCount: 0,
+      startedAt: now,
+      finishedAt: null,
+    });
+    announce();
+
+    if (rule.request === null) {
+      store.updateRun(runId, {
+        status: "failed",
+        detail:
+          "rule has no agent configuration — open it in the SlopCop panel and save it once",
+        finishedAt: Date.now(),
+      });
+      announce();
+      return { runId, threadId: null };
+    }
+
+    const context = { rule, pullRequest, runId };
+    try {
+      // `spawn` takes prompt XOR input. The composer stores its draft under
+      // `input`, so it must be dropped here — the prompt SlopCop builds from
+      // the rule + PR context is what actually runs.
+      const { input: _draftInput, ...execution } = rule.request as Record<
+        string,
+        unknown
+      >;
+      // `executionInputSources` tells the server which fields the caller chose
+      // explicitly; anything not marked explicit falls back to the project's
+      // remembered default. The composer omits `providerId` there, so replaying
+      // its request verbatim silently dropped our provider and resolved the
+      // project's instead — which then rejected the (valid) model as unknown.
+      // Anything we actually send is by definition an explicit choice.
+      const sources: Record<string, string> = {
+        ...((execution.executionInputSources as Record<string, string>) ?? {}),
+      };
+      for (const field of [
+        "providerId",
+        "model",
+        "reasoningLevel",
+        "serviceTier",
+        "permissionMode",
+      ]) {
+        if (execution[field] !== undefined) sources[field] = "explicit";
+      }
+      execution.executionInputSources = sources;
+      const thread = await bb.sdk.threads.spawn({
+        ...execution,
+        prompt: buildPrompt(context),
+        title: buildThreadTitle(context),
+        visibility: rule.visibility,
+      } as never);
+      const threadId = (thread as { id: string }).id;
+      store.updateRun(runId, { status: "reviewing", threadId });
+      inFlight += 1;
+      announce();
+      bb.log.info(
+        `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
+      );
+      return { runId, threadId };
+    } catch (error) {
+      store.updateRun(runId, {
+        status: "failed",
+        detail: error instanceof Error ? error.message : String(error),
+        finishedAt: Date.now(),
+      });
+      announce();
+      return { runId, threadId: null };
+    }
+  }
+
+  /** Records a rule that matched nothing, so "why no review?" is answerable. */
+  function recordSkip(
+    rule: Rule,
+    pullRequest: PullRequest,
+    reason: string,
+  ): void {
+    store.insertRun({
+      id: newId("run"),
+      ruleId: rule.id,
+      ruleName: rule.name,
+      repo: rule.repo,
+      prNumber: pullRequest.number,
+      prTitle: pullRequest.title,
+      prAuthor: pullRequest.author?.login ?? "",
+      headSha: pullRequest.headRefOid,
+      status: "skipped",
+      mode: rule.mode,
+      detail: reason,
+      threadId: null,
+      commentCount: 0,
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+    });
+  }
+
+  /**
+   * One polling pass. Detects the ready-for-review edge per PR, then evaluates
+   * every rule watching that repo.
+   */
+  async function poll(maxConcurrent: number): Promise<void> {
+    const rules = store.listRules().filter((rule) => rule.enabled);
+    const repos = [...new Set(rules.map((rule) => rule.repo))];
+
+    for (const repo of repos) {
+      let pullRequests: PullRequest[];
+      try {
+        pullRequests = await gh.listOpenPullRequests(repo);
+      } catch (error) {
+        bb.log.warn(
+          `poll failed for ${repo}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        continue;
+      }
+
+      // First pass over a repo only records what is already open, so enabling a
+      // rule never reviews the backlog. Every later unseen PR is genuinely new.
+      const repoBootstrapped = store.isBootstrapped(repo);
+      if (!repoBootstrapped) {
+        bb.log.info(
+          `bootstrapping ${repo}: recording ${pullRequests.length} open PR(s) as backlog`,
+        );
+      }
+
+      for (const pullRequest of pullRequests) {
+        const triggers: Trigger[] = computeTriggers({
+          seen: store.getSeen(repo, pullRequest.number),
+          isDraft: pullRequest.isDraft,
+          headSha: pullRequest.headRefOid,
+          repoBootstrapped,
+        });
+        store.markSeen(
+          repo,
+          pullRequest.number,
+          pullRequest.headRefOid,
+          pullRequest.isDraft,
+          Date.now(),
+        );
+        if (triggers.length === 0) continue;
+
+        const repoRules = rules.filter((candidate) => candidate.repo === repo);
+        await hydrateFiles(repoRules, repo, pullRequest);
+
+        for (const rule of repoRules) {
+          for (const trigger of triggers) {
+            const result = evaluateRule(rule, pullRequest, trigger);
+            if (!result.matched) {
+              if (result.blockedByTrust) {
+                recordSkip(rule, pullRequest, result.reason);
+                announce();
+              }
+              continue;
+            }
+            const alreadyRan = store.hasRunFor(
+              rule.id,
+              repo,
+              pullRequest.number,
+              rule.dedupe === "once_per_head_sha"
+                ? pullRequest.headRefOid
+                : null,
+            );
+            if (alreadyRan) continue;
+            if (inFlight >= maxConcurrent) {
+              bb.log.info(
+                `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+              );
+              continue;
+            }
+            await dispatch(rule, pullRequest);
+            break;
+          }
+        }
+      }
+
+      store.markBootstrapped(repo, Date.now());
+    }
+  }
+
+  // --- verification ------------------------------------------------------
+
+  async function finishRun(
+    threadId: string,
+    finalMessage: string | null,
+    failure: string | null,
+  ): Promise<void> {
+    const run = store.findRunByThread(threadId);
+    if (run === null || run.finishedAt !== null) return;
+    inFlight = Math.max(0, inFlight - 1);
+
+    if (failure !== null) {
+      store.updateRun(run.id, {
+        status: "failed",
+        detail: failure,
+        finishedAt: Date.now(),
+      });
+      announce();
+      return;
+    }
+
+    const runVerify = () =>
+      verifyLive({
+        gh,
+        repo: run.repo,
+        prNumber: run.prNumber,
+        runId: run.id,
+        startedAt: run.startedAt,
+        authenticatedLogin: ghLogin,
+      });
+
+    const result =
+      run.mode === "shadow"
+        ? verifyShadow({ runId: run.id, finalMessage })
+        : await (async () => {
+            // GitHub's list endpoints can lag a just-submitted review, so a
+            // bare no_comment gets one retry before it is believed.
+            const first = await runVerify();
+            if (first.status !== "no_comment") return first;
+            await new Promise((resolve) => setTimeout(resolve, 4_000));
+            return runVerify();
+          })();
+
+    store.replaceComments(run.id, result.comments);
+    store.updateRun(run.id, {
+      status: result.status,
+      detail: result.detail,
+      commentCount: result.comments.length,
+      finishedAt: Date.now(),
+    });
+    announce();
+    bb.log.info(
+      `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
+    );
+  }
+
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    void finishRun(thread.id, lastAssistantText, null).catch(
+      (error: unknown) => {
+        bb.log.error(
+          `verification failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    );
+  });
+
+  /**
+   * `thread.failed`'s `error` is only the latest system/error message, so a
+   * provider-level rejection (bad model, auth, cold-start) arrives as null and
+   * the run would record a useless "it failed". Recover the real message from
+   * the event log, which is where provider/error actually lands.
+   */
+  async function describeThreadFailure(
+    threadId: string,
+    reported: string | null,
+  ): Promise<string> {
+    if (reported !== null && reported.trim().length > 0) return reported;
+    try {
+      const result = (await bb.sdk.threads.events.list({
+        threadId,
+      } as never)) as { events?: unknown[] };
+      const events = Array.isArray(result.events) ? result.events : [];
+      for (const raw of [...events].reverse()) {
+        const event = raw as { type?: unknown; message?: unknown; error?: unknown };
+        const type = typeof event.type === "string" ? event.type : "";
+        if (!type.includes("error")) continue;
+        const message =
+          typeof event.message === "string"
+            ? event.message
+            : typeof event.error === "string"
+              ? event.error
+              : JSON.stringify(event).slice(0, 400);
+        if (message.length > 0) return `${type}: ${message}`;
+      }
+    } catch (error) {
+      bb.log.warn(
+        `could not read failure detail for ${threadId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return "the review thread failed (no error detail recorded — open the thread)";
+  }
+
+  bb.events.on("thread.failed", ({ thread, error }) => {
+    void describeThreadFailure(thread.id, error).then((detail) =>
+      finishRun(thread.id, null, detail),
+    );
+  });
+
+  // --- shared helpers for rpc + cli ---------------------------------------
+
+  function resolveRule(idOrName: string): Rule {
+    const rule = store.getRule(idOrName) ?? store.findRuleByName(idOrName);
+    if (rule === null) throw new Error(`no rule named '${idOrName}'`);
+    return rule;
+  }
+
+  async function checkPr(rule: Rule, prNumber: number) {
+    const pullRequest = await gh.getPullRequest(rule.repo, prNumber);
+    await hydrateFiles([rule], rule.repo, pullRequest);
+    const result = evaluateRule(rule, pullRequest, "manual");
+    return { pullRequest, result };
+  }
+
+  function saveRule(
+    id: string | null,
+    input: z.infer<typeof ruleInputSchema>,
+  ): Rule {
+    const now = Date.now();
+    const existing = id === null ? null : store.getRule(id);
+    const rule: Rule = {
+      id: existing?.id ?? newId("rule"),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      ...input,
+    };
+    store.upsertRule(rule);
+    if (isDangerousCombination(rule)) {
+      bb.log.warn(
+        `rule '${rule.name}' reviews PRs from ANY author with a non-restricted permission mode — untrusted code will run with full access`,
+      );
+    }
+    return rule;
+  }
+
+  // --- rpc -----------------------------------------------------------------
+
+  bb.rpc.register(rpcContract, {
+    listRules: () => ({ rules: store.listRules().map(toRuleOutput) }),
+
+    saveRule: ({ id, rule }) => ({ rule: toRuleOutput(saveRule(id, rule)) }),
+
+    deleteRule: ({ id }) => {
+      store.deleteRule(id);
+      announce();
+      return { ok: true };
+    },
+
+    setRuleEnabled: ({ id, enabled }) => {
+      const rule = store.getRule(id);
+      if (rule === null) throw new Error("rule not found");
+      store.upsertRule({ ...rule, enabled, updatedAt: Date.now() });
+      announce();
+      return { ok: true };
+    },
+
+    listRuns: ({ ruleId, limit }) => ({
+      runs: store.listRuns({ ruleId: ruleId ?? undefined, limit }),
+    }),
+
+    getRunComments: ({ runId }) => ({
+      comments: store
+        .listComments(runId)
+        .map(({ runId: _runId, ...rest }) => rest),
+    }),
+
+    checkPr: async ({ ruleId, prNumber }) => {
+      const rule = resolveRule(ruleId);
+      const { pullRequest, result } = await checkPr(rule, prNumber);
+      return {
+        matched: result.matched,
+        reason: result.matched ? null : result.reason,
+        prTitle: pullRequest.title,
+        prAuthor: pullRequest.author?.login ?? "",
+        association: String(pullRequest.authorAssociation),
+      };
+    },
+
+    dispatchNow: async ({ ruleId, prNumber }) => {
+      const rule = resolveRule(ruleId);
+      const pullRequest = await gh.getPullRequest(rule.repo, prNumber);
+      await hydrateFiles([rule], rule.repo, pullRequest);
+      return dispatch(rule, pullRequest);
+    },
+
+    status: async () => {
+      const values = await readSettings();
+      return {
+        ghAvailable: ghLogin !== null,
+        ghLogin,
+        watchedRepos: [
+          ...new Set(
+            store
+              .listRules()
+              .filter((rule) => rule.enabled)
+              .map((rule) => rule.repo),
+          ),
+        ],
+        pollSeconds: values.pollSeconds,
+      };
+    },
+  });
+
+  // --- cli -----------------------------------------------------------------
+
+  bb.cli.register({
+    name: "slopcop",
+    summary: "Configure automated PR review rules",
+    commands: [
+      {
+        name: "rules",
+        summary: "List rules",
+        usage: "bb slopcop rules [--json]",
+      },
+      {
+        name: "rules-add",
+        summary: "Create a rule",
+        usage:
+          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,…>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--live] [--hidden]",
+      },
+      {
+        name: "rules-edit",
+        summary: "Update a rule",
+        usage: "bb slopcop rules edit <id|name> [same flags as add]",
+      },
+      {
+        name: "rules-toggle",
+        summary: "Toggle or delete a rule",
+        usage: "bb slopcop rules enable <id|name>",
+      },
+      {
+        name: "runs",
+        summary: "Recent review runs",
+        usage: "bb slopcop runs [--rule <id|name>] [--limit N] [--json]",
+      },
+      {
+        name: "check",
+        summary: "Dry-run a rule against a PR and explain the outcome",
+        usage: "bb slopcop check <id|name> <pr-number>",
+      },
+      {
+        name: "dispatch",
+        summary: "Run a rule against a PR now",
+        usage: "bb slopcop dispatch <id|name> <pr-number> [--force]",
+      },
+      {
+        name: "verify",
+        summary: "Re-check a live run's comments against GitHub",
+        usage: "bb slopcop verify [run-id] [--json]",
+      },
+      {
+        name: "show",
+        summary: "Show a run and the review body it produced",
+        usage: "bb slopcop show [run-id] [--json]",
+      },
+      {
+        name: "status",
+        summary: "Show gh auth and watched repos",
+        usage: "bb slopcop status",
+      },
+    ],
+    async run(argv) {
+      const flag = (name: string): string | undefined => {
+        const index = argv.indexOf(`--${name}`);
+        return index >= 0 ? argv[index + 1] : undefined;
+      };
+      const has = (name: string) => argv.includes(`--${name}`);
+      const json = has("json");
+      const ok = (stdout: string) => ({ exitCode: 0, stdout });
+      const fail = (stderr: string) => ({ exitCode: 1, stderr });
+
+      try {
+        const [command, rawSub] = argv;
+        // A leading flag is not a subcommand: `rules --json` must list, not
+        // fall through to the usage error.
+        const sub =
+          rawSub !== undefined && rawSub.startsWith("--") ? undefined : rawSub;
+
+        if (command === "status") {
+          const values = await readSettings();
+          const repos = [
+            ...new Set(
+              store
+                .listRules()
+                .filter((rule) => rule.enabled)
+                .map((rule) => rule.repo),
+            ),
+          ];
+          const payload = {
+            ghLogin,
+            ghAvailable: ghLogin !== null,
+            watchedRepos: repos,
+            pollSeconds: values.pollSeconds,
+            rules: store.listRules().length,
+          };
+          return ok(
+            json
+              ? JSON.stringify(payload, null, 2)
+              : `gh: ${ghLogin ?? "NOT AUTHENTICATED"}\nwatching: ${
+                  repos.join(", ") || "(no enabled rules)"
+                }\npolling every ${values.pollSeconds}s\n${payload.rules} rule(s)`,
+          );
+        }
+
+        if (command === "rules" && (sub === undefined || sub === "list")) {
+          const rules = store.listRules();
+          if (json) return ok(JSON.stringify(rules.map(toRuleOutput), null, 2));
+          if (rules.length === 0) return ok("No rules yet.");
+          return ok(
+            rules
+              .map((rule) => {
+                const flags = [
+                  rule.enabled ? "enabled" : "disabled",
+                  rule.mode,
+                  ...(rule.visibility === "hidden" ? ["hidden threads"] : []),
+                  describeTrust(rule.authorTrust),
+                ];
+                return `${rule.name}  ${rule.repo}  [${flags.join(" · ")}]  ${rule.id}`;
+              })
+              .join("\n"),
+          );
+        }
+
+        if (command === "rules" && (sub === "add" || sub === "edit")) {
+          const existing = sub === "edit" ? resolveRule(argv[2] ?? "") : null;
+          const list = (name: string) =>
+            flag(name)
+              ?.split(",")
+              .map((value) => value.trim())
+              .filter((value) => value.length > 0);
+
+          const conditions = existing?.conditions.slice() ?? [];
+          const paths = list("paths");
+          if (paths !== undefined) {
+            const index = conditions.findIndex((c) => c.kind === "paths");
+            const next = { kind: "paths" as const, globs: paths };
+            if (index >= 0) conditions[index] = next;
+            else conditions.push(next);
+          }
+          const base = flag("base");
+          if (base !== undefined) {
+            const index = conditions.findIndex((c) => c.kind === "base_branch");
+            const next = { kind: "base_branch" as const, globs: [base] };
+            if (index >= 0) conditions[index] = next;
+            else conditions.push(next);
+          }
+          const label = list("label");
+          if (label !== undefined) {
+            conditions.push({ kind: "has_label", labels: label });
+          }
+          const skipLabel = list("skip-label");
+          if (skipLabel !== undefined) {
+            conditions.push({ kind: "missing_label", labels: skipLabel });
+          }
+
+          const parsed = ruleInputSchema.parse({
+            name: flag("name") ?? existing?.name,
+            repo: flag("repo") ?? existing?.repo,
+            enabled: has("disabled") ? false : (existing?.enabled ?? true),
+            mode: has("live")
+              ? "live"
+              : has("shadow")
+                ? "shadow"
+                : (existing?.mode ?? "shadow"),
+            triggers: list("trigger") ??
+              existing?.triggers ?? ["ready_for_review"],
+            conditions,
+            authorTrust:
+              flag("trust") ?? existing?.authorTrust ?? "write_access",
+            prompt: flag("prompt") ?? existing?.prompt ?? "",
+            request: existing?.request ?? null,
+            dedupe: flag("dedupe") ?? existing?.dedupe ?? "once_per_pr",
+            reviewStrategy:
+              flag("strategy") ?? existing?.reviewStrategy ?? "update",
+            visibility: has("hidden")
+              ? "hidden"
+              : has("visible")
+                ? "visible"
+                : (existing?.visibility ?? "visible"),
+          });
+
+          // Agent configuration from the CLI, so another BB agent can create a
+          // dispatchable rule without opening the panel.
+          const projectFlag = flag("project");
+          let request = existing?.request ?? null;
+          if (projectFlag !== undefined || flag("model") !== undefined) {
+            const projects = await bb.sdk.projects.list();
+            const project =
+              projectFlag === undefined
+                ? null
+                : (projects.find((entry) => entry.id === projectFlag) ??
+                  projects.find((entry) => entry.name === projectFlag) ??
+                  null);
+            if (projectFlag !== undefined && project === null) {
+              return fail(
+                `no project named '${projectFlag}'. Available: ${projects
+                  .map((entry) => entry.name)
+                  .join(", ")}`,
+              );
+            }
+            const previous = (request ?? {}) as Record<string, unknown>;
+            request = {
+              ...previous,
+              projectId: project?.id ?? (previous.projectId as string),
+              providerId: flag("provider") ?? previous.providerId ?? "claude-code",
+              model: flag("model") ?? previous.model ?? "claude-opus-5",
+              reasoningLevel:
+                flag("reasoning") ?? previous.reasoningLevel ?? "high",
+              // BB's permission modes are full | auto | accept-edits — there is
+              // no read-only tier, so `auto` is the narrowest sensible default.
+              permissionMode:
+                flag("permission") ?? previous.permissionMode ?? "auto",
+              executionInputSources: previous.executionInputSources ?? {
+                providerId: "explicit",
+                model: "explicit",
+                reasoningLevel: "explicit",
+                permissionMode: "explicit",
+              },
+              environment: previous.environment ?? { type: "project-default" },
+            } as never;
+          }
+          parsed.request = request as never;
+
+          const rule = saveRule(existing?.id ?? null, parsed);
+          announce();
+          const warning = isDangerousCombination(rule)
+            ? "\nWARNING: this rule reviews PRs from ANY author without a restricted permission mode."
+            : "";
+          const unconfigured =
+            rule.request === null
+              ? "\nNote: no agent configured yet — open the rule in the SlopCop panel and save it once before it can dispatch."
+              : "";
+          return ok(
+            json
+              ? JSON.stringify(toRuleOutput(rule), null, 2)
+              : `${sub === "add" ? "Created" : "Updated"} '${rule.name}' (${rule.id}) in ${rule.mode} mode.${unconfigured}${warning}`,
+          );
+        }
+
+        if (
+          command === "rules" &&
+          (sub === "enable" || sub === "disable" || sub === "rm")
+        ) {
+          const rule = resolveRule(argv[2] ?? "");
+          if (sub === "rm") {
+            store.deleteRule(rule.id);
+            announce();
+            return ok(`Deleted '${rule.name}'.`);
+          }
+          store.upsertRule({
+            ...rule,
+            enabled: sub === "enable",
+            updatedAt: Date.now(),
+          });
+          announce();
+          return ok(
+            `${sub === "enable" ? "Enabled" : "Disabled"} '${rule.name}'.`,
+          );
+        }
+
+        if (command === "runs") {
+          const ruleFlag = flag("rule");
+          const rule = ruleFlag === undefined ? null : resolveRule(ruleFlag);
+          const limitFlag = Number.parseInt(flag("limit") ?? "20", 10);
+          const runs = store.listRuns({
+            ruleId: rule?.id,
+            limit: Number.isFinite(limitFlag) ? limitFlag : 20,
+          });
+          if (json) return ok(JSON.stringify(runs, null, 2));
+          if (runs.length === 0) return ok("No runs yet.");
+          return ok(
+            runs
+              .map(
+                (run) =>
+                  `${run.status.padEnd(24)} ${run.ruleName}  #${run.prNumber} ${run.prTitle}` +
+                  (run.commentCount > 0
+                    ? `  (${run.commentCount} comment(s))`
+                    : "") +
+                  (run.detail === null ? "" : `\n    ${run.detail}`),
+              )
+              .join("\n"),
+          );
+        }
+
+        if (command === "verify") {
+          const target = argv[1] ?? "";
+          const run =
+            (target === "" ? null : store.getRun(target)) ??
+            store.listRuns({ limit: 1 })[0];
+          if (run === undefined || run === null) return fail("no such run");
+          if (run.mode === "shadow") {
+            return fail(
+              "shadow runs post nothing, so there is nothing on GitHub to verify",
+            );
+          }
+          const result = await verifyLive({
+            gh,
+            repo: run.repo,
+            prNumber: run.prNumber,
+            runId: run.id,
+            startedAt: run.startedAt,
+            authenticatedLogin: ghLogin,
+          });
+          store.replaceComments(run.id, result.comments);
+          store.updateRun(run.id, {
+            status: result.status,
+            detail: result.detail,
+            commentCount: result.comments.length,
+          });
+          announce();
+          return ok(
+            json
+              ? JSON.stringify(result, null, 2)
+              : `${run.id}: ${result.status} (${result.comments.length} comment(s))${
+                  result.detail === null ? "" : `\n${result.detail}`
+                }`,
+          );
+        }
+
+        if (command === "show") {
+          const runId = argv[1] ?? "";
+          const run = store.getRun(runId) ?? store.listRuns({ limit: 1 })[0];
+          if (run === undefined || run === null) return fail("no such run");
+          const comments = store.listComments(run.id);
+          if (json) return ok(JSON.stringify({ run, comments }, null, 2));
+          const header =
+            `${run.ruleName} — ${run.repo}#${run.prNumber} ${run.prTitle}\n` +
+            `status: ${run.status}${run.mode === "shadow" ? " (shadow — nothing was posted)" : ""}` +
+            (run.detail === null ? "" : `\ndetail: ${run.detail}`);
+          const bodies = comments
+            .map(
+              (comment) =>
+                `\n--- ${comment.kind}${
+                  comment.path === null ? "" : ` ${comment.path}:${comment.line ?? ""}`
+                } [${comment.attribution}]${comment.url === null ? "" : ` ${comment.url}`} ---\n${comment.bodyExcerpt}`,
+            )
+            .join("\n");
+          return ok(`${header}\n${bodies || "\n(no comments recorded)"}`);
+        }
+
+        if (command === "check" || command === "dispatch") {
+          const rule = resolveRule(argv[1] ?? "");
+          const prNumber = Number.parseInt(argv[2] ?? "", 10);
+          if (!Number.isFinite(prNumber)) return fail("expected a PR number");
+
+          if (command === "check") {
+            const { pullRequest, result } = await checkPr(rule, prNumber);
+            const payload = {
+              matched: result.matched,
+              reason: result.matched ? null : result.reason,
+              pr: {
+                number: pullRequest.number,
+                title: pullRequest.title,
+                author: pullRequest.author?.login ?? "",
+                association: pullRequest.authorAssociation,
+              },
+            };
+            return ok(
+              json
+                ? JSON.stringify(payload, null, 2)
+                : result.matched
+                  ? `MATCH — '${rule.name}' would review #${prNumber} (${pullRequest.title}) in ${rule.mode} mode.`
+                  : `NO MATCH — ${result.reason}`,
+            );
+          }
+
+          const { pullRequest, result } = await checkPr(rule, prNumber);
+          if (!result.matched && !has("force")) {
+            return fail(
+              `'${rule.name}' does not match PR #${prNumber}: ${result.reason}\nRe-run with --force to dispatch anyway.`,
+            );
+          }
+          const dispatched = await dispatch(rule, pullRequest);
+          return ok(
+            json
+              ? JSON.stringify(dispatched, null, 2)
+              : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
+          );
+        }
+
+        return fail(
+          "Usage: bb slopcop <rules|runs|show|verify|check|dispatch|status> …\nRun `bb slopcop rules` to list rules.",
+        );
+      } catch (error) {
+        return fail(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  // --- watcher -------------------------------------------------------------
+
+  bb.background.service("watcher", {
+    async start(signal) {
+      const initial = await readSettings();
+      gh = createGhClient(initial.ghPath);
+      ghLogin = await gh.authenticatedLogin();
+      if (ghLogin === null) {
+        bb.status.needsConfiguration(
+          "`gh` is not authenticated on this machine. Run `gh auth login`, then reload the plugin.",
+        );
+        return;
+      }
+      bb.log.info(`gh authenticated as ${ghLogin}`);
+
+      while (!signal.aborted) {
+        const values = await readSettings();
+        try {
+          await poll(values.maxConcurrent);
+        } catch (error) {
+          bb.log.error(
+            `poll pass failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, values.pollSeconds * 1_000);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve(undefined);
+            },
+            { once: true },
+          );
+        });
+      }
+    },
+  });
+
+  bb.onDispose(() => {
+    bb.log.info("disposed");
+  });
+}
