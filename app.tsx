@@ -797,7 +797,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "slopcop",
     title: "SlopCop",
-    icon: "Siren",
+    icon: "AlertTriangle",
     path: "slopcop",
     component: SlopCopPanel,
   });

@@ -7,10 +7,10 @@
     "bbPluginSdk": "^0.4.1"
   },
   "bb": {
-    "name": "Slopcop",
-    "description": "A BB plugin.",
+    "name": "SlopCop",
+    "description": "Automated PR review rules that dispatch BB agents.",
     "branding": {
-      "icon": "Zap"
+      "icon": "./assets/icon.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx"
