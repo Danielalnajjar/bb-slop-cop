@@ -4,6 +4,11 @@
 // It is uncontrolled — there is no value/onChange and the only readout is
 // onSubmit — so its submit button IS "save rule", and each rule gets its own
 // draftKey so switching rules loads the right prompt.
+//
+// The saved execution config is restored through the composer's `default*`
+// seeding props. Before those existed, re-opening a rule showed project
+// defaults and re-saving silently overwrote the stored model, permission mode,
+// and machine — so these props are what make editing a rule non-destructive.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   definePluginApp,
@@ -281,6 +286,18 @@ function RuleEditor({
   const [trust, setTrust] = useState(rule?.authorTrust ?? "write_access");
   const [mode, setMode] = useState(rule?.mode ?? "shadow");
   const [visibility, setVisibility] = useState(rule?.visibility ?? "visible");
+
+  // The rule's stored NewThreadRequest, replayed into the composer so it opens
+  // showing what this rule actually runs with rather than project defaults.
+  const saved = (rule?.request ?? null) as {
+    projectId?: string;
+    providerId?: string;
+    model?: string;
+    reasoningLevel?: string;
+    serviceTier?: string;
+    permissionMode?: string;
+    environment?: unknown;
+  } | null;
   const [triggers, setTriggers] = useState<string[]>(
     rule?.triggers ?? ["ready_for_review"],
   );
@@ -485,6 +502,13 @@ function RuleEditor({
         <NewThreadComposer
           draftKey={`slopcop:rule:${rule?.id ?? "new"}`}
           initialPrompt={rule?.prompt ?? ""}
+          defaultProjectId={saved?.projectId}
+          defaultProviderId={saved?.providerId}
+          defaultModel={saved?.model}
+          defaultReasoningLevel={saved?.reasoningLevel as never}
+          defaultServiceTier={saved?.serviceTier as never}
+          defaultPermissionMode={saved?.permissionMode as never}
+          defaultEnvironment={saved?.environment as never}
           placeholder="Tell the agent what to look for, and how to post its review…"
           layout="document"
           onSubmit={handleSubmit}
