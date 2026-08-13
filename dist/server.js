@@ -15153,6 +15153,15 @@ function resolveThreadSectionId(configured, sections) {
   );
 }
 
+// lib/paths.ts
+import { homedir } from "node:os";
+import { join } from "node:path";
+function expandHome(path, home = homedir()) {
+  if (path === "~") return home;
+  if (!path.startsWith("~/")) return path;
+  return join(home, path.slice(2));
+}
+
 // lib/types.ts
 var AUTHOR_ASSOCIATIONS = [
   "OWNER",
@@ -15656,14 +15665,19 @@ async function plugin(bb) {
     const values = await settings.get();
     const poll2 = Number.parseInt(values.pollSeconds, 10);
     const concurrency = Number.parseInt(values.maxConcurrentReviews, 10);
+    const botGhPath = values.botGhPath.trim();
     return {
       pollSeconds: Number.isFinite(poll2) && poll2 >= 15 ? poll2 : 60,
       maxConcurrent: Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 3,
       // One switch turns on bot mode. The backend client and the agent's write
       // command must resolve to the same identity, or `verifyLive`'s
       // account-based fallback would look for comments from the wrong login.
-      ghPath: values.botGhPath.trim() || values.ghPath.trim() || "gh",
-      botGhPath: values.botGhPath.trim(),
+      //
+      // `execFile` does not expand `~`, but the agent's shell does — and the
+      // two often run on different hosts with different home directories, so
+      // an absolute path cannot serve both. Store the tilde, expand it here.
+      ghPath: expandHome(botGhPath) || values.ghPath.trim() || "gh",
+      botGhPath,
       defaultThreadSection: values.defaultThreadSection.trim()
     };
   };

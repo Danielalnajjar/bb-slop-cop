@@ -10,6 +10,7 @@ import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
 import { resolveThreadSectionId } from "./lib/sections";
+import { expandHome } from "./lib/paths";
 import {
   computeTriggers,
   describeTrust,
@@ -206,6 +207,7 @@ export default async function plugin(bb: BbPluginApi) {
     const values = await settings.get();
     const poll = Number.parseInt(values.pollSeconds, 10);
     const concurrency = Number.parseInt(values.maxConcurrentReviews, 10);
+    const botGhPath = values.botGhPath.trim();
     return {
       pollSeconds: Number.isFinite(poll) && poll >= 15 ? poll : 60,
       maxConcurrent:
@@ -213,8 +215,12 @@ export default async function plugin(bb: BbPluginApi) {
       // One switch turns on bot mode. The backend client and the agent's write
       // command must resolve to the same identity, or `verifyLive`'s
       // account-based fallback would look for comments from the wrong login.
-      ghPath: values.botGhPath.trim() || values.ghPath.trim() || "gh",
-      botGhPath: values.botGhPath.trim(),
+      //
+      // `execFile` does not expand `~`, but the agent's shell does — and the
+      // two often run on different hosts with different home directories, so
+      // an absolute path cannot serve both. Store the tilde, expand it here.
+      ghPath: expandHome(botGhPath) || values.ghPath.trim() || "gh",
+      botGhPath,
       defaultThreadSection: values.defaultThreadSection.trim(),
     };
   };

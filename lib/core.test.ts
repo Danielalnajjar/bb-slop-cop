@@ -19,6 +19,7 @@ import { verifyLive, verifyShadow } from "./verify";
 import type { GhClient, GhComment } from "./gh";
 import type { PullRequest, Rule } from "./types";
 import { resolveThreadSectionId } from "./sections";
+import { expandHome } from "./paths";
 
 function makeRule(overrides: Partial<Rule> = {}): Rule {
   return {
@@ -79,6 +80,33 @@ describe("thread sections", () => {
     expect(() => resolveThreadSectionId("Missing", sections)).toThrow(
       "no thread section named 'Missing'. Available: Automated reviews, Work",
     );
+  });
+});
+
+describe("home-relative paths", () => {
+  const home = "/home/sawyer";
+
+  it("expands a leading ~/ so one setting fits two hosts", () => {
+    expect(expandHome("~/.slopcop/slopcop-gh", home)).toBe(
+      "/home/sawyer/.slopcop/slopcop-gh",
+    );
+    expect(expandHome("~/.slopcop/slopcop-gh", "/Users/sawyerhood")).toBe(
+      "/Users/sawyerhood/.slopcop/slopcop-gh",
+    );
+  });
+
+  it("leaves absolute and bare commands alone", () => {
+    expect(expandHome("/usr/local/bin/slopcop-gh", home)).toBe(
+      "/usr/local/bin/slopcop-gh",
+    );
+    expect(expandHome("gh", home)).toBe("gh");
+    expect(expandHome("", home)).toBe("");
+  });
+
+  it("refuses to guess at another user's home", () => {
+    expect(expandHome("~other/.slopcop/gh", home)).toBe("~other/.slopcop/gh");
+    expect(expandHome("/opt/~/gh", home)).toBe("/opt/~/gh");
+    expect(expandHome("~", home)).toBe(home);
   });
 });
 
