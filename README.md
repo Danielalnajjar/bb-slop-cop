@@ -94,6 +94,52 @@ A rule's prompt is the whole product, and prompts drift. Shadow mode runs the re
 review against a real PR and stores the exact body it would have posted, so a prompt
 change can be dry-run before it is ever visible to your team.
 
+## Running under a bot identity
+
+By default SlopCop reads and posts as whoever `gh` is logged in as — you. Point the
+`botGhPath` setting at a wrapper that exports a bot `GH_TOKEN` and execs `gh`, and the
+poller, the verifier, and the spawned review agent all switch to that identity. Your own
+`gh` login is untouched, because the token never leaves the wrapper's process tree. The
+agent is told the command name, never a token.
+
+`scripts/slopcop-gh` is that wrapper for a GitHub App. It mints an installation token,
+caches it in `~/.slopcop/token.cache.json` until ten minutes before expiry, and execs
+`gh`. Any wrapper works; the plugin only cares that the command behaves like `gh`.
+
+On the GitHub side:
+
+1. Open Settings → Developer settings → GitHub Apps → New GitHub App.
+2. Clear the **Webhook → Active** checkbox. SlopCop polls, so it needs no webhook.
+3. Grant repository permissions: Pull requests **Read and write**, Contents
+   **Read-only**, Metadata **Read-only**.
+4. Create the app. Record the App ID. Generate a private key and save the `.pem` file.
+5. Install the app on every repo a rule watches. The poller reads through the same
+   identity, so a missing installation fails the poll for that repo.
+6. Record the installation ID from the install URL.
+
+On this machine:
+
+```sh
+mkdir -p ~/.slopcop && chmod 700 ~/.slopcop
+mv ~/Downloads/slopcop.*.private-key.pem ~/.slopcop/slopcop.private-key.pem
+chmod 600 ~/.slopcop/slopcop.private-key.pem
+cat > ~/.slopcop/app.json <<'JSON'
+{ "appId": "123456", "installationId": "78901234",
+  "privateKeyPath": "~/.slopcop/slopcop.private-key.pem" }
+JSON
+cp scripts/slopcop-gh ~/.slopcop/slopcop-gh
+~/.slopcop/slopcop-gh api user            # expect the app's bot login
+```
+
+Then set `botGhPath` to `~/.slopcop/slopcop-gh` and check `bb slopcop status`.
+
+Two consequences worth knowing:
+
+- Comments post as `your-app[bot]`, so `--request-changes` now works on your own PRs.
+  GitHub blocks that only when the reviewer is the PR author.
+- The agent runs as your Unix user, so it can read the key if it tries. A separate OS
+  user or a container is the only real isolation.
+
 ## Commands
 
 | | |
@@ -108,8 +154,9 @@ change can be dry-run before it is ever visible to your team.
 | `bb slopcop verify [run-id]` | Re-check a live run's comments against GitHub |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
 
-Plugin setting: `defaultThreadSection` accepts a BB thread section name or ID.
-SlopCop fails a run with a clear error if that section no longer exists.
+Plugin settings: `defaultThreadSection` accepts a BB thread section name or ID.
+SlopCop fails a run with a clear error if that section no longer exists. `botGhPath`
+switches every GitHub call to a bot identity — see above.
 
 Rule flags: `--name --repo --project --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger

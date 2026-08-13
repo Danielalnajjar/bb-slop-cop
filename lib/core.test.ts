@@ -14,6 +14,7 @@ import {
   isTrustedAuthor,
   matchGlob,
 } from "./matcher";
+import { buildPrompt } from "./dispatch";
 import { verifyLive, verifyShadow } from "./verify";
 import type { GhClient, GhComment } from "./gh";
 import type { PullRequest, Rule } from "./types";
@@ -78,6 +79,45 @@ describe("thread sections", () => {
     expect(() => resolveThreadSectionId("Missing", sections)).toThrow(
       "no thread section named 'Missing'. Available: Automated reviews, Work",
     );
+  });
+});
+
+describe("bot posting command", () => {
+  const context = (ghCommand?: string) => ({
+    rule: makeRule({ mode: "live" as const }),
+    pullRequest: makePr(),
+    runId: "run_1",
+    ghCommand,
+  });
+
+  it("defaults to plain gh and adds no bot note", () => {
+    const prompt = buildPrompt(context());
+    expect(prompt).toContain("Post your review to the PR with `gh`.");
+    expect(prompt).not.toContain("SlopCop identity");
+  });
+
+  it("routes writes through the configured wrapper", () => {
+    const prompt = buildPrompt(context("/home/me/.slopcop/slopcop-gh"));
+    expect(prompt).toContain(
+      "`/home/me/.slopcop/slopcop-gh pr review --comment`",
+    );
+    expect(prompt).toContain("Plain `gh` is fine for reads.");
+    expect(prompt).not.toContain("Post your review to the PR with `gh`.");
+  });
+
+  it("treats a blank wrapper setting as unset", () => {
+    expect(buildPrompt(context("   "))).toContain(
+      "Post your review to the PR with `gh`.",
+    );
+  });
+
+  it("never tells a shadow rule to post, wrapper or not", () => {
+    const prompt = buildPrompt({
+      ...context("/home/me/.slopcop/slopcop-gh"),
+      rule: makeRule({ mode: "shadow" }),
+    });
+    expect(prompt).toContain("DO NOT POST ANYTHING");
+    expect(prompt).not.toContain("slopcop-gh");
   });
 });
 

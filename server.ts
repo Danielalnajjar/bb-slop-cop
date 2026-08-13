@@ -178,6 +178,13 @@ export default async function plugin(bb: BbPluginApi) {
       default: "3",
     },
     ghPath: { type: "string", label: "Path to the gh binary", default: "gh" },
+    botGhPath: {
+      type: "string",
+      label: "Bot gh wrapper",
+      description:
+        "Absolute path to a wrapper that exports a bot GH_TOKEN and execs gh. When set, SlopCop reads, verifies, and posts as the bot instead of your own gh login. Leave empty to use your own login.",
+      default: "",
+    },
     defaultThreadSection: {
       type: "string",
       label: "Default review thread section",
@@ -203,7 +210,11 @@ export default async function plugin(bb: BbPluginApi) {
       pollSeconds: Number.isFinite(poll) && poll >= 15 ? poll : 60,
       maxConcurrent:
         Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 3,
-      ghPath: values.ghPath.trim() || "gh",
+      // One switch turns on bot mode. The backend client and the agent's write
+      // command must resolve to the same identity, or `verifyLive`'s
+      // account-based fallback would look for comments from the wrong login.
+      ghPath: values.botGhPath.trim() || values.ghPath.trim() || "gh",
+      botGhPath: values.botGhPath.trim(),
       defaultThreadSection: values.defaultThreadSection.trim(),
     };
   };
@@ -283,7 +294,8 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId, threadId: null };
     }
 
-    const context = { rule, pullRequest, runId };
+    const { botGhPath, defaultThreadSection } = await readSettings();
+    const context = { rule, pullRequest, runId, ghCommand: botGhPath };
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
       // `input`, so it must be dropped here — the prompt SlopCop builds from
@@ -311,7 +323,6 @@ export default async function plugin(bb: BbPluginApi) {
         if (execution[field] !== undefined) sources[field] = "explicit";
       }
       execution.executionInputSources = sources;
-      const { defaultThreadSection } = await readSettings();
       const sectionId = resolveThreadSectionId(
         defaultThreadSection,
         defaultThreadSection.length > 0

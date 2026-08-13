@@ -11,6 +11,13 @@ export interface DispatchContext {
   rule: Rule;
   pullRequest: PullRequest;
   runId: string;
+  /**
+   * The command the agent must use for writes. A bot deployment points this at
+   * a wrapper that exports a bot `GH_TOKEN` and then execs `gh`, so the review
+   * posts under the bot identity while the operator's own `gh` login stays
+   * untouched. The agent never sees the token, only this command name.
+   */
+  ghCommand?: string;
 }
 
 const SHADOW_BANNER = `## SHADOW MODE — DO NOT POST ANYTHING
@@ -20,11 +27,19 @@ other command that writes to GitHub. Read-only \`gh\` commands are fine.
 Instead, output the review you WOULD have posted, as your final message, using
 the exact format below. It will be shown for approval before the rule goes live.`;
 
-const LIVE_BANNER = `## POSTING
+function liveBanner(ghCommand: string): string {
+  const note =
+    ghCommand === "gh"
+      ? ""
+      : `\n\nUse \`${ghCommand}\` for every command that writes to GitHub — it is
+what posts under the SlopCop identity. Plain \`gh\` is fine for reads. Do not
+try to read, print, or pass a token yourself.`;
+  return `## POSTING
 
-Post your review to the PR with \`gh\`. Use \`gh pr review --comment\` for the
-summary (or \`--request-changes\` for something genuinely blocking), and inline
-comments for specific lines.`;
+Post your review to the PR with \`${ghCommand}\`. Use \`${ghCommand} pr review --comment\`
+for the summary (or \`--request-changes\` for something genuinely blocking), and
+inline comments for specific lines.${note}`;
+}
 
 function formatBodyContract(context: DispatchContext): string {
   const { rule, pullRequest, runId } = context;
@@ -105,7 +120,7 @@ ${formatPullRequest(pullRequest, rule.repo)}
 
 ${rule.prompt.trim()}
 
-${shadow ? SHADOW_BANNER : LIVE_BANNER}
+${shadow ? SHADOW_BANNER : liveBanner(context.ghCommand?.trim() || "gh")}
 
 ${formatBodyContract(context)}
 
