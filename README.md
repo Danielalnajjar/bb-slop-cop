@@ -106,9 +106,10 @@ agent is told the command name, never a token.
 caches it in `~/.slopcop/token.cache.json` until ten minutes before expiry, and execs
 `gh`. Any wrapper works; the plugin only cares that the command behaves like `gh`.
 
-On the GitHub side:
+On the GitHub side. Own the app at the organization, not at a personal account —
+an app owned by a person dies with that person's access:
 
-1. Open Settings → Developer settings → GitHub Apps → New GitHub App.
+1. Open `https://github.com/organizations/<org>/settings/apps/new`.
 2. Clear the **Webhook → Active** checkbox. SlopCop polls, so it needs no webhook.
 3. Grant repository permissions: Pull requests **Read and write**, Contents
    **Read-only**, Metadata **Read-only**.
@@ -116,6 +117,20 @@ On the GitHub side:
 5. Install the app on every repo a rule watches. The poller reads through the same
    identity, so a missing installation fails the poll for that repo.
 6. Record the installation ID from the install URL.
+
+`gh` cannot create or install an app — neither action has a REST endpoint that a user
+token can call. It can do everything after that, because `gh api` respects an explicit
+`-H Authorization`:
+
+```sh
+gh api -H "Authorization: Bearer $JWT" /orgs/<org>/installation --jq .id
+```
+
+To skip the permissions form, use the [app manifest flow][manifest] instead of step 1.
+You approve one browser page, then `gh api -X POST /app-manifests/$CODE/conversions`
+returns the App ID and the private key in its response body.
+
+[manifest]: https://docs.github.com/apps/sharing-github-apps/registering-a-github-app-from-a-manifest
 
 On this machine:
 
