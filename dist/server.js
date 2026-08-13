@@ -14648,7 +14648,12 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
         );
         return stdout.trim() || null;
       } catch {
-        return null;
+        try {
+          const stdout = await run(ghPath, ["slopcop-login"], timeoutMs);
+          return stdout.trim() || null;
+        } catch {
+          return null;
+        }
       }
     }
   };

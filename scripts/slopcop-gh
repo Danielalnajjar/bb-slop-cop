@@ -11,6 +11,7 @@
 // private key and the minted token stay outside the agent's context entirely.
 //
 // Usage: slopcop-gh pr review 12 --comment --body "..."
+//        slopcop-gh slopcop-login          # prints "<app-slug>[bot]"
 //
 // Config, in ~/.slopcop/app.json (or $SLOPCOP_HOME/app.json):
 //   {
@@ -140,8 +141,35 @@ async function mintToken(config) {
   return parsed.token;
 }
 
+/**
+ * An installation token has no `GET /user`. GitHub offers no whoami for one,
+ * so the bot login is derived from the app slug, which needs the App JWT.
+ * SlopCop calls this when `api user` fails, to keep the account-based comment
+ * attribution in `verifyLive` working under a bot identity.
+ */
+async function printLogin(config) {
+  const response = await fetch("https://api.github.com/app", {
+    headers: {
+      Authorization: `Bearer ${buildAppJwt(config)}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "slopcop-gh",
+    },
+  });
+  const body = await response.text();
+  if (!response.ok) fail(`app lookup failed (${response.status}): ${body.trim()}`);
+  const slug = JSON.parse(body).slug;
+  if (typeof slug !== "string" || slug.length === 0) fail("app has no slug");
+  process.stdout.write(`${slug}[bot]\n`);
+}
+
 async function main() {
-  const token = readCachedToken() ?? (await mintToken(readConfig()));
+  const config = readConfig();
+  if (process.argv[2] === "slopcop-login") {
+    await printLogin(config);
+    return;
+  }
+  const token = readCachedToken() ?? (await mintToken(config));
   const env = { ...process.env, GH_TOKEN: token };
   // GITHUB_TOKEN would otherwise win in some `gh` code paths, and the operator
   // may well have one exported for unrelated work.

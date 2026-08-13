@@ -143,8 +143,13 @@ cat > ~/.slopcop/app.json <<'JSON'
   "privateKeyPath": "~/.slopcop/slopcop.private-key.pem" }
 JSON
 cp scripts/slopcop-gh ~/.slopcop/slopcop-gh
-~/.slopcop/slopcop-gh api user            # expect the app's bot login
+~/.slopcop/slopcop-gh slopcop-login       # expect "<app-slug>[bot]"
 ```
+
+An installation token is not a user, so `gh api user` returns 403 under the wrapper.
+GitHub publishes no whoami for such a token. `slopcop-login` derives the bot login from
+the app slug instead, and `authenticatedLogin()` falls back to it. Without that, the
+account guard in `verifyLive` would disarm and count anyone's comment as possibly ours.
 
 Then set `botGhPath` to `~/.slopcop/slopcop-gh` and check `bb slopcop status`.
 

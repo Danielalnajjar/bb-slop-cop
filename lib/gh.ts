@@ -185,7 +185,17 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
         );
         return stdout.trim() || null;
       } catch {
-        return null;
+        // A GitHub App installation token has no `GET /user` — it is not a
+        // user — so a bot deployment always lands here. Returning null would
+        // silently disarm the account guard in `verifyLive`, which then counts
+        // anyone's comment as possibly ours. A bot wrapper answers this
+        // instead; plain `gh` fails it harmlessly and we fall through.
+        try {
+          const stdout = await run(ghPath, ["slopcop-login"], timeoutMs);
+          return stdout.trim() || null;
+        } catch {
+          return null;
+        }
       }
     },
   };
