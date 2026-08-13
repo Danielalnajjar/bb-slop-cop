@@ -17,6 +17,7 @@ import {
 import { verifyLive, verifyShadow } from "./verify";
 import type { GhClient, GhComment } from "./gh";
 import type { PullRequest, Rule } from "./types";
+import { resolveThreadSectionId } from "./sections";
 
 function makeRule(overrides: Partial<Rule> = {}): Rule {
   return {
@@ -55,6 +56,30 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     ...overrides,
   };
 }
+
+describe("thread sections", () => {
+  const sections = [
+    { id: "sec_reviews", name: "Automated reviews" },
+    { id: "sec_work", name: "Work" },
+  ];
+
+  it("resolves a section by name or ID", () => {
+    expect(resolveThreadSectionId("Automated reviews", sections)).toBe(
+      "sec_reviews",
+    );
+    expect(resolveThreadSectionId("sec_work", sections)).toBe("sec_work");
+  });
+
+  it("leaves threads unsectioned when the setting is empty", () => {
+    expect(resolveThreadSectionId("  ", sections)).toBeUndefined();
+  });
+
+  it("fails clearly when the configured section does not exist", () => {
+    expect(() => resolveThreadSectionId("Missing", sections)).toThrow(
+      "no thread section named 'Missing'. Available: Automated reviews, Work",
+    );
+  });
+});
 
 describe("markers", () => {
   it("round-trips", () => {

@@ -41,6 +41,14 @@ bb slopcop show                       # the review it would have posted
 bb slopcop rules edit security-sweep --live
 ```
 
+To put all new review threads in one BB section, set its name or ID:
+
+```sh
+bb plugin config slopcop set defaultThreadSection "Automated reviews"
+```
+
+Clear the setting to create review threads without a section.
+
 ## Design notes
 
 Three decisions do most of the work.
@@ -99,6 +107,9 @@ change can be dry-run before it is ever visible to your team.
 | `bb slopcop show [run-id]` | A run and the review body it produced |
 | `bb slopcop verify [run-id]` | Re-check a live run's comments against GitHub |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
+
+Plugin setting: `defaultThreadSection` accepts a BB thread section name or ID.
+SlopCop fails a run with a clear error if that section no longer exists.
 
 Rule flags: `--name --repo --project --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger

@@ -49,6 +49,15 @@ sidebar organization and raise no unread or notification attention. Right for a
 rule that fires often. Default is `--visible`, so a new rule is watchable while
 you tune it.
 
+Set a default BB section for all new review threads with a section name or ID:
+
+```sh
+bb plugin config slopcop set defaultThreadSection "Automated reviews"
+```
+
+Clear `defaultThreadSection` to create review threads without a section. A run
+fails with an explicit error if the configured section no longer exists.
+
 Permission modes are BB's own: `full`, `auto` (default), `accept-edits`. There
 is no read-only mode, which is why the trust gate is the real protection.
 

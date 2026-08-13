@@ -9,6 +9,7 @@ import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { resolveThreadSectionId } from "./lib/sections";
 import {
   computeTriggers,
   describeTrust,
@@ -151,6 +152,7 @@ export const rpcContract = defineRpcContract({
       ghLogin: z.string().nullable(),
       watchedRepos: z.array(z.string()),
       pollSeconds: z.number(),
+      defaultThreadSection: z.string(),
     }),
   },
 });
@@ -176,6 +178,13 @@ export default async function plugin(bb: BbPluginApi) {
       default: "3",
     },
     ghPath: { type: "string", label: "Path to the gh binary", default: "gh" },
+    defaultThreadSection: {
+      type: "string",
+      label: "Default review thread section",
+      description:
+        "Use a section name or ID. Leave this field empty to create unsectioned review threads.",
+      default: "",
+    },
   });
 
   const db = bb.storage.database();
@@ -195,6 +204,7 @@ export default async function plugin(bb: BbPluginApi) {
       maxConcurrent:
         Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 3,
       ghPath: values.ghPath.trim() || "gh",
+      defaultThreadSection: values.defaultThreadSection.trim(),
     };
   };
 
@@ -301,11 +311,19 @@ export default async function plugin(bb: BbPluginApi) {
         if (execution[field] !== undefined) sources[field] = "explicit";
       }
       execution.executionInputSources = sources;
+      const { defaultThreadSection } = await readSettings();
+      const sectionId = resolveThreadSectionId(
+        defaultThreadSection,
+        defaultThreadSection.length > 0
+          ? await bb.sdk.threadSections.list()
+          : [],
+      );
       const thread = await bb.sdk.threads.spawn({
         ...execution,
         prompt: buildPrompt(context),
         title: buildThreadTitle(context),
         visibility: rule.visibility,
+        ...(sectionId === undefined ? {} : { sectionId }),
       } as never);
       const threadId = (thread as { id: string }).id;
       store.updateRun(runId, { status: "reviewing", threadId });
@@ -650,6 +668,7 @@ export default async function plugin(bb: BbPluginApi) {
           ),
         ],
         pollSeconds: values.pollSeconds,
+        defaultThreadSection: values.defaultThreadSection,
       };
     },
   });
@@ -744,6 +763,7 @@ export default async function plugin(bb: BbPluginApi) {
             ghAvailable: ghLogin !== null,
             watchedRepos: repos,
             pollSeconds: values.pollSeconds,
+            defaultThreadSection: values.defaultThreadSection,
             rules: store.listRules().length,
           };
           return ok(
@@ -751,7 +771,9 @@ export default async function plugin(bb: BbPluginApi) {
               ? JSON.stringify(payload, null, 2)
               : `gh: ${ghLogin ?? "NOT AUTHENTICATED"}\nwatching: ${
                   repos.join(", ") || "(no enabled rules)"
-                }\npolling every ${values.pollSeconds}s\n${payload.rules} rule(s)`,
+                }\npolling every ${values.pollSeconds}s\ndefault section: ${
+                  values.defaultThreadSection || "(unsectioned)"
+                }\n${payload.rules} rule(s)`,
           );
         }
 
