@@ -120,23 +120,45 @@ describe("bot posting command", () => {
 
   it("defaults to plain gh and adds no bot note", () => {
     const prompt = buildPrompt(context());
-    expect(prompt).toContain("Post your review to the PR with `gh`.");
+    expect(prompt).toContain("Post with `gh`.");
     expect(prompt).not.toContain("SlopCop identity");
   });
 
   it("routes writes through the configured wrapper", () => {
     const prompt = buildPrompt(context("/home/me/.slopcop/slopcop-gh"));
     expect(prompt).toContain(
-      "`/home/me/.slopcop/slopcop-gh pr review --comment`",
+      "/home/me/.slopcop/slopcop-gh api repos/acme/checkout-api/pulls/482/comments",
+    );
+    expect(prompt).toContain(
+      "/home/me/.slopcop/slopcop-gh pr review 482 --comment",
     );
     expect(prompt).toContain("Plain `gh` is fine for reads.");
-    expect(prompt).not.toContain("Post your review to the PR with `gh`.");
+    expect(prompt).not.toContain("Post with `gh`.");
   });
 
   it("treats a blank wrapper setting as unset", () => {
-    expect(buildPrompt(context("   "))).toContain(
-      "Post your review to the PR with `gh`.",
-    );
+    expect(buildPrompt(context("   "))).toContain("Post with `gh`.");
+  });
+
+  it("tells live agents to pin findings on the line, not the review body", () => {
+    const prompt = buildPrompt(context());
+    expect(prompt).toContain("api repos/acme/checkout-api/pulls/482/comments");
+    expect(prompt).toContain("-f commit_id=a1b2c3d");
+    expect(prompt).toContain("-F body=@-");
+    expect(prompt).toContain("<<'EOF'");
+    expect(prompt).toContain("--body-file -");
+    expect(prompt).not.toContain("-f body=");
+    expect(prompt).not.toMatch(/--comment -b /);
+    expect(prompt).toContain("Do not switch to a newer");
+    expect(prompt).not.toContain("stop and do not post");
+    expect(prompt).toContain("old-file line");
+    expect(prompt).toContain("Do not put finding text in the");
+    expect(prompt).toContain("Conversation review body");
+    expect(prompt).toContain("only when there are zero findings");
+    expect(prompt).toContain("pr review 482 --comment");
+    expect(prompt).toContain("Do not also run");
+    expect(prompt).toContain("second Conversation card");
+    expect(prompt).not.toContain("--request-changes");
   });
 
   it("never tells a shadow rule to post, wrapper or not", () => {
