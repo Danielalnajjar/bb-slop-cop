@@ -14528,7 +14528,7 @@ function date4(params) {
 config(en_default());
 
 // lib/gh.ts
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 var GhError = class extends Error {
   constructor(message, stderr) {
     super(message);
@@ -14537,25 +14537,76 @@ var GhError = class extends Error {
   }
   stderr;
 };
+var MAX_BUFFER = 16 * 1024 * 1024;
+function failFrom(args, stderr, fallback) {
+  return new GhError(
+    `gh ${args.slice(0, 3).join(" ")} failed: ${stderr.trim() || fallback}`,
+    stderr
+  );
+}
 function run(file2, args, timeoutMs) {
   return new Promise((resolve, reject) => {
     execFile(
       file2,
       args,
-      { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+      { timeout: timeoutMs, maxBuffer: MAX_BUFFER },
       (error51, stdout, stderr) => {
         if (error51) {
-          reject(
-            new GhError(
-              `gh ${args.slice(0, 3).join(" ")} failed: ${stderr.trim() || error51.message}`,
-              stderr
-            )
-          );
+          reject(failFrom(args, stderr, error51.message));
           return;
         }
         resolve(stdout);
       }
     );
+  });
+}
+function runWithStdin(file2, args, timeoutMs, stdin) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file2, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let bytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(failFrom(args, stderr, "timed out"));
+    }, timeoutMs);
+    const finish = (error51) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error51) {
+        reject(error51);
+        return;
+      }
+      resolve(stdout);
+    };
+    const take = (chunk, sink) => {
+      bytes += chunk.length;
+      if (bytes > MAX_BUFFER) {
+        child.kill("SIGKILL");
+        finish(failFrom(args, stderr, "output exceeded 16 MiB"));
+        return;
+      }
+      if (sink === "out") stdout += chunk.toString();
+      else stderr += chunk.toString();
+    };
+    child.stdout.on("data", (chunk) => take(chunk, "out"));
+    child.stderr.on("data", (chunk) => take(chunk, "err"));
+    child.stdin.on("error", (error51) => {
+      finish(failFrom(args, stderr, error51.message));
+    });
+    child.on("error", (error51) => {
+      finish(failFrom(args, stderr, error51.message));
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        finish(null);
+        return;
+      }
+      finish(failFrom(args, stderr, `exit ${code ?? "null"}`));
+    });
+    child.stdin.end(stdin);
   });
 }
 function toTimestamp(value) {
@@ -14655,6 +14706,17 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
           return null;
         }
       }
+    },
+    async request(method, endpoint, body) {
+      const args = ["api", "--method", method, endpoint];
+      const stdout = body === void 0 ? await run(ghPath, args, timeoutMs) : await runWithStdin(
+        ghPath,
+        [...args, "--input", "-"],
+        timeoutMs,
+        JSON.stringify(body)
+      );
+      const trimmed = stdout.trim();
+      return trimmed.length === 0 ? null : JSON.parse(trimmed);
     }
   };
 }
@@ -15502,6 +15564,138 @@ function verifyShadow(options) {
   };
 }
 
+// lib/checks.ts
+var CHECK_NAME = "SlopCop";
+function asRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+}
+function prUrl(repo, prNumber) {
+  return `https://github.com/${repo}/pull/${prNumber}`;
+}
+function conclusionFor(status) {
+  switch (status) {
+    case "commented":
+    case "commented_partial":
+    case "commented_unmarked":
+      return "success";
+    case "no_comment":
+    case "commented_unattributed":
+      return "neutral";
+    case "failed":
+      return "failure";
+    case "skipped":
+    case "shadowed":
+    case "dispatched":
+    case "reviewing":
+      return null;
+  }
+}
+function outputFor(input) {
+  const { status, ruleName, prNumber, commentCount, detail } = input;
+  const extra = detail !== null && detail.length > 0 ? `
+
+${detail}` : "";
+  switch (status) {
+    case "commented":
+      return {
+        title: "Review posted",
+        summary: `SlopCop finished \`${ruleName}\` on PR #${prNumber} and posted ${commentCount} comment(s).${extra}`
+      };
+    case "commented_partial":
+    case "commented_unmarked":
+      return {
+        title: "Review posted with attribution drift",
+        summary: `SlopCop posted on PR #${prNumber}, but some comments were missing the required marker.${extra}`
+      };
+    case "no_comment":
+      return {
+        title: "Review finished without a comment",
+        summary: `SlopCop ran \`${ruleName}\` on PR #${prNumber} but posted nothing.${extra}`
+      };
+    case "commented_unattributed":
+      return {
+        title: "Review not attributable",
+        summary: `A comment landed on PR #${prNumber} but could not be proven as SlopCop's.${extra}`
+      };
+    case "failed":
+      return {
+        title: "Review failed",
+        summary: `SlopCop failed while reviewing PR #${prNumber} with \`${ruleName}\`.`
+      };
+    default:
+      return {
+        title: "SlopCop",
+        summary: `Rule \`${ruleName}\` on PR #${prNumber}: ${status}.${extra}`
+      };
+  }
+}
+function checkId(value) {
+  const id = asRecord2(value).id;
+  return typeof id === "number" ? id : null;
+}
+async function findCheckRunId(request, input) {
+  const payload = await request(
+    "GET",
+    `repos/${input.repo}/commits/${input.sha}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}&filter=all&per_page=100`
+  );
+  const rows = asRecord2(payload).check_runs;
+  if (!Array.isArray(rows)) return null;
+  const ours = rows.filter(
+    (row) => asRecord2(row).external_id === input.runId
+  );
+  const inProgress = ours.find(
+    (row) => asRecord2(row).status === "in_progress"
+  );
+  return checkId(inProgress ?? ours[0] ?? null);
+}
+async function startCheckRun(request, input) {
+  const created = await request(
+    "POST",
+    `repos/${input.repo}/check-runs`,
+    {
+      name: CHECK_NAME,
+      head_sha: input.sha,
+      status: "in_progress",
+      external_id: input.runId,
+      details_url: prUrl(input.repo, input.prNumber),
+      started_at: (/* @__PURE__ */ new Date()).toISOString(),
+      output: {
+        title: "Reviewing",
+        summary: `SlopCop is running \`${input.ruleName}\` on PR #${input.prNumber}.`
+      }
+    }
+  );
+  return checkId(created);
+}
+async function completeCheckRun(request, input) {
+  const conclusion = conclusionFor(input.status);
+  if (conclusion === null) return;
+  const at = (/* @__PURE__ */ new Date()).toISOString();
+  const body = {
+    name: CHECK_NAME,
+    status: "completed",
+    conclusion,
+    completed_at: at,
+    details_url: prUrl(input.repo, input.prNumber),
+    output: outputFor(input)
+  };
+  const existing = input.checkRunId ?? await findCheckRunId(request, input);
+  if (existing !== null) {
+    await request(
+      "PATCH",
+      `repos/${input.repo}/check-runs/${existing}`,
+      body
+    );
+    return;
+  }
+  await request("POST", `repos/${input.repo}/check-runs`, {
+    ...body,
+    head_sha: input.sha,
+    external_id: input.runId,
+    started_at: at
+  });
+}
+
 // server.ts
 var RUNS_CHANNEL = "runs-changed";
 var ruleInputSchema = external_exports.object({
@@ -15684,6 +15878,39 @@ async function plugin(bb) {
   const announce = () => {
     bb.realtime.publish(RUNS_CHANNEL, { at: Date.now() });
   };
+  const checkRunIds = /* @__PURE__ */ new Map();
+  async function reportCheck(kind, run2, complete) {
+    if (run2.mode !== "live" || run2.headSha.length === 0) return;
+    const request = gh.request.bind(gh);
+    const base = {
+      repo: run2.repo,
+      sha: run2.headSha,
+      runId: run2.id,
+      ruleName: run2.ruleName,
+      prNumber: run2.prNumber
+    };
+    try {
+      if (kind === "start") {
+        const id = await startCheckRun(request, base);
+        if (id !== null) checkRunIds.set(run2.id, id);
+        return;
+      }
+      if (complete === void 0) return;
+      try {
+        await completeCheckRun(request, {
+          ...base,
+          ...complete,
+          checkRunId: checkRunIds.get(run2.id) ?? null
+        });
+      } finally {
+        checkRunIds.delete(run2.id);
+      }
+    } catch (error51) {
+      bb.log.warn(
+        `check run ${kind} failed for ${run2.repo}#${run2.prNumber}: ${error51 instanceof Error ? error51.message : String(error51)}`
+      );
+    }
+  }
   async function hydrateFiles(rules, repo, pullRequest) {
     const needsFiles = rules.some(
       (rule) => rule.conditions.some((condition) => condition.kind === "paths")
@@ -15728,6 +15955,14 @@ async function plugin(bb) {
       announce();
       return { runId, threadId: null };
     }
+    const checkRun = {
+      id: runId,
+      repo: rule.repo,
+      headSha: pullRequest.headRefOid,
+      ruleName: rule.name,
+      prNumber: pullRequest.number,
+      mode: rule.mode
+    };
     const { botGhPath, defaultThreadSection } = await readSettings();
     const context = { rule, pullRequest, runId, ghCommand: botGhPath };
     try {
@@ -15749,6 +15984,7 @@ async function plugin(bb) {
         defaultThreadSection,
         defaultThreadSection.length > 0 ? await bb.sdk.threadSections.list() : []
       );
+      await reportCheck("start", checkRun);
       const thread = await bb.sdk.threads.spawn({
         ...execution,
         prompt: buildPrompt(context),
@@ -15771,6 +16007,11 @@ async function plugin(bb) {
         finishedAt: Date.now()
       });
       announce();
+      await reportCheck("complete", checkRun, {
+        status: "failed",
+        commentCount: 0,
+        detail: null
+      });
       return { runId, threadId: null };
     }
   }
@@ -15864,40 +16105,68 @@ async function plugin(bb) {
     const run2 = store.findRunByThread(threadId);
     if (run2 === null || run2.finishedAt !== null) return;
     inFlight = Math.max(0, inFlight - 1);
-    if (failure !== null) {
+    try {
+      if (failure !== null) {
+        store.updateRun(run2.id, {
+          status: "failed",
+          detail: failure,
+          finishedAt: Date.now()
+        });
+        announce();
+        await reportCheck("complete", run2, {
+          status: "failed",
+          commentCount: 0,
+          detail: null
+        });
+        return;
+      }
+      const runVerify = () => verifyLive({
+        gh,
+        repo: run2.repo,
+        prNumber: run2.prNumber,
+        runId: run2.id,
+        startedAt: run2.startedAt,
+        authenticatedLogin: ghLogin
+      });
+      const result = run2.mode === "shadow" ? verifyShadow({ runId: run2.id, finalMessage }) : await (async () => {
+        const first = await runVerify();
+        if (first.status !== "no_comment") return first;
+        await new Promise((resolve) => setTimeout(resolve, 4e3));
+        return runVerify();
+      })();
+      store.replaceComments(run2.id, result.comments);
       store.updateRun(run2.id, {
-        status: "failed",
-        detail: failure,
+        status: result.status,
+        detail: result.detail,
+        commentCount: result.comments.length,
         finishedAt: Date.now()
       });
       announce();
-      return;
+      await reportCheck("complete", run2, {
+        status: result.status,
+        commentCount: result.comments.length,
+        detail: result.detail
+      });
+      bb.log.info(
+        `run ${run2.id} (${run2.ruleName} #${run2.prNumber}) -> ${result.status}`
+      );
+    } catch (error51) {
+      const detail = error51 instanceof Error ? error51.message : String(error51);
+      store.updateRun(run2.id, {
+        status: "failed",
+        detail,
+        finishedAt: Date.now()
+      });
+      announce();
+      await reportCheck("complete", run2, {
+        status: "failed",
+        commentCount: 0,
+        detail: null
+      });
+      bb.log.error(
+        `verification failed: ${detail}`
+      );
     }
-    const runVerify = () => verifyLive({
-      gh,
-      repo: run2.repo,
-      prNumber: run2.prNumber,
-      runId: run2.id,
-      startedAt: run2.startedAt,
-      authenticatedLogin: ghLogin
-    });
-    const result = run2.mode === "shadow" ? verifyShadow({ runId: run2.id, finalMessage }) : await (async () => {
-      const first = await runVerify();
-      if (first.status !== "no_comment") return first;
-      await new Promise((resolve) => setTimeout(resolve, 4e3));
-      return runVerify();
-    })();
-    store.replaceComments(run2.id, result.comments);
-    store.updateRun(run2.id, {
-      status: result.status,
-      detail: result.detail,
-      commentCount: result.comments.length,
-      finishedAt: Date.now()
-    });
-    announce();
-    bb.log.info(
-      `run ${run2.id} (${run2.ruleName} #${run2.prNumber}) -> ${result.status}`
-    );
   }
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     void finishRun(thread.id, lastAssistantText, null).catch(
@@ -16061,7 +16330,7 @@ async function plugin(bb) {
       },
       {
         name: "verify",
-        summary: "Re-check a live run's comments against GitHub",
+        summary: "Re-check a finished live run against GitHub and complete its check",
         usage: "bb slopcop verify [run-id] [--json]"
       },
       {
@@ -16247,6 +16516,11 @@ ${payload.rules} rule(s)`
               "shadow runs post nothing, so there is nothing on GitHub to verify"
             );
           }
+          if (run2.finishedAt === null) {
+            return fail(
+              "run is still in flight \u2014 wait for the thread to finish"
+            );
+          }
           const result = await verifyLive({
             gh,
             repo: run2.repo,
@@ -16262,6 +16536,11 @@ ${payload.rules} rule(s)`
             commentCount: result.comments.length
           });
           announce();
+          await reportCheck("complete", run2, {
+            status: result.status,
+            commentCount: result.comments.length,
+            detail: result.detail
+          });
           return ok(
             json2 ? JSON.stringify(result, null, 2) : `${run2.id}: ${result.status} (${result.comments.length} comment(s))${result.detail === null ? "" : `
 ${result.detail}`}`
