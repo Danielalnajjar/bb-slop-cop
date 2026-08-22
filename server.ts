@@ -17,7 +17,7 @@ import {
   evaluateRule,
   isDangerousCombination,
 } from "./lib/matcher";
-import { verifyLive, verifyShadow } from "./lib/verify";
+import { liveVerifyBlockReason, verifyLive, verifyShadow } from "./lib/verify";
 import {
   completeCheckRun,
   startCheckRun,
@@ -414,6 +414,11 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
       );
+      const pending = pendingFinish.get(threadId);
+      if (pending !== undefined) {
+        pendingFinish.delete(threadId);
+        await finishRun(threadId, pending.finalMessage, pending.failure);
+      }
       return { runId, threadId };
     } catch (error) {
       store.updateRun(runId, {
@@ -540,13 +545,24 @@ export default async function plugin(bb: BbPluginApi) {
 
   // --- verification ------------------------------------------------------
 
+  // Host delivers thread.idle/failed on setImmediate; that can beat spawn's
+  // HTTP response, so finishRun stashes until dispatch stores threadId.
+  const pendingFinish = new Map<
+    string,
+    { finalMessage: string | null; failure: string | null }
+  >();
+
   async function finishRun(
     threadId: string,
     finalMessage: string | null,
     failure: string | null,
   ): Promise<void> {
     const run = store.findRunByThread(threadId);
-    if (run === null || run.finishedAt !== null) return;
+    if (run === null) {
+      pendingFinish.set(threadId, { finalMessage, failure });
+      return;
+    }
+    if (run.finishedAt !== null) return;
     inFlight = Math.max(0, inFlight - 1);
 
     try {
@@ -1079,16 +1095,8 @@ export default async function plugin(bb: BbPluginApi) {
             (target === "" ? null : store.getRun(target)) ??
             store.listRuns({ limit: 1 })[0];
           if (run === undefined || run === null) return fail("no such run");
-          if (run.mode === "shadow") {
-            return fail(
-              "shadow runs post nothing, so there is nothing on GitHub to verify",
-            );
-          }
-          if (run.finishedAt === null) {
-            return fail(
-              "run is still in flight — wait for the thread to finish",
-            );
-          }
+          const blocked = liveVerifyBlockReason(run);
+          if (blocked !== null) return fail(blocked);
           const result = await verifyLive({
             gh,
             repo: run.repo,

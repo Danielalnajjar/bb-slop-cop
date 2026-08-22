@@ -50,6 +50,24 @@ function toRunComment(
  * comments, inline review comments, and review bodies in separate endpoints —
  * reading only one would under-count a normal multi-comment review.
  */
+/** Why `bb slopcop verify` must not run this row. Null means it may. */
+export function liveVerifyBlockReason(run: {
+  mode: string;
+  status: string;
+  finishedAt: number | null;
+}): string | null {
+  if (run.mode === "shadow") {
+    return "shadow runs post nothing, so there is nothing on GitHub to verify";
+  }
+  if (run.finishedAt === null) {
+    return "run is still in flight — wait for the thread to finish";
+  }
+  if (run.status === "skipped") {
+    return "skipped runs never dispatched a review";
+  }
+  return null;
+}
+
 export async function verifyLive(options: {
   gh: GhClient;
   repo: string;

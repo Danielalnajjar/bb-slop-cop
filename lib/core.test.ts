@@ -15,7 +15,7 @@ import {
   matchGlob,
 } from "./matcher";
 import { buildPrompt } from "./dispatch";
-import { verifyLive, verifyShadow } from "./verify";
+import { liveVerifyBlockReason, verifyLive, verifyShadow } from "./verify";
 import {
   CHECK_NAME,
   completeCheckRun,
@@ -428,6 +428,37 @@ const marked = (kind: "summary" | "inline", run = "run_1") =>
   });
 
 describe("live verification", () => {
+  it("refuses shadow, in-flight, and skipped runs", () => {
+    expect(
+      liveVerifyBlockReason({
+        mode: "shadow",
+        status: "shadowed",
+        finishedAt: 1,
+      }),
+    ).toMatch(/shadow/);
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "reviewing",
+        finishedAt: null,
+      }),
+    ).toMatch(/in flight/);
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "skipped",
+        finishedAt: 1,
+      }),
+    ).toMatch(/skipped/);
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "commented",
+        finishedAt: 1,
+      }),
+    ).toBeNull();
+  });
+
   const base = {
     repo: "acme/checkout-api",
     prNumber: 482,

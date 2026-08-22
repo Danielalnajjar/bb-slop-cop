@@ -15460,6 +15460,18 @@ function toRunComment(comment, runId, fallbackKind, attribution) {
     attribution
   };
 }
+function liveVerifyBlockReason(run2) {
+  if (run2.mode === "shadow") {
+    return "shadow runs post nothing, so there is nothing on GitHub to verify";
+  }
+  if (run2.finishedAt === null) {
+    return "run is still in flight \u2014 wait for the thread to finish";
+  }
+  if (run2.status === "skipped") {
+    return "skipped runs never dispatched a review";
+  }
+  return null;
+}
 async function verifyLive(options) {
   const { gh, repo, prNumber, runId, startedAt, authenticatedLogin } = options;
   const [issueComments, reviewComments, reviews] = await Promise.all([
@@ -15999,6 +16011,11 @@ async function plugin(bb) {
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`
       );
+      const pending = pendingFinish.get(threadId);
+      if (pending !== void 0) {
+        pendingFinish.delete(threadId);
+        await finishRun(threadId, pending.finalMessage, pending.failure);
+      }
       return { runId, threadId };
     } catch (error51) {
       store.updateRun(runId, {
@@ -16101,9 +16118,14 @@ async function plugin(bb) {
       store.markBootstrapped(repo, Date.now());
     }
   }
+  const pendingFinish = /* @__PURE__ */ new Map();
   async function finishRun(threadId, finalMessage, failure) {
     const run2 = store.findRunByThread(threadId);
-    if (run2 === null || run2.finishedAt !== null) return;
+    if (run2 === null) {
+      pendingFinish.set(threadId, { finalMessage, failure });
+      return;
+    }
+    if (run2.finishedAt !== null) return;
     inFlight = Math.max(0, inFlight - 1);
     try {
       if (failure !== null) {
@@ -16511,16 +16533,8 @@ ${payload.rules} rule(s)`
           const target = argv[1] ?? "";
           const run2 = (target === "" ? null : store.getRun(target)) ?? store.listRuns({ limit: 1 })[0];
           if (run2 === void 0 || run2 === null) return fail("no such run");
-          if (run2.mode === "shadow") {
-            return fail(
-              "shadow runs post nothing, so there is nothing on GitHub to verify"
-            );
-          }
-          if (run2.finishedAt === null) {
-            return fail(
-              "run is still in flight \u2014 wait for the thread to finish"
-            );
-          }
+          const blocked = liveVerifyBlockReason(run2);
+          if (blocked !== null) return fail(blocked);
           const result = await verifyLive({
             gh,
             repo: run2.repo,
