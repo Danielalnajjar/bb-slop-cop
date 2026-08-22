@@ -37,7 +37,7 @@ bb slopcop rules add \
   --model claude-opus-5 \
   --paths "src/auth/**,src/payments/**" \
   --base main \
-  --prompt "Review the diff for auth and payment issues. Post findings with gh pr review --comment."
+  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
 ```
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
