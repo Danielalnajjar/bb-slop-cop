@@ -9,6 +9,7 @@ import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { archiveReviewThread } from "./lib/lifecycle";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
 import {
@@ -635,6 +636,8 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.error(
         `verification failed: ${detail}`,
       );
+    } finally {
+      await archiveReviewThread(bb, threadId);
     }
   }
 

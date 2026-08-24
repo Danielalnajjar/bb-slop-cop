@@ -15226,6 +15226,17 @@ function buildThreadTitle(context) {
   return `${prefix}: ${context.rule.name} \u2014 PR #${context.pullRequest.number}`;
 }
 
+// lib/lifecycle.ts
+async function archiveReviewThread(bb, threadId) {
+  try {
+    await bb.sdk.threads.archive({ threadId });
+  } catch (error51) {
+    bb.log.warn(
+      `could not archive completed review thread ${threadId}: ${error51 instanceof Error ? error51.message : String(error51)}`
+    );
+  }
+}
+
 // lib/sections.ts
 function resolveThreadSectionId(configured, sections) {
   const value = configured.trim();
@@ -16213,6 +16224,8 @@ async function plugin(bb) {
       bb.log.error(
         `verification failed: ${detail}`
       );
+    } finally {
+      await archiveReviewThread(bb, threadId);
     }
   }
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
