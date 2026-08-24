@@ -4,11 +4,12 @@
 // draft -> ready-for-review edge, matches PRs against enabled rules, and spawns
 // a review thread per match. When that thread goes idle, SlopCop verifies the
 // outcome against GitHub itself rather than trusting the agent's transcript.
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { archiveReviewThread } from "./lib/lifecycle";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
 import {
@@ -17,7 +18,13 @@ import {
   evaluateRule,
   isDangerousCombination,
 } from "./lib/matcher";
-import { verifyLive, verifyShadow } from "./lib/verify";
+import { liveVerifyBlockReason, verifyLive, verifyShadow } from "./lib/verify";
+import {
+  completeCheckRun,
+  startCheckRun,
+  type CompleteCheckInput,
+} from "./lib/checks";
+import type { Run } from "./lib/types";
 import {
   authorTrustSchema,
   conditionSchema,
@@ -230,6 +237,55 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /**
+   * Best-effort: a missing Checks permission must not fail the review.
+   * Process-local ids are start's POST response so complete can PATCH
+   * before the list endpoint catches up. Not a DB replica.
+   */
+  const checkRunIds = new Map<string, number>();
+
+  async function reportCheck(
+    kind: "start" | "complete",
+    run: Pick<
+      Run,
+      "id" | "repo" | "headSha" | "ruleName" | "prNumber" | "mode"
+    >,
+    complete?: Pick<CompleteCheckInput, "status" | "commentCount" | "detail">,
+  ): Promise<void> {
+    if (run.mode !== "live" || run.headSha.length === 0) return;
+    const request = gh.request.bind(gh);
+    const base = {
+      repo: run.repo,
+      sha: run.headSha,
+      runId: run.id,
+      ruleName: run.ruleName,
+      prNumber: run.prNumber,
+    };
+    try {
+      if (kind === "start") {
+        const id = await startCheckRun(request, base);
+        if (id !== null) checkRunIds.set(run.id, id);
+        return;
+      }
+      if (complete === undefined) return;
+      try {
+        await completeCheckRun(request, {
+          ...base,
+          ...complete,
+          checkRunId: checkRunIds.get(run.id) ?? null,
+        });
+      } finally {
+        checkRunIds.delete(run.id);
+      }
+    } catch (error) {
+      bb.log.warn(
+        `check run ${kind} failed for ${run.repo}#${run.prNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * REST does not return a PR's changed files inline, so they are fetched only
    * when a rule actually filters on paths — which keeps the common poll pass to
    * a single API call per repo.
@@ -300,6 +356,14 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId, threadId: null };
     }
 
+    const checkRun = {
+      id: runId,
+      repo: rule.repo,
+      headSha: pullRequest.headRefOid,
+      ruleName: rule.name,
+      prNumber: pullRequest.number,
+      mode: rule.mode,
+    };
     const { botGhPath, defaultThreadSection } = await readSettings();
     const context = { rule, pullRequest, runId, ghCommand: botGhPath };
     try {
@@ -335,6 +399,8 @@ export default async function plugin(bb: BbPluginApi) {
           ? await bb.sdk.threadSections.list()
           : [],
       );
+      // thread.idle / thread.failed already run finishRun concurrently.
+      await reportCheck("start", checkRun);
       const thread = await bb.sdk.threads.spawn({
         ...execution,
         prompt: buildPrompt(context),
@@ -349,6 +415,11 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
       );
+      const pending = pendingFinish.get(threadId);
+      if (pending !== undefined) {
+        pendingFinish.delete(threadId);
+        await finishRun(threadId, pending.finalMessage, pending.failure);
+      }
       return { runId, threadId };
     } catch (error) {
       store.updateRun(runId, {
@@ -357,6 +428,11 @@ export default async function plugin(bb: BbPluginApi) {
         finishedAt: Date.now(),
       });
       announce();
+      await reportCheck("complete", checkRun, {
+        status: "failed",
+        commentCount: 0,
+        detail: null,
+      });
       return { runId, threadId: null };
     }
   }
@@ -470,58 +546,99 @@ export default async function plugin(bb: BbPluginApi) {
 
   // --- verification ------------------------------------------------------
 
+  // Host delivers thread.idle/failed on setImmediate; that can beat spawn's
+  // HTTP response, so finishRun stashes until dispatch stores threadId.
+  const pendingFinish = new Map<
+    string,
+    { finalMessage: string | null; failure: string | null }
+  >();
+
   async function finishRun(
     threadId: string,
     finalMessage: string | null,
     failure: string | null,
   ): Promise<void> {
     const run = store.findRunByThread(threadId);
-    if (run === null || run.finishedAt !== null) return;
+    if (run === null) {
+      pendingFinish.set(threadId, { finalMessage, failure });
+      return;
+    }
+    if (run.finishedAt !== null) return;
     inFlight = Math.max(0, inFlight - 1);
 
-    if (failure !== null) {
+    try {
+      if (failure !== null) {
+        store.updateRun(run.id, {
+          status: "failed",
+          detail: failure,
+          finishedAt: Date.now(),
+        });
+        announce();
+        await reportCheck("complete", run, {
+          status: "failed",
+          commentCount: 0,
+          detail: null,
+        });
+        return;
+      }
+
+      const runVerify = () =>
+        verifyLive({
+          gh,
+          repo: run.repo,
+          prNumber: run.prNumber,
+          runId: run.id,
+          startedAt: run.startedAt,
+          authenticatedLogin: ghLogin,
+        });
+
+      const result =
+        run.mode === "shadow"
+          ? verifyShadow({ runId: run.id, finalMessage })
+          : await (async () => {
+              // GitHub's list endpoints can lag a just-submitted review, so a
+              // bare no_comment gets one retry before it is believed.
+              const first = await runVerify();
+              if (first.status !== "no_comment") return first;
+              await new Promise((resolve) => setTimeout(resolve, 4_000));
+              return runVerify();
+            })();
+
+      store.replaceComments(run.id, result.comments);
       store.updateRun(run.id, {
-        status: "failed",
-        detail: failure,
+        status: result.status,
+        detail: result.detail,
+        commentCount: result.comments.length,
         finishedAt: Date.now(),
       });
       announce();
-      return;
-    }
-
-    const runVerify = () =>
-      verifyLive({
-        gh,
-        repo: run.repo,
-        prNumber: run.prNumber,
-        runId: run.id,
-        startedAt: run.startedAt,
-        authenticatedLogin: ghLogin,
+      await reportCheck("complete", run, {
+        status: result.status,
+        commentCount: result.comments.length,
+        detail: result.detail,
       });
-
-    const result =
-      run.mode === "shadow"
-        ? verifyShadow({ runId: run.id, finalMessage })
-        : await (async () => {
-            // GitHub's list endpoints can lag a just-submitted review, so a
-            // bare no_comment gets one retry before it is believed.
-            const first = await runVerify();
-            if (first.status !== "no_comment") return first;
-            await new Promise((resolve) => setTimeout(resolve, 4_000));
-            return runVerify();
-          })();
-
-    store.replaceComments(run.id, result.comments);
-    store.updateRun(run.id, {
-      status: result.status,
-      detail: result.detail,
-      commentCount: result.comments.length,
-      finishedAt: Date.now(),
-    });
-    announce();
-    bb.log.info(
-      `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
-    );
+      bb.log.info(
+        `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      store.updateRun(run.id, {
+        status: "failed",
+        detail,
+        finishedAt: Date.now(),
+      });
+      announce();
+      await reportCheck("complete", run, {
+        status: "failed",
+        commentCount: 0,
+        detail: null,
+      });
+      bb.log.error(
+        `verification failed: ${detail}`,
+      );
+    } finally {
+      await archiveReviewThread(bb, threadId);
+    }
   }
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
@@ -734,7 +851,8 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "verify",
-        summary: "Re-check a live run's comments against GitHub",
+        summary:
+          "Re-check a finished live run against GitHub and complete its check",
         usage: "bb slopcop verify [run-id] [--json]",
       },
       {
@@ -980,11 +1098,8 @@ export default async function plugin(bb: BbPluginApi) {
             (target === "" ? null : store.getRun(target)) ??
             store.listRuns({ limit: 1 })[0];
           if (run === undefined || run === null) return fail("no such run");
-          if (run.mode === "shadow") {
-            return fail(
-              "shadow runs post nothing, so there is nothing on GitHub to verify",
-            );
-          }
+          const blocked = liveVerifyBlockReason(run);
+          if (blocked !== null) return fail(blocked);
           const result = await verifyLive({
             gh,
             repo: run.repo,
@@ -1000,6 +1115,11 @@ export default async function plugin(bb: BbPluginApi) {
             commentCount: result.comments.length,
           });
           announce();
+          await reportCheck("complete", run, {
+            status: result.status,
+            commentCount: result.comments.length,
+            detail: result.detail,
+          });
           return ok(
             json
               ? JSON.stringify(result, null, 2)

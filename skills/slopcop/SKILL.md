@@ -37,7 +37,7 @@ bb slopcop rules add \
   --model claude-opus-5 \
   --paths "src/auth/**,src/payments/**" \
   --base main \
-  --prompt "Review the diff for auth and payment issues. Post findings with gh pr review --comment."
+  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
 ```
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
@@ -69,6 +69,7 @@ bb slopcop status                      # gh auth, watched repos, poll interval
 bb slopcop check <rule> <pr-number>    # dry run: match or the exact reason it did not
 bb slopcop runs [--rule <r>] [--json]  # recent runs and their status
 bb slopcop show [run-id]               # the review body a run produced
+bb slopcop verify [run-id]             # re-check GitHub and complete the merge-box check
 bb slopcop dispatch <rule> <pr> [--force]
 bb slopcop rules edit|enable|disable|rm <rule>
 ```
@@ -87,3 +88,11 @@ matched nothing, e.g. blocked by the trust gate) · `failed`.
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker
 rather than trusting the agent's transcript.
+
+Live runs also open a GitHub Check named `SlopCop` on the head SHA
+(in progress from dispatch, before the thread is spawned, then completed
+from verified comment state). `bb slopcop verify` re-completes that check
+once the thread has finished — it will not close a spinner still in flight.
+That is the merge-box row next to CI; the GitHub App avatar is the left-hand
+identity. Shadow runs never open a check. A missing Checks permission on the
+GitHub App is non-fatal — comments still post.

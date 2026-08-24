@@ -33,7 +33,7 @@ bb slopcop rules add \
   --repo owner/repo \
   --project my-project \
   --paths "src/auth/**,src/payments/**" \
-  --prompt "Review the diff for auth and payment issues. Post findings with gh pr review --comment."
+  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
 
 bb slopcop check security-sweep 482   # would it match? if not, exactly why not
 bb slopcop dispatch security-sweep 482
@@ -75,12 +75,13 @@ Every posted body carries a visible header so humans know it is a bot and which 
 wrote it, plus a hidden marker so SlopCop can find its own comments later:
 
 ```markdown
-🚨 **SLOP COP** 🚨 · `security-sweep`
+🚨 `slopcop/security-sweep` — this compare is unauthenticated
 
-Three findings, one blocking…
-
-<!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=summary -->
+<!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=inline -->
 ```
+
+Findings are line comments on the diff. A Conversation review body is only for
+the no-findings case (`kind=summary`).
 
 When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
 polls GitHub's three separate comment surfaces (issue comments, inline review comments,
@@ -112,7 +113,11 @@ an app owned by a person dies with that person's access:
 1. Open `https://github.com/organizations/<org>/settings/apps/new`.
 2. Clear the **Webhook → Active** checkbox. SlopCop polls, so it needs no webhook.
 3. Grant repository permissions: Pull requests **Read and write**, Contents
-   **Read-only**, Metadata **Read-only**.
+   **Read-only**, Metadata **Read-only**, Checks **Read and write**. Checks is
+   what puts a `SlopCop` row in the PR merge-box next to CI. Live reviews
+   still post comments if the app lacks it; the check is simply omitted. The
+   GitHub App avatar is what shows on that row — use the plugin icon, or
+   whatever identity the bot should have.
 4. Create the app. Record the App ID. Generate a private key and save the `.pem` file.
 5. Install the app on every repo a rule watches. The poller reads through the same
    identity, so a missing installation fails the poll for that repo.
@@ -171,7 +176,7 @@ Two consequences worth knowing:
 | `bb slopcop dispatch <rule> <pr> [--force]` | Run now |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
-| `bb slopcop verify [run-id]` | Re-check a live run's comments against GitHub |
+| `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
 
 Plugin settings: `defaultThreadSection` accepts a BB thread section name or ID.

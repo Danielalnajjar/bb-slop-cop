@@ -3,7 +3,7 @@
 // This is what makes verification independent of the agent: SlopCop reads PR
 // and comment state itself rather than trusting a transcript. Mirrors the
 // official github plugin's execFile approach.
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import type { PullRequest } from "./types";
 
 export class GhError extends Error {
@@ -28,6 +28,11 @@ export interface GhClient {
   listReviewComments(repo: string, number: number): Promise<GhComment[]>;
   listReviews(repo: string, number: number): Promise<GhComment[]>;
   authenticatedLogin(): Promise<string | null>;
+  request(
+    method: "GET" | "POST" | "PATCH",
+    endpoint: string,
+    body?: unknown,
+  ): Promise<unknown>;
 }
 
 export interface GhComment {
@@ -40,6 +45,19 @@ export interface GhComment {
   createdAt: number;
 }
 
+const MAX_BUFFER = 16 * 1024 * 1024;
+
+function failFrom(
+  args: string[],
+  stderr: string,
+  fallback: string,
+): GhError {
+  return new GhError(
+    `gh ${args.slice(0, 3).join(" ")} failed: ${stderr.trim() || fallback}`,
+    stderr,
+  );
+}
+
 function run(
   file: string,
   args: string[],
@@ -49,22 +67,74 @@ function run(
     execFile(
       file,
       args,
-      { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+      { timeout: timeoutMs, maxBuffer: MAX_BUFFER },
       (error, stdout, stderr) => {
         if (error) {
-          reject(
-            new GhError(
-              `gh ${args.slice(0, 3).join(" ")} failed: ${
-                stderr.trim() || error.message
-              }`,
-              stderr,
-            ),
-          );
+          reject(failFrom(args, stderr, error.message));
           return;
         }
         resolve(stdout);
       },
     );
+  });
+}
+
+/** `gh api --input -` needs a stdin body; execFile cannot supply one. */
+function runWithStdin(
+  file: string,
+  args: string[],
+  timeoutMs: number,
+  stdin: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let bytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(failFrom(args, stderr, "timed out"));
+    }, timeoutMs);
+
+    const finish = (error: Error | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(stdout);
+    };
+
+    const take = (chunk: Buffer, sink: "out" | "err") => {
+      bytes += chunk.length;
+      if (bytes > MAX_BUFFER) {
+        child.kill("SIGKILL");
+        finish(failFrom(args, stderr, "output exceeded 16 MiB"));
+        return;
+      }
+      if (sink === "out") stdout += chunk.toString();
+      else stderr += chunk.toString();
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => take(chunk, "out"));
+    child.stderr.on("data", (chunk: Buffer) => take(chunk, "err"));
+    child.stdin.on("error", (error) => {
+      finish(failFrom(args, stderr, error.message));
+    });
+    child.on("error", (error) => {
+      finish(failFrom(args, stderr, error.message));
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        finish(null);
+        return;
+      }
+      finish(failFrom(args, stderr, `exit ${code ?? "null"}`));
+    });
+    child.stdin.end(stdin);
   });
 }
 
@@ -197,6 +267,21 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
           return null;
         }
       }
+    },
+
+    async request(method, endpoint, body) {
+      const args = ["api", "--method", method, endpoint];
+      const stdout =
+        body === undefined
+          ? await run(ghPath, args, timeoutMs)
+          : await runWithStdin(
+              ghPath,
+              [...args, "--input", "-"],
+              timeoutMs,
+              JSON.stringify(body),
+            );
+      const trimmed = stdout.trim();
+      return trimmed.length === 0 ? null : JSON.parse(trimmed);
     },
   };
 }

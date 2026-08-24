@@ -15,8 +15,16 @@ import {
   matchGlob,
 } from "./matcher";
 import { buildPrompt } from "./dispatch";
-import { verifyLive, verifyShadow } from "./verify";
+import { liveVerifyBlockReason, verifyLive, verifyShadow } from "./verify";
+import {
+  CHECK_NAME,
+  completeCheckRun,
+  conclusionFor,
+  outputFor,
+  startCheckRun,
+} from "./checks";
 import type { GhClient, GhComment } from "./gh";
+import type { RunStatus } from "./types";
 import type { PullRequest, Rule } from "./types";
 import { resolveThreadSectionId } from "./sections";
 import { expandHome } from "./paths";
@@ -120,23 +128,37 @@ describe("bot posting command", () => {
 
   it("defaults to plain gh and adds no bot note", () => {
     const prompt = buildPrompt(context());
-    expect(prompt).toContain("Post your review to the PR with `gh`.");
+    expect(prompt).toContain("Post with `gh`.");
     expect(prompt).not.toContain("SlopCop identity");
   });
 
   it("routes writes through the configured wrapper", () => {
     const prompt = buildPrompt(context("/home/me/.slopcop/slopcop-gh"));
     expect(prompt).toContain(
-      "`/home/me/.slopcop/slopcop-gh pr review --comment`",
+      "/home/me/.slopcop/slopcop-gh api repos/acme/checkout-api/pulls/482/comments",
+    );
+    expect(prompt).toContain(
+      "/home/me/.slopcop/slopcop-gh pr review 482 --comment",
     );
     expect(prompt).toContain("Plain `gh` is fine for reads.");
-    expect(prompt).not.toContain("Post your review to the PR with `gh`.");
+    expect(prompt).not.toContain("Post with `gh`.");
   });
 
   it("treats a blank wrapper setting as unset", () => {
-    expect(buildPrompt(context("   "))).toContain(
-      "Post your review to the PR with `gh`.",
-    );
+    expect(buildPrompt(context("   "))).toContain("Post with `gh`.");
+  });
+
+  it("tells live agents to pin findings on the line, not the review body", () => {
+    const prompt = buildPrompt(context());
+    expect(prompt).toContain("api repos/acme/checkout-api/pulls/482/comments");
+    expect(prompt).toContain("-f commit_id=a1b2c3d");
+    expect(prompt).toContain("Do not put finding text in the");
+    expect(prompt).toContain("Conversation review body");
+    expect(prompt).toContain("only when there are zero findings");
+    expect(prompt).toContain("pr review 482 --comment");
+    expect(prompt).toContain("Do not also run");
+    expect(prompt).toContain("second Conversation card");
+    expect(prompt).not.toContain("--request-changes");
   });
 
   it("never tells a shadow rule to post, wrapper or not", () => {
@@ -407,6 +429,7 @@ function fakeGh(parts: {
     listReviewComments: async () => parts.review ?? [],
     listReviews: async () => parts.reviews ?? [],
     authenticatedLogin: async () => "octocat",
+    request: async () => null,
   };
 }
 
@@ -419,6 +442,37 @@ const marked = (kind: "summary" | "inline", run = "run_1") =>
   });
 
 describe("live verification", () => {
+  it("refuses shadow, in-flight, and skipped runs", () => {
+    expect(
+      liveVerifyBlockReason({
+        mode: "shadow",
+        status: "shadowed",
+        finishedAt: 1,
+      }),
+    ).toMatch(/shadow/);
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "reviewing",
+        finishedAt: null,
+      }),
+    ).toMatch(/in flight/);
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "skipped",
+        finishedAt: 1,
+      }),
+    ).toMatch(/skipped/);
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "commented",
+        finishedAt: 1,
+      }),
+    ).toBeNull();
+  });
+
   const base = {
     repo: "acme/checkout-api",
     prNumber: 482,
@@ -541,5 +595,185 @@ describe("shadow verification", () => {
     expect(verifyShadow({ runId: "run_1", finalMessage: null }).status).toBe(
       "no_comment",
     );
+  });
+});
+
+describe("github checks", () => {
+  it("treats a posted review as success so it does not fail merges", () => {
+    const posted: RunStatus[] = [
+      "commented",
+      "commented_partial",
+      "commented_unmarked",
+    ];
+    for (const status of posted) {
+      expect(conclusionFor(status)).toBe("success");
+    }
+  });
+
+  it("does not open or complete a check for shadow or in-flight runs", () => {
+    expect(conclusionFor("shadowed")).toBeNull();
+    expect(conclusionFor("reviewing")).toBeNull();
+    expect(conclusionFor("dispatched")).toBeNull();
+  });
+
+  it("uses the same check name GitHub groups in the merge box", () => {
+    expect(CHECK_NAME).toBe("SlopCop");
+  });
+
+  it("creates an in_progress check and later completes the same run", async () => {
+    const calls: { method: string; endpoint: string; body: unknown }[] = [];
+    const request: GhClient["request"] = async (method, endpoint, body) => {
+      calls.push({ method, endpoint, body });
+      if (method === "POST") return { id: 99 };
+      if (method === "GET") {
+        return {
+          check_runs: [
+            { id: 99, external_id: "run_1", status: "in_progress" },
+          ],
+        };
+      }
+      return { id: 99 };
+    };
+
+    await startCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+    });
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+      status: "commented",
+      commentCount: 2,
+      detail: null,
+    });
+
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.endpoint).toBe("repos/acme/checkout-api/check-runs");
+    expect(calls[0]?.body).toMatchObject({
+      name: "SlopCop",
+      head_sha: "a1b2c3d",
+      status: "in_progress",
+      external_id: "run_1",
+    });
+    expect(calls[1]?.endpoint).toContain("filter=all");
+    expect(calls[2]?.method).toBe("PATCH");
+    expect(calls[2]?.endpoint).toBe("repos/acme/checkout-api/check-runs/99");
+    expect(calls[2]?.body).toMatchObject({
+      status: "completed",
+      conclusion: "success",
+    });
+  });
+
+  it("patches the id returned by start without listing check runs", async () => {
+    const calls: { method: string; endpoint: string }[] = [];
+    const request: GhClient["request"] = async (method, endpoint) => {
+      calls.push({ method, endpoint });
+      if (method === "POST") return { id: 42 };
+      return { id: 42 };
+    };
+    const id = await startCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+    });
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+      status: "failed",
+      commentCount: 0,
+      detail: null,
+      checkRunId: id,
+    });
+    expect(id).toBe(42);
+    expect(calls.map((call) => call.method)).toEqual(["POST", "PATCH"]);
+    expect(calls[1]?.endpoint).toBe("repos/acme/checkout-api/check-runs/42");
+  });
+
+  it("posts a completed check when no in-progress run exists to patch", async () => {
+    const calls: { method: string; endpoint: string; body: unknown }[] = [];
+    const request: GhClient["request"] = async (method, endpoint, body) => {
+      calls.push({ method, endpoint, body });
+      if (method === "GET") return { check_runs: [] };
+      return { id: 7 };
+    };
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "deadbeef",
+      runId: "run_9",
+      ruleName: "security-sweep",
+      prNumber: 1,
+      status: "failed",
+      commentCount: 0,
+      detail: "thread crashed",
+    });
+    expect(calls.at(-1)?.method).toBe("POST");
+    const posted = calls.at(-1)?.body as {
+      head_sha: string;
+      conclusion: string;
+      external_id: string;
+      started_at: string;
+      completed_at: string;
+    };
+    expect(posted).toMatchObject({
+      head_sha: "deadbeef",
+      conclusion: "failure",
+      external_id: "run_9",
+    });
+    expect(posted.started_at).toBe(posted.completed_at);
+    const failed = outputFor({
+      repo: "acme/checkout-api",
+      sha: "deadbeef",
+      runId: "run_9",
+      ruleName: "security-sweep",
+      prNumber: 1,
+      status: "failed",
+      commentCount: 0,
+      detail: "thread crashed /tmp/secret",
+    });
+    expect(failed.title).toBe("Review failed");
+    expect(failed.summary).not.toContain("thread crashed");
+    expect(failed.summary).not.toContain("/tmp/secret");
+  });
+
+  it("patches this run's in-progress check even when a later same-name run exists", async () => {
+    const calls: { method: string; endpoint: string }[] = [];
+    const request: GhClient["request"] = async (method, endpoint) => {
+      calls.push({ method, endpoint });
+      if (method === "GET") {
+        return {
+          check_runs: [
+            { id: 2, external_id: "run_other", status: "in_progress" },
+            { id: 1, external_id: "run_1", status: "in_progress" },
+          ],
+        };
+      }
+      return { id: 1 };
+    };
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+      status: "commented",
+      commentCount: 1,
+      detail: null,
+    });
+    expect(calls[0]?.endpoint).toContain("filter=all");
+    expect(calls[1]).toEqual({
+      method: "PATCH",
+      endpoint: "repos/acme/checkout-api/check-runs/1",
+    });
   });
 });

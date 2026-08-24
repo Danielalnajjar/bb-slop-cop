@@ -27,18 +27,45 @@ other command that writes to GitHub. Read-only \`gh\` commands are fine.
 Instead, output the review you WOULD have posted, as your final message, using
 the exact format below. It will be shown for approval before the rule goes live.`;
 
-function liveBanner(ghCommand: string): string {
+function liveBanner(ghCommand: string, context: DispatchContext): string {
   const note =
     ghCommand === "gh"
       ? ""
       : `\n\nUse \`${ghCommand}\` for every command that writes to GitHub — it is
 what posts under the SlopCop identity. Plain \`gh\` is fine for reads. Do not
 try to read, print, or pass a token yourself.`;
+  const repo = context.rule.repo;
+  const pr = context.pullRequest.number;
+  const sha = context.pullRequest.headRefOid;
+  // `gh pr review --comment` submits a Conversation-root review body. It cannot
+  // attach to a file, which is how findings ended up only in the top card.
   return `## POSTING
 
-Post your review to the PR with \`${ghCommand}\`. Use \`${ghCommand} pr review --comment\`
-for the summary (or \`--request-changes\` for something genuinely blocking), and
-inline comments for specific lines.${note}`;
+Post with \`${ghCommand}\`.
+
+Findings are line comments on the diff. Do not put finding text in the
+Conversation review body — \`gh pr review --comment\` cannot attach to a file.
+
+For each finding, post one review comment on the line (commit is the head SHA):
+
+    ${ghCommand} api repos/${repo}/pulls/${pr}/comments \\
+      -f commit_id=${sha} \\
+      -f path=FILE \\
+      -F line=LINE \\
+      -f side=RIGHT \\
+      -f body='…header, finding, marker…'
+
+\`path\` is repo-relative. \`line\` is the new-file line (RIGHT side). Use
+\`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
+and pass \`-f subject_type=file\`.
+
+If there are no findings, post one review summary:
+
+    ${ghCommand} pr review ${pr} --comment -b '…header, one sentence, marker…'
+
+Do not post a summary that contains findings. Do not also run
+\`gh pr review\` after line comments — that opens a second Conversation card.
+Line comments publish immediately; that is the finding.${note}`;
 }
 
 function formatBodyContract(context: DispatchContext): string {
@@ -61,21 +88,21 @@ Each comment MUST begin with the SlopCop header and end with its marker. The
 marker is invisible on GitHub and is how SlopCop finds its own comments later;
 a comment without it cannot be attributed and will be reported as a failure.
 
-Summary / review body — starts with:
-
-    ${buildHeader("summary", rule.name)}
-
-and ends with exactly:
-
-    ${summaryMarker}
-
-Each inline comment — starts with:
+Each finding is a line comment — starts with:
 
     ${buildHeader("inline", rule.name)} <the finding>
 
 and ends with exactly:
 
     ${inlineMarker}
+
+No-findings review body (only when there are zero findings) — starts with:
+
+    ${buildHeader("summary", rule.name)}
+
+and ends with exactly:
+
+    ${summaryMarker}
 
 Replies use the inline header and a marker with \`kind=reply\`. Do not alter the
 marker text in any way.`;
@@ -120,7 +147,7 @@ ${formatPullRequest(pullRequest, rule.repo)}
 
 ${rule.prompt.trim()}
 
-${shadow ? SHADOW_BANNER : liveBanner(context.ghCommand?.trim() || "gh")}
+${shadow ? SHADOW_BANNER : liveBanner(context.ghCommand?.trim() || "gh", context)}
 
 ${formatBodyContract(context)}
 
