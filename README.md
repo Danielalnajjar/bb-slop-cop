@@ -81,7 +81,8 @@ wrote it, plus a hidden marker so SlopCop can find its own comments later:
 ```
 
 Findings are line comments on the diff. A Conversation review body is only for
-the no-findings case (`kind=summary`).
+the no-findings case (`kind=summary`). A later run on a new commit is told
+which comments this rule already left, so it should not open a twin thread.
 
 When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
 polls GitHub's three separate comment surfaces (issue comments, inline review comments,

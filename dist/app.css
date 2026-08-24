@@ -232,6 +232,9 @@
     .ml-1\.5 {
       margin-left: calc(var(--spacing) * 1.5);
     }
+    .block {
+      display: block;
+    }
     .flex {
       display: flex;
     }
