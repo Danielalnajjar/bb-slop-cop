@@ -10,7 +10,8 @@
       "DOM"
     ],
     "types": [
-      "node"
+      "node",
+      "react"
     ],
     "paths": {
       "@/*": [

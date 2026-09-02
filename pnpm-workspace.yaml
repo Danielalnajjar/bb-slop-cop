@@ -1,0 +1,17 @@
+packages:
+  - .
+
+allowBuilds:
+  better-sqlite3: true
+
+enableGlobalVirtualStore: false
+
+minimumReleaseAgeExclude:
+  - "@get-bb/plugin-sdk@0.4.34"
+
+strictDepBuilds: true
+
+trustPolicy: no-downgrade
+trustPolicyExclude:
+  - "@pierre/theme@2.0.0"
+  - "undici-types@6.21.0"

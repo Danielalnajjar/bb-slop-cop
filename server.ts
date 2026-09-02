@@ -4,7 +4,11 @@
 // draft -> ready-for-review edge, matches PRs against enabled rules, and spawns
 // a review thread per match. When that thread goes idle, SlopCop verifies the
 // outcome against GitHub itself rather than trusting the agent's transcript.
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import {
+  defineRpcContract,
+  type BbPluginApi,
+  type PluginThreadEventPayloads,
+} from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
@@ -578,7 +582,123 @@ export default async function plugin(bb: BbPluginApi) {
     { finalMessage: string | null; failure: string | null }
   >();
 
-  async function finishRun(
+  // provider-retry and SlopCop both observe a failed turn. Correlate the
+  // failed request with the public retry row so dispatching that row cannot
+  // erase the evidence before thread.failed arrives.
+  const RETRY_QUEUE_GRACE_MS = 1_000;
+  type QueueEntry = PluginThreadEventPayloads["message.queued"]["entry"];
+  const failedRequestByThread = new Map<string, string>();
+  const preservedRequestByThread = new Map<string, string>();
+  const retriedRequestsByThread = new Map<string, Set<string>>();
+  const retryQueueWaiters = new Map<
+    string,
+    {
+      promise: Promise<boolean>;
+      timer: ReturnType<typeof setTimeout>;
+      resolve: (queued: boolean) => void;
+    }
+  >();
+  const finalizing = new Map<string, Promise<void>>();
+
+  function retryKey(threadId: string, requestId: string): string {
+    return `${threadId}\u0000${requestId}`;
+  }
+
+  function settleRetryQueueWaiter(
+    threadId: string,
+    requestId: string,
+    queued: boolean,
+  ): void {
+    const key = retryKey(threadId, requestId);
+    const waiter = retryQueueWaiters.get(key);
+    if (waiter === undefined) return;
+    clearTimeout(waiter.timer);
+    retryQueueWaiters.delete(key);
+    waiter.resolve(queued);
+  }
+
+  function noteRetry(entry: QueueEntry): void {
+    if (entry.payload.kind !== "retry") return;
+    const requestId = entry.payload.retryOfTurnRequestId;
+    const requests = retriedRequestsByThread.get(entry.threadId) ?? new Set();
+    requests.add(requestId);
+    retriedRequestsByThread.set(entry.threadId, requests);
+    settleRetryQueueWaiter(entry.threadId, requestId, true);
+  }
+
+  function hasRetry(threadId: string, requestId: string): boolean {
+    return retriedRequestsByThread.get(threadId)?.has(requestId) ?? false;
+  }
+
+  async function readRetryQueue(
+    threadId: string,
+    requestId: string,
+  ): Promise<boolean> {
+    try {
+      const entries = await bb.sdk.threads.queue.list({ threadId });
+      for (const entry of entries) {
+        noteRetry(entry);
+      }
+      return retriedRequestsByThread.get(threadId)?.has(requestId) ?? false;
+    } catch (error) {
+      bb.log.warn(
+        `could not inspect retry queue for ${threadId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return false;
+  }
+
+  async function retryExistsFor(
+    threadId: string,
+    requestId: string,
+  ): Promise<boolean> {
+    if (hasRetry(threadId, requestId)) return true;
+    if (await readRetryQueue(threadId, requestId)) return true;
+    if (hasRetry(threadId, requestId)) return true;
+
+    const key = retryKey(threadId, requestId);
+    const existing = retryQueueWaiters.get(key);
+    if (existing !== undefined) return existing.promise;
+
+    let settle!: (queued: boolean) => void;
+    const promise = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    const timer = setTimeout(() => {
+      retryQueueWaiters.delete(key);
+      settle(false);
+    }, RETRY_QUEUE_GRACE_MS);
+    retryQueueWaiters.set(key, { promise, timer, resolve: settle });
+    const queued = await promise;
+    return queued || hasRetry(threadId, requestId) || readRetryQueue(threadId, requestId);
+  }
+
+  function clearFailureCorrelation(threadId: string): void {
+    failedRequestByThread.delete(threadId);
+    preservedRequestByThread.delete(threadId);
+    retriedRequestsByThread.delete(threadId);
+  }
+
+  bb.onDispose(() => {
+    for (const waiter of retryQueueWaiters.values()) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(false);
+    }
+    retryQueueWaiters.clear();
+  });
+
+  bb.events.on("turn.failed", (event) => {
+    retriedRequestsByThread.delete(event.threadId);
+    failedRequestByThread.set(event.threadId, event.requestId);
+    preservedRequestByThread.delete(event.threadId);
+  });
+
+  bb.events.on("message.queued", ({ entry }) => noteRetry(entry));
+  bb.events.on("message.dispatched", ({ entry }) => noteRetry(entry));
+
+  async function finishRunOnce(
     threadId: string,
     finalMessage: string | null,
     failure: string | null,
@@ -666,7 +786,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  function finishRun(
+    threadId: string,
+    finalMessage: string | null,
+    failure: string | null,
+  ): Promise<void> {
+    const inProgress = finalizing.get(threadId);
+    if (inProgress !== undefined) return inProgress;
+    const promise = finishRunOnce(threadId, finalMessage, failure).finally(() => {
+      finalizing.delete(threadId);
+    });
+    finalizing.set(threadId, promise);
+    return promise;
+  }
+
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    clearFailureCorrelation(thread.id);
     void finishRun(thread.id, lastAssistantText, null).catch(
       (error: unknown) => {
         bb.log.error(
@@ -714,10 +849,26 @@ export default async function plugin(bb: BbPluginApi) {
     return "the review thread failed (no error detail recorded — open the thread)";
   }
 
-  bb.events.on("thread.failed", ({ thread, error }) => {
-    void describeThreadFailure(thread.id, error).then((detail) =>
-      finishRun(thread.id, null, detail),
-    );
+  bb.events.on("thread.failed", async ({ thread, error }) => {
+    const requestId = failedRequestByThread.get(thread.id);
+    if (
+      requestId !== undefined &&
+      preservedRequestByThread.get(thread.id) === requestId
+    ) {
+      return;
+    }
+
+    const detail = describeThreadFailure(thread.id, error);
+    if (requestId !== undefined) {
+      const retryQueued = await retryExistsFor(thread.id, requestId);
+      if (retryQueued) {
+        preservedRequestByThread.set(thread.id, requestId);
+        return;
+      }
+    }
+
+    clearFailureCorrelation(thread.id);
+    await finishRun(thread.id, null, await detail);
   });
 
   // --- shared helpers for rpc + cli ---------------------------------------
