@@ -331,6 +331,7 @@ export default async function plugin(bb: BbPluginApi) {
     pullRequest: PullRequest,
     options: { forcedReason?: string | null } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
+    const { botGhPath, defaultThreadSection } = await readSettings();
     const runId = newId("run");
     const now = Date.now();
     // A forced run bypassed a gate the rule would otherwise have honoured, so
@@ -376,7 +377,6 @@ export default async function plugin(bb: BbPluginApi) {
       prNumber: pullRequest.number,
       mode: rule.mode,
     };
-    const { botGhPath, defaultThreadSection } = await readSettings();
     let priorComments: ReturnType<typeof collectPriorComments> = [];
     try {
       const [issues, review, reviews] = await Promise.all([

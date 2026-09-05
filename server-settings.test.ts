@@ -110,3 +110,55 @@ it.each([
     await harness.lifecycle.dispose();
   }
 });
+
+it.each([
+  { pollSeconds: 14, maxConcurrentReviews: 3 },
+  { pollSeconds: 60, maxConcurrentReviews: 0 },
+])("does not reserve a run when manual dispatch rejects stored settings $pollSeconds/$maxConcurrentReviews", async (settings) => {
+  vi.useFakeTimers();
+  let polls = 0;
+  const pullRequest = {
+    number: 42, title: "Retry after correcting settings", draft: false,
+    head: { sha: "same-head" }, base: { ref: "main" },
+    user: { login: "dana" }, author_association: "MEMBER", labels: [],
+  };
+  vi.mocked(execFile).mockImplementation(((_file: string, args: string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+    let response = "[]";
+    if (args.includes("user")) response = "test-user";
+    else if (args.includes("repos/acme/widgets/pulls/42")) response = JSON.stringify(pullRequest);
+    else if (args.some(arg => arg.includes("pulls?"))) {
+      response = JSON.stringify([{ ...pullRequest, draft: ++polls === 1 }]);
+    }
+    callback(null, response, "");
+    return undefined as never;
+  }) as unknown as typeof execFile);
+  const { bb, harness } = createFakePluginHost({ settings });
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: "thr_retry" }));
+  try {
+    await plugin(bb);
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "settings-retry", repo: "acme/widgets", dedupe: "once_per_head_sha",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } }) as { rule: { id: string } };
+
+    await expect(harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 42 })).rejects.toThrow();
+    expect(await harness.behavior.callRpc("listRuns", {})).toEqual({ runs: [] });
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+
+    await harness.behavior.setSettings({ pollSeconds: 15, maxConcurrentReviews: 1 });
+    const service = harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await harness.behavior.callRpc("listRuns", {})).toMatchObject({ runs: [{
+        prNumber: 42, headSha: "same-head", status: "reviewing", threadId: "thr_retry",
+      }] });
+      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    } finally {
+      service.controller.abort();
+      await service.done;
+    }
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});

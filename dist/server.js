@@ -20386,6 +20386,7 @@ async function plugin(bb) {
     }
   }
   async function dispatch(rule, pullRequest, options = {}) {
+    const { botGhPath, defaultThreadSection } = await readSettings();
     const runId = newId("run");
     const now = Date.now();
     const forcedReason = options.forcedReason ?? null;
@@ -20424,7 +20425,6 @@ async function plugin(bb) {
       prNumber: pullRequest.number,
       mode: rule.mode
     };
-    const { botGhPath, defaultThreadSection } = await readSettings();
     let priorComments = [];
     try {
       const [issues, review, reviews] = await Promise.all([
