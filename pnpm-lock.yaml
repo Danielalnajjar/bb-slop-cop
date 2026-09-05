@@ -22,8 +22,8 @@ importers:
         version: 4.5.4
     devDependencies:
       '@get-bb/plugin-sdk':
-        specifier: 0.4.34
-        version: 0.4.34(@types/better-sqlite3@7.6.13)(@types/react@19.2.18)(better-sqlite3@12.11.1)(cron-parser@5.10.0)(hono@4.13.5)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.5.4)
+        specifier: 0.4.47
+        version: 0.4.47(@types/better-sqlite3@7.6.13)(@types/react@19.2.18)(better-sqlite3@12.11.1)(cron-parser@5.10.0)(hono@4.13.5)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.5.4)
       '@pierre/diffs':
         specifier: ^1.2.9
         version: 1.3.6(@shikijs/themes@4.4.3)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -129,8 +129,8 @@ packages:
   '@floating-ui/utils@0.2.12':
     resolution: {integrity: sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww==}
 
-  '@get-bb/plugin-sdk@0.4.34':
-    resolution: {integrity: sha512-2ugZuMXdASpmRUrGPaj09sk0t21xDJTudqzT0ucFW8pYY8PMyVmy7RCTRAsNo1oCicvOvD97rw8C1v3k5hYqFA==}
+  '@get-bb/plugin-sdk@0.4.47':
+    resolution: {integrity: sha512-qGUaLAzAZM/BCAAK8iTetlSwzRplw/BtMXqamgjVD2nKFKucOPAWzQOp/CtufS3t/1p7cfQ09rZwUYtnXtKFIQ==}
     peerDependencies:
       '@testing-library/react': ^16.3.2
       '@types/better-sqlite3': ^7.6.12
@@ -1646,7 +1646,7 @@ snapshots:
 
   '@floating-ui/utils@0.2.12': {}
 
-  '@get-bb/plugin-sdk@0.4.34(@types/better-sqlite3@7.6.13)(@types/react@19.2.18)(better-sqlite3@12.11.1)(cron-parser@5.10.0)(hono@4.13.5)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.5.4)':
+  '@get-bb/plugin-sdk@0.4.47(@types/better-sqlite3@7.6.13)(@types/react@19.2.18)(better-sqlite3@12.11.1)(cron-parser@5.10.0)(hono@4.13.5)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.5.4)':
     optionalDependencies:
       '@types/better-sqlite3': 7.6.13
       '@types/react': 19.2.18

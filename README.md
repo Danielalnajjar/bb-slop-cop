@@ -15,12 +15,24 @@ GitHub  ←(gh)—  watcher  →  rule matcher  →  dispatcher  →  BB agent
 
 ## Install
 
-Requires BB ≥ 0.35 and an authenticated [`gh`](https://cli.github.com) on the machine
+Requires BB ≥ 0.42.0 and an authenticated [`gh`](https://cli.github.com) on the machine
 running the BB server.
 
 ```sh
 bb plugin install git:https://github.com/SawyerHood/bb-slop-cop.git@main
 ```
+
+## Numeric settings upgrade
+
+`pollSeconds` is an integer ≥15 (default 60); `maxConcurrentReviews` is an
+integer ≥1 (default 3). Before upgrading, read these settings through
+`bb plugin config slopcop --json`. Canonical strings such as `"60"` and `"3"`
+need no write: BB 0.42 reads them as numbers without rewriting storage.
+Non-canonical strings must first be saved as canonical decimal strings under
+the old plugin, preserving its effective `parseInt` value and defaults.
+After upgrading, read back the numbers and verify `bb slopcop status` before
+enabling reviews. Invalid stored numeric values stop settings-dependent work
+until corrected through Settings or the CLI; the plugin never rewrites them.
 
 ## Quick start
 

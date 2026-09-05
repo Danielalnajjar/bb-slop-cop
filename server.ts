@@ -44,6 +44,9 @@ import {
   type Trigger,
 } from "./lib/types";
 
+const pollSecondsSchema = z.number().int().min(15);
+const maxConcurrentReviewsSchema = z.number().int().min(1);
+
 const RUNS_CHANNEL = "runs-changed";
 
 const ruleInputSchema = z.object({
@@ -181,14 +184,16 @@ function toRuleOutput(rule: Rule) {
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     pollSeconds: {
-      type: "string",
+      type: "number",
       label: "Poll interval (seconds)",
-      default: "60",
+      default: 60,
+      experimental_schema: pollSecondsSchema,
     },
     maxConcurrentReviews: {
-      type: "string",
+      type: "number",
       label: "Max concurrent review threads",
-      default: "3",
+      default: 3,
+      experimental_schema: maxConcurrentReviewsSchema,
     },
     ghPath: { type: "string", label: "Path to the gh binary", default: "gh" },
     botGhPath: {
@@ -217,13 +222,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   const readSettings = async () => {
     const values = await settings.get();
-    const poll = Number.parseInt(values.pollSeconds, 10);
-    const concurrency = Number.parseInt(values.maxConcurrentReviews, 10);
+    // Stored values bypass save-time validation, so validate before scheduling.
+    const pollSeconds = pollSecondsSchema.parse(values.pollSeconds);
+    const maxConcurrent = maxConcurrentReviewsSchema.parse(
+      values.maxConcurrentReviews,
+    );
     const botGhPath = values.botGhPath.trim();
     return {
-      pollSeconds: Number.isFinite(poll) && poll >= 15 ? poll : 60,
-      maxConcurrent:
-        Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 3,
+      pollSeconds,
+      maxConcurrent,
       // One switch turns on bot mode. The backend client and the agent's write
       // command must resolve to the same identity, or `verifyLive`'s
       // account-based fallback would look for comments from the wrong login.
@@ -324,6 +331,7 @@ export default async function plugin(bb: BbPluginApi) {
     pullRequest: PullRequest,
     options: { forcedReason?: string | null } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
+    const { botGhPath, defaultThreadSection } = await readSettings();
     const runId = newId("run");
     const now = Date.now();
     // A forced run bypassed a gate the rule would otherwise have honoured, so
@@ -369,7 +377,6 @@ export default async function plugin(bb: BbPluginApi) {
       prNumber: pullRequest.number,
       mode: rule.mode,
     };
-    const { botGhPath, defaultThreadSection } = await readSettings();
     let priorComments: ReturnType<typeof collectPriorComments> = [];
     try {
       const [issues, review, reviews] = await Promise.all([

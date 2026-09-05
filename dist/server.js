@@ -20152,6 +20152,8 @@ async function completeCheckRun(request, input2) {
 }
 
 // server.ts
+var pollSecondsSchema = external_exports.number().int().min(15);
+var maxConcurrentReviewsSchema = external_exports.number().int().min(1);
 var RUNS_CHANNEL = "runs-changed";
 var ruleInputSchema = external_exports.object({
   name: external_exports.string().min(1),
@@ -20281,14 +20283,16 @@ function toRuleOutput(rule) {
 async function plugin(bb) {
   const settings = bb.settings.define({
     pollSeconds: {
-      type: "string",
+      type: "number",
       label: "Poll interval (seconds)",
-      default: "60"
+      default: 60,
+      experimental_schema: pollSecondsSchema
     },
     maxConcurrentReviews: {
-      type: "string",
+      type: "number",
       label: "Max concurrent review threads",
-      default: "3"
+      default: 3,
+      experimental_schema: maxConcurrentReviewsSchema
     },
     ghPath: { type: "string", label: "Path to the gh binary", default: "gh" },
     botGhPath: {
@@ -20312,12 +20316,14 @@ async function plugin(bb) {
   let inFlight = 0;
   const readSettings = async () => {
     const values = await settings.get();
-    const poll2 = Number.parseInt(values.pollSeconds, 10);
-    const concurrency = Number.parseInt(values.maxConcurrentReviews, 10);
+    const pollSeconds = pollSecondsSchema.parse(values.pollSeconds);
+    const maxConcurrent = maxConcurrentReviewsSchema.parse(
+      values.maxConcurrentReviews
+    );
     const botGhPath = values.botGhPath.trim();
     return {
-      pollSeconds: Number.isFinite(poll2) && poll2 >= 15 ? poll2 : 60,
-      maxConcurrent: Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 3,
+      pollSeconds,
+      maxConcurrent,
       // One switch turns on bot mode. The backend client and the agent's write
       // command must resolve to the same identity, or `verifyLive`'s
       // account-based fallback would look for comments from the wrong login.
@@ -20380,6 +20386,7 @@ async function plugin(bb) {
     }
   }
   async function dispatch(rule, pullRequest, options = {}) {
+    const { botGhPath, defaultThreadSection } = await readSettings();
     const runId = newId("run");
     const now = Date.now();
     const forcedReason = options.forcedReason ?? null;
@@ -20418,7 +20425,6 @@ async function plugin(bb) {
       prNumber: pullRequest.number,
       mode: rule.mode
     };
-    const { botGhPath, defaultThreadSection } = await readSettings();
     let priorComments = [];
     try {
       const [issues, review, reviews] = await Promise.all([
