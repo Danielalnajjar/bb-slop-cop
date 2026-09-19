@@ -49,14 +49,22 @@ Post with \`${ghCommand}\`.
 Findings are line comments on the diff. Do not put finding text in the
 Conversation review body — \`gh pr review --comment\` cannot attach to a file.
 
+Write every body to its own file first, with a quoted heredoc delimiter so
+the text lands exactly as written, and pass the file to \`gh\`. Never pass a
+body inline in quotes: a \`\\n\` typed inside quotes reaches GitHub as two
+literal characters, not a line break.
+
 For each finding, post one review comment on the line (commit is the head SHA):
 
+    cat >/tmp/slopcop-finding-N.md <<'BODY'
+    …header, finding, marker…
+    BODY
     ${ghCommand} api repos/${repo}/pulls/${pr}/comments \\
       -f commit_id=${sha} \\
       -f path=FILE \\
       -F line=LINE \\
       -f side=RIGHT \\
-      -f body='…header, finding, marker…'
+      -f body=@/tmp/slopcop-finding-N.md
 
 \`path\` is repo-relative. \`line\` is the new-file line (RIGHT side). Use
 \`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
@@ -64,7 +72,10 @@ and pass \`-f subject_type=file\`.
 
 If there are no findings, post one review summary:
 
-    ${ghCommand} pr review ${pr} --comment -b '…header, one sentence, marker…'
+    cat >/tmp/slopcop-summary.md <<'BODY'
+    …header, one sentence, marker…
+    BODY
+    ${ghCommand} pr review ${pr} --comment --body-file /tmp/slopcop-summary.md
 
 Do not post a summary that contains findings. Do not also run
 \`gh pr review\` after line comments — that opens a second Conversation card.

@@ -19514,14 +19514,22 @@ Post with \`${ghCommand}\`.
 Findings are line comments on the diff. Do not put finding text in the
 Conversation review body \u2014 \`gh pr review --comment\` cannot attach to a file.
 
+Write every body to its own file first, with a quoted heredoc delimiter so
+the text lands exactly as written, and pass the file to \`gh\`. Never pass a
+body inline in quotes: a \`\\n\` typed inside quotes reaches GitHub as two
+literal characters, not a line break.
+
 For each finding, post one review comment on the line (commit is the head SHA):
 
+    cat >/tmp/slopcop-finding-N.md <<'BODY'
+    \u2026header, finding, marker\u2026
+    BODY
     ${ghCommand} api repos/${repo}/pulls/${pr}/comments \\
       -f commit_id=${sha} \\
       -f path=FILE \\
       -F line=LINE \\
       -f side=RIGHT \\
-      -f body='\u2026header, finding, marker\u2026'
+      -f body=@/tmp/slopcop-finding-N.md
 
 \`path\` is repo-relative. \`line\` is the new-file line (RIGHT side). Use
 \`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
@@ -19529,7 +19537,10 @@ and pass \`-f subject_type=file\`.
 
 If there are no findings, post one review summary:
 
-    ${ghCommand} pr review ${pr} --comment -b '\u2026header, one sentence, marker\u2026'
+    cat >/tmp/slopcop-summary.md <<'BODY'
+    \u2026header, one sentence, marker\u2026
+    BODY
+    ${ghCommand} pr review ${pr} --comment --body-file /tmp/slopcop-summary.md
 
 Do not post a summary that contains findings. Do not also run
 \`gh pr review\` after line comments \u2014 that opens a second Conversation card.

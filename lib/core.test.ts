@@ -158,6 +158,14 @@ describe("bot posting command", () => {
     expect(prompt).toContain("only when there are zero findings");
     expect(prompt).toContain("pr review 482 --comment");
     expect(prompt).toContain("Do not also run");
+  });
+
+  it("makes live agents post bodies from files, never inline quotes", () => {
+    const prompt = buildPrompt(context());
+    expect(prompt).toContain("-f body=@/tmp/slopcop-finding-N.md");
+    expect(prompt).toContain("--comment --body-file /tmp/slopcop-summary.md");
+    expect(prompt).not.toContain("body='");
+    expect(prompt).not.toContain(" -b '");
     expect(prompt).toContain("second Conversation card");
     expect(prompt).not.toContain("--request-changes");
     expect(prompt).toContain("at most two short sentences");
