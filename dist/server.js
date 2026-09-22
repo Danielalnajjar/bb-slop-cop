@@ -19348,14 +19348,13 @@ function createStore(db) {
       );
     },
     /**
-     * Runs whose review thread was spawned but never reached a terminal
-     * status. Thread lifecycle events are process-local, so these are what a
-     * restart has to reconcile against BB.
+     * Runs still reviewing or awaiting terminal check/thread cleanup.
+     * A selected verdict stays unfinished until its finalization completes.
      */
     listUnfinishedRuns() {
       const rows = db.prepare(
         `SELECT * FROM runs
-           WHERE finished_at IS NULL AND thread_id IS NOT NULL
+           WHERE finished_at IS NULL
            ORDER BY started_at`
       ).all();
       return rows.map(rowToRun);
@@ -20522,7 +20521,7 @@ async function plugin(bb) {
         store.updateRun(runId, {
           status: "cancelled",
           detail: "plugin stopped before dispatch completed",
-          finishedAt: Date.now()
+          finishedAt: null
         });
         announce();
       }
@@ -20598,7 +20597,7 @@ async function plugin(bb) {
       }));
       const threadId = thread.id;
       const reserved = store.getRun(runId);
-      if (reserved !== null && reserved.finishedAt !== null) {
+      if (reserved !== null && !isReviewInProgress(reserved)) {
         store.updateRun(runId, { threadId });
         await stopReviewThread(threadId);
         bb.log.info(
@@ -20623,14 +20622,10 @@ async function plugin(bb) {
       store.updateRun(runId, {
         status: "failed",
         detail: error61 instanceof Error ? error61.message : String(error61),
-        finishedAt: Date.now()
+        finishedAt: null
       });
       announce();
-      await reportCheck("complete", checkRun, {
-        status: "failed",
-        commentCount: 0,
-        detail: null
-      });
+      await finalizeRun(store.getRun(runId));
       return { runId, threadId: null };
     }
   }
@@ -20815,6 +20810,18 @@ async function plugin(bb) {
   });
   bb.events.on("message.queued", ({ entry }) => noteRetry(entry));
   bb.events.on("message.dispatched", ({ entry }) => noteRetry(entry));
+  function isReviewInProgress(run2) {
+    return run2.status === "dispatched" || run2.status === "reviewing";
+  }
+  async function finalizeRun(run2) {
+    await reportCheck("complete", run2, run2);
+    const threadId = run2.threadId;
+    if (threadId !== null) {
+      await waitForWork(() => archiveReviewThread(bb, threadId));
+    }
+    store.updateRun(run2.id, { finishedAt: Date.now() });
+    announce();
+  }
   async function finishRunOnce(threadId, finalMessage, noVerdict) {
     const run2 = store.findRunByThread(threadId);
     if (run2 === null) {
@@ -20822,20 +20829,19 @@ async function plugin(bb) {
       return;
     }
     if (run2.finishedAt !== null) return;
+    if (!isReviewInProgress(run2)) {
+      await finalizeRun(run2);
+      return;
+    }
     inFlight = Math.max(0, inFlight - 1);
     try {
       if (noVerdict !== null) {
         store.updateRun(run2.id, {
           status: "cancelled",
           detail: noVerdict,
-          finishedAt: Date.now()
+          finishedAt: null
         });
         announce();
-        await reportCheck("complete", run2, {
-          status: "cancelled",
-          commentCount: 0,
-          detail: noVerdict
-        });
         return;
       }
       const runVerify = () => verifyLive({
@@ -20872,14 +20878,9 @@ async function plugin(bb) {
         status: result.status,
         detail: result.detail,
         commentCount: result.comments.length,
-        finishedAt: Date.now()
+        finishedAt: null
       });
       announce();
-      await reportCheck("complete", run2, {
-        status: result.status,
-        commentCount: result.comments.length,
-        detail: result.detail
-      });
       bb.log.info(
         `run ${run2.id} (${run2.ruleName} #${run2.prNumber}) -> ${result.status}`
       );
@@ -20889,20 +20890,16 @@ async function plugin(bb) {
       store.updateRun(run2.id, {
         status: "failed",
         detail,
-        finishedAt: Date.now()
+        finishedAt: null
       });
       announce();
-      await reportCheck("complete", run2, {
-        status: "failed",
-        commentCount: 0,
-        detail: null
-      });
       bb.log.error(
         `verification failed: ${detail}`
       );
     } finally {
-      if (!watcherSignal?.aborted) {
-        await waitForWork(() => archiveReviewThread(bb, threadId));
+      const selected = store.getRun(run2.id);
+      if (selected !== null && !isReviewInProgress(selected) && !watcherSignal?.aborted) {
+        await finalizeRun(selected);
       }
     }
   }
@@ -20963,23 +20960,37 @@ async function plugin(bb) {
     clearFailureCorrelation(thread.id);
     await finishRun(thread.id, null, await detail);
   });
-  function hasUnfinishedRun(threadId) {
+  function hasReviewInProgress(threadId) {
     const run2 = store.findRunByThread(threadId);
-    return run2 !== null && run2.finishedAt === null;
+    return run2 !== null && isReviewInProgress(run2);
   }
   bb.events.on("thread.archived", async ({ thread }) => {
-    if (!hasUnfinishedRun(thread.id)) return;
+    if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
   });
   bb.events.on("thread.deleted", async ({ thread }) => {
-    if (!hasUnfinishedRun(thread.id)) return;
+    if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_DELETED_REASON);
   });
   async function reconcileUnfinishedRuns() {
     for (const run2 of store.listUnfinishedRuns()) {
       const threadId = run2.threadId;
-      if (threadId === null) continue;
       try {
+        if (!isReviewInProgress(run2)) {
+          if (threadId === null) await finalizeRun(run2);
+          else await finishRun(threadId, null, null);
+          continue;
+        }
+        if (threadId === null) {
+          const cancelled = {
+            ...run2,
+            status: "cancelled",
+            detail: "plugin stopped before dispatch completed"
+          };
+          store.updateRun(run2.id, cancelled);
+          await finalizeRun(cancelled);
+          continue;
+        }
         const thread = await waitForWork(() => bb.sdk.threads.get({ threadId }));
         const outcome = reviewThreadOutcome(thread);
         if (outcome.kind === "running") {
@@ -21029,14 +21040,10 @@ async function plugin(bb) {
       store.updateRun(run2.id, {
         status: "cancelled",
         detail: CANCELLED_DETAIL,
-        finishedAt: Date.now()
+        finishedAt: null
       });
       announce();
-      await reportCheck("complete", run2, {
-        status: "cancelled",
-        commentCount: 0,
-        detail: CANCELLED_DETAIL
-      });
+      await finalizeRun({ ...run2, status: "cancelled", detail: CANCELLED_DETAIL });
       return;
     }
     await finishRun(run2.threadId, null, CANCELLED_DETAIL);
@@ -21339,7 +21346,7 @@ ${payload.rules} rule(s)`
           if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
           const run2 = store.getRun(runId);
           if (run2 === null) return fail(`no such run '${runId}'`);
-          if (run2.finishedAt !== null) {
+          if (!isReviewInProgress(run2)) {
             return fail(
               `run ${run2.id} already finished as ${run2.status} \u2014 nothing to cancel`
             );

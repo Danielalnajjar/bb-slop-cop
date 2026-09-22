@@ -383,7 +383,7 @@ export default async function plugin(bb: BbPluginApi) {
         store.updateRun(runId, {
           status: "cancelled",
           detail: "plugin stopped before dispatch completed",
-          finishedAt: Date.now(),
+          finishedAt: null,
         });
         announce();
       }
@@ -482,7 +482,7 @@ export default async function plugin(bb: BbPluginApi) {
       // cancellation stays; writing `reviewing` over it here would leave the
       // agent running with no event able to close the run again.
       const reserved = store.getRun(runId);
-      if (reserved !== null && reserved.finishedAt !== null) {
+      if (reserved !== null && !isReviewInProgress(reserved)) {
         store.updateRun(runId, { threadId });
         await stopReviewThread(threadId);
         bb.log.info(
@@ -507,14 +507,10 @@ export default async function plugin(bb: BbPluginApi) {
       store.updateRun(runId, {
         status: "failed",
         detail: error instanceof Error ? error.message : String(error),
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", checkRun, {
-        status: "failed",
-        commentCount: 0,
-        detail: null,
-      });
+      await finalizeRun(store.getRun(runId)!);
       return { runId, threadId: null };
     }
   }
@@ -773,6 +769,20 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("message.queued", ({ entry }) => noteRetry(entry));
   bb.events.on("message.dispatched", ({ entry }) => noteRetry(entry));
 
+  function isReviewInProgress(run: Run): boolean {
+    return run.status === "dispatched" || run.status === "reviewing";
+  }
+
+  async function finalizeRun(run: Run): Promise<void> {
+    await reportCheck("complete", run, run);
+    const threadId = run.threadId;
+    if (threadId !== null) {
+      await waitForWork(() => archiveReviewThread(bb, threadId));
+    }
+    store.updateRun(run.id, { finishedAt: Date.now() });
+    announce();
+  }
+
   async function finishRunOnce(
     threadId: string,
     finalMessage: string | null,
@@ -784,6 +794,10 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     if (run.finishedAt !== null) return;
+    if (!isReviewInProgress(run)) {
+      await finalizeRun(run);
+      return;
+    }
     inFlight = Math.max(0, inFlight - 1);
 
     try {
@@ -795,14 +809,9 @@ export default async function plugin(bb: BbPluginApi) {
         store.updateRun(run.id, {
           status: "cancelled",
           detail: noVerdict,
-          finishedAt: Date.now(),
+          finishedAt: null,
         });
         announce();
-        await reportCheck("complete", run, {
-          status: "cancelled",
-          commentCount: 0,
-          detail: noVerdict,
-        });
         return;
       }
 
@@ -854,14 +863,9 @@ export default async function plugin(bb: BbPluginApi) {
         status: result.status,
         detail: result.detail,
         commentCount: result.comments.length,
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", run, {
-        status: result.status,
-        commentCount: result.comments.length,
-        detail: result.detail,
-      });
       bb.log.info(
         `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
       );
@@ -871,20 +875,16 @@ export default async function plugin(bb: BbPluginApi) {
       store.updateRun(run.id, {
         status: "failed",
         detail,
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", run, {
-        status: "failed",
-        commentCount: 0,
-        detail: null,
-      });
       bb.log.error(
         `verification failed: ${detail}`,
       );
     } finally {
-      if (!watcherSignal?.aborted) {
-        await waitForWork(() => archiveReviewThread(bb, threadId));
+      const selected = store.getRun(run.id);
+      if (selected !== null && !isReviewInProgress(selected) && !watcherSignal?.aborted) {
+        await finalizeRun(selected);
       }
     }
   }
@@ -975,9 +975,9 @@ export default async function plugin(bb: BbPluginApi) {
     await finishRun(thread.id, null, await detail);
   });
 
-  function hasUnfinishedRun(threadId: string): boolean {
+  function hasReviewInProgress(threadId: string): boolean {
     const run = store.findRunByThread(threadId);
-    return run !== null && run.finishedAt === null;
+    return run !== null && isReviewInProgress(run);
   }
 
   /**
@@ -990,12 +990,12 @@ export default async function plugin(bb: BbPluginApi) {
    * still open.
    */
   bb.events.on("thread.archived", async ({ thread }) => {
-    if (!hasUnfinishedRun(thread.id)) return;
+    if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
   });
 
   bb.events.on("thread.deleted", async ({ thread }) => {
-    if (!hasUnfinishedRun(thread.id)) return;
+    if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_DELETED_REASON);
   });
 
@@ -1011,8 +1011,19 @@ export default async function plugin(bb: BbPluginApi) {
   async function reconcileUnfinishedRuns(): Promise<void> {
     for (const run of store.listUnfinishedRuns()) {
       const threadId = run.threadId;
-      if (threadId === null) continue;
       try {
+        if (!isReviewInProgress(run)) {
+          if (threadId === null) await finalizeRun(run);
+          else await finishRun(threadId, null, null);
+          continue;
+        }
+        if (threadId === null) {
+          const cancelled = { ...run, status: "cancelled" as const,
+            detail: "plugin stopped before dispatch completed" };
+          store.updateRun(run.id, cancelled);
+          await finalizeRun(cancelled);
+          continue;
+        }
         const thread = (await waitForWork(() => bb.sdk.threads.get({ threadId }))) as {
           status: string;
           archivedAt?: number | null;
@@ -1083,23 +1094,18 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The operator's way out of a run nothing else can close. The run is
-   * finalized before the thread is stopped: stopping an active thread makes BB
-   * announce `thread.idle`, and a finished run turns that announcement into a
-   * no-op rather than a verification pass that overwrites the reason.
+   * assigned its terminal verdict before the thread is stopped: BB can announce
+   * `thread.idle` during cleanup, which must not overwrite that verdict.
    */
   async function cancelRun(run: Run): Promise<void> {
     if (run.threadId === null) {
       store.updateRun(run.id, {
         status: "cancelled",
         detail: CANCELLED_DETAIL,
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", run, {
-        status: "cancelled",
-        commentCount: 0,
-        detail: CANCELLED_DETAIL,
-      });
+      await finalizeRun({ ...run, status: "cancelled", detail: CANCELLED_DETAIL });
       return;
     }
     await finishRun(run.threadId, null, CANCELLED_DETAIL);
@@ -1489,7 +1495,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
           const run = store.getRun(runId);
           if (run === null) return fail(`no such run '${runId}'`);
-          if (run.finishedAt !== null) {
+          if (!isReviewInProgress(run)) {
             return fail(
               `run ${run.id} already finished as ${run.status} — nothing to cancel`,
             );
