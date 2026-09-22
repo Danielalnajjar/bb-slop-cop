@@ -518,7 +518,7 @@ const marked = (kind: "summary" | "inline", run = "run_1") =>
   });
 
 describe("live verification", () => {
-  it("refuses shadow, in-flight, and skipped runs", () => {
+  it("refuses shadow, in-flight, skipped, and cancelled runs", () => {
     expect(
       liveVerifyBlockReason({
         mode: "shadow",
@@ -540,6 +540,15 @@ describe("live verification", () => {
         finishedAt: 1,
       }),
     ).toMatch(/skipped/);
+    // Verifying a cancelled run would rewrite it as `no_comment`, which
+    // dedupes away the re-review that `cancelled` exists to keep available.
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "cancelled",
+        finishedAt: 1,
+      }),
+    ).toMatch(/cancelled/);
     expect(
       liveVerifyBlockReason({
         mode: "live",

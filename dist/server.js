@@ -19954,6 +19954,9 @@ function liveVerifyBlockReason(run2) {
   if (run2.status === "skipped") {
     return "skipped runs never dispatched a review";
   }
+  if (run2.status === "cancelled") {
+    return "cancelled runs never reached a verdict \u2014 dispatch a new review instead";
+  }
   return null;
 }
 async function verifyLive(options) {
@@ -20524,6 +20527,15 @@ async function plugin(bb) {
         ...sectionId === void 0 ? {} : { sectionId }
       });
       const threadId = thread.id;
+      const reserved = store.getRun(runId);
+      if (reserved !== null && reserved.finishedAt !== null) {
+        store.updateRun(runId, { threadId });
+        await stopReviewThread(threadId);
+        bb.log.info(
+          `run ${runId} was cancelled before ${threadId} spawned; stopped it`
+        );
+        return { runId, threadId };
+      }
       store.updateRun(runId, { status: "reviewing", threadId });
       inFlight += 1;
       announce();
@@ -20679,6 +20691,17 @@ async function plugin(bb) {
       );
     }
     return false;
+  }
+  async function retryQueuedFor(threadId) {
+    try {
+      const entries = await bb.sdk.threads.queue.list({ threadId });
+      return entries.some((entry) => entry.payload.kind === "retry");
+    } catch (error61) {
+      bb.log.warn(
+        `could not inspect retry queue for ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
+      );
+      return false;
+    }
   }
   async function retryExistsFor(threadId, requestId) {
     if (hasRetry(threadId, requestId)) return true;
@@ -20866,13 +20889,22 @@ async function plugin(bb) {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
         const outcome = reviewThreadOutcome(thread);
-        if (outcome.kind === "running") continue;
+        if (outcome.kind === "running") {
+          inFlight += 1;
+          continue;
+        }
         bb.log.info(
           `reconciling ${run2.id} (${run2.ruleName} #${run2.prNumber}): its thread is ${thread.status}`
         );
         if (outcome.kind === "finished") {
-          const { output: output2 } = await bb.sdk.threads.output({ threadId });
-          await finishRun(threadId, output2, null);
+          const finalMessage = run2.mode === "shadow" ? (await bb.sdk.threads.output({ threadId })).output : null;
+          await finishRun(threadId, finalMessage, null);
+          continue;
+        }
+        if (thread.status === "error" && await retryQueuedFor(threadId)) {
+          bb.log.info(
+            `leaving run ${run2.id} open: a retry is queued for ${threadId}`
+          );
           continue;
         }
         await finishRun(
@@ -20885,6 +20917,15 @@ async function plugin(bb) {
           `could not reconcile run ${run2.id}: ${error61 instanceof Error ? error61.message : String(error61)}`
         );
       }
+    }
+  }
+  async function stopReviewThread(threadId) {
+    try {
+      await bb.sdk.threads.stop({ threadId });
+    } catch (error61) {
+      bb.log.warn(
+        `could not stop review thread ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
+      );
     }
   }
   const CANCELLED_DETAIL = "cancelled by operator";
@@ -20904,13 +20945,7 @@ async function plugin(bb) {
       return;
     }
     await finishRun(run2.threadId, null, CANCELLED_DETAIL);
-    try {
-      await bb.sdk.threads.stop({ threadId: run2.threadId });
-    } catch (error61) {
-      bb.log.warn(
-        `could not stop review thread ${run2.threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
-      );
-    }
+    await stopReviewThread(run2.threadId);
   }
   function resolveRule(idOrName) {
     const rule = store.getRule(idOrName) ?? store.findRuleByName(idOrName);
@@ -21217,6 +21252,11 @@ ${payload.rules} rule(s)`
           await cancelRun(run2);
           const cancelled = store.getRun(run2.id);
           if (json2) return ok(JSON.stringify(cancelled, null, 2));
+          if (cancelled !== null && cancelled.status !== "cancelled") {
+            return ok(
+              `Run ${run2.id} (${run2.ruleName} #${run2.prNumber}) finished as ${cancelled.status} before the cancellation landed.`
+            );
+          }
           return ok(
             `Cancelled ${run2.id} (${run2.ruleName} #${run2.prNumber}) \u2014 ${CANCELLED_DETAIL}.`
           );

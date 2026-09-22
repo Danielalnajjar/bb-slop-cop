@@ -450,6 +450,18 @@ export default async function plugin(bb: BbPluginApi) {
         ...(sectionId === undefined ? {} : { sectionId }),
       } as never);
       const threadId = (thread as { id: string }).id;
+      // `runs cancel` can finalize this run while it still has no thread. The
+      // cancellation stays; writing `reviewing` over it here would leave the
+      // agent running with no event able to close the run again.
+      const reserved = store.getRun(runId);
+      if (reserved !== null && reserved.finishedAt !== null) {
+        store.updateRun(runId, { threadId });
+        await stopReviewThread(threadId);
+        bb.log.info(
+          `run ${runId} was cancelled before ${threadId} spawned; stopped it`,
+        );
+        return { runId, threadId };
+      }
       store.updateRun(runId, { status: "reviewing", threadId });
       inFlight += 1;
       announce();
@@ -660,6 +672,25 @@ export default async function plugin(bb: BbPluginApi) {
       );
     }
     return false;
+  }
+
+  /**
+   * Whether the thread's queue still holds a retry. The correlated check needs
+   * the failed request id, which no longer exists after a restart, so the
+   * reconcile pass asks the weaker question the persistent queue can answer.
+   */
+  async function retryQueuedFor(threadId: string): Promise<boolean> {
+    try {
+      const entries = await bb.sdk.threads.queue.list({ threadId });
+      return entries.some((entry) => entry.payload.kind === "retry");
+    } catch (error) {
+      bb.log.warn(
+        `could not inspect retry queue for ${threadId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
+    }
   }
 
   async function retryExistsFor(
@@ -931,13 +962,33 @@ export default async function plugin(bb: BbPluginApi) {
           deletedAt?: number | null;
         };
         const outcome = reviewThreadOutcome(thread);
-        if (outcome.kind === "running") continue;
+        if (outcome.kind === "running") {
+          // `inFlight` starts at zero on load, and this is the only pass that
+          // knows a recovered review still occupies one of its slots.
+          inFlight += 1;
+          continue;
+        }
         bb.log.info(
           `reconciling ${run.id} (${run.ruleName} #${run.prNumber}): its thread is ${thread.status}`,
         );
         if (outcome.kind === "finished") {
-          const { output } = await bb.sdk.threads.output({ threadId });
-          await finishRun(threadId, output, null);
+          // Only a shadow review is read from its transcript; a live one is
+          // verified against GitHub. Fetching an output nobody reads would
+          // strand the run whenever that call fails.
+          const finalMessage =
+            run.mode === "shadow"
+              ? (await bb.sdk.threads.output({ threadId })).output
+              : null;
+          await finishRun(threadId, finalMessage, null);
+          continue;
+        }
+        // The live `thread.failed` path leaves an errored thread alone while a
+        // provider retry is queued for it; a restart inside that window must
+        // not finalize and archive the review the retry is about to resume.
+        if (thread.status === "error" && (await retryQueuedFor(threadId))) {
+          bb.log.info(
+            `leaving run ${run.id} open: a retry is queued for ${threadId}`,
+          );
           continue;
         }
         await finishRun(
@@ -954,6 +1005,18 @@ export default async function plugin(bb: BbPluginApi) {
           }`,
         );
       }
+    }
+  }
+
+  async function stopReviewThread(threadId: string): Promise<void> {
+    try {
+      await bb.sdk.threads.stop({ threadId });
+    } catch (error) {
+      bb.log.warn(
+        `could not stop review thread ${threadId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 
@@ -981,15 +1044,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     await finishRun(run.threadId, null, CANCELLED_DETAIL);
-    try {
-      await bb.sdk.threads.stop({ threadId: run.threadId });
-    } catch (error) {
-      bb.log.warn(
-        `could not stop review thread ${run.threadId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+    await stopReviewThread(run.threadId);
   }
 
   // --- shared helpers for rpc + cli ---------------------------------------
@@ -1383,6 +1438,13 @@ export default async function plugin(bb: BbPluginApi) {
           await cancelRun(run);
           const cancelled = store.getRun(run.id);
           if (json) return ok(JSON.stringify(cancelled, null, 2));
+          // A verification already under way for this thread finishes the run
+          // on its own verdict; say which one won rather than claiming this.
+          if (cancelled !== null && cancelled.status !== "cancelled") {
+            return ok(
+              `Run ${run.id} (${run.ruleName} #${run.prNumber}) finished as ${cancelled.status} before the cancellation landed.`,
+            );
+          }
           return ok(
             `Cancelled ${run.id} (${run.ruleName} #${run.prNumber}) — ${CANCELLED_DETAIL}.`,
           );

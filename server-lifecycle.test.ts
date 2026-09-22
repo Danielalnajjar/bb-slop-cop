@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import {
   createFakePluginHost,
+  makeQueueEntry,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
@@ -42,6 +43,44 @@ function stubGhLogin(): void {
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => {
     callback(null, "test-user", "");
+    return undefined as never;
+  }) as unknown as typeof execFile);
+}
+
+/**
+ * `gh` for a watcher that actually polls: an empty API, or one PR that is a
+ * draft on the first poll and ready on the second, which is the
+ * `ready_for_review` transition a rule triggers on.
+ */
+function stubGh(options: { readyPullRequest?: boolean } = {}): void {
+  let polls = 0;
+  const pullRequest = {
+    number: 7,
+    title: "A PR nobody is reviewing yet",
+    draft: false,
+    head: { sha: "sha-7" },
+    base: { ref: "main" },
+    user: { login: "dana" },
+    author_association: "MEMBER",
+    labels: [],
+  };
+  vi.mocked(execFile).mockImplementation(((
+    _file: string,
+    args: string[],
+    _options: unknown,
+    callback: (error: Error | null, stdout: string, stderr: string) => void,
+  ) => {
+    let response = "[]";
+    if (args.includes("user")) response = "test-user";
+    else if (args.includes("repos/acme/widgets/pulls/7")) {
+      response = JSON.stringify(pullRequest);
+    } else if (args.some((arg) => arg.includes("pulls?"))) {
+      response =
+        options.readyPullRequest === true
+          ? JSON.stringify([{ ...pullRequest, draft: ++polls === 1 }])
+          : "[]";
+    }
+    callback(null, response, "");
     return undefined as never;
   }) as unknown as typeof execFile);
 }
@@ -152,6 +191,112 @@ describe("reconciling runs a restart stranded", () => {
     }
   });
 
+  it("verifies a recovered live run without reading its transcript", async () => {
+    vi.useFakeTimers();
+    stubGh();
+    const { harness, store } = await setup({ mode: "live" });
+    harness.inspection.sdk.stub("threads.get", () =>
+      makeThreadResponse({ id: THREAD_ID, status: "idle" }),
+    );
+    harness.inspection.sdk.stub("threads.output", () => {
+      throw new Error("transcript unavailable");
+    });
+
+    try {
+      const service = harness.behavior.runService("watcher");
+      // Live verification retries a bare no_comment once, four seconds later.
+      await vi.advanceTimersByTimeAsync(5_000);
+      service.controller.abort();
+      await service.done;
+
+      // A live review is verified against GitHub, so an unreadable transcript
+      // must not leave the run stranded at `reviewing`.
+      expect(store.getRun("run_1")).toMatchObject({
+        status: "no_comment",
+        finishedAt: expect.any(Number),
+      });
+      expect(harness.inspection.sdk.callsTo("threads.output")).toHaveLength(0);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("leaves an errored thread open while a provider retry is queued", async () => {
+    vi.useFakeTimers();
+    stubGhLogin();
+    const { harness, store } = await setup();
+    harness.inspection.sdk.stub("threads.get", () =>
+      makeThreadResponse({ id: THREAD_ID, status: "error" }),
+    );
+    harness.inspection.sdk.stub("threads.queue.list", () => [
+      makeQueueEntry({
+        id: "queued_retry",
+        threadId: THREAD_ID,
+        payload: {
+          kind: "retry",
+          attempt: 2,
+          reason: "Provider overloaded",
+          retryOfTurnRequestId: "request_1",
+        },
+      }),
+    ]);
+
+    try {
+      await startWatcher(harness);
+
+      // The retry will resume this review; finalizing and archiving it here
+      // would kill it, exactly as the live `thread.failed` path avoids doing.
+      expect(store.getRun("run_1")).toMatchObject({
+        status: "reviewing",
+        finishedAt: null,
+      });
+      expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(0);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("counts a recovered running review against the concurrency cap", async () => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true });
+    const { bb, harness } = createFakePluginHost({
+      settings: { pollSeconds: 15, maxConcurrentReviews: 1 },
+    });
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.get", () =>
+      makeThreadResponse({ id: THREAD_ID, status: "active" }),
+    );
+    harness.inspection.sdk.stub("threads.spawn", () =>
+      makeThreadResponse({ id: "thr_new" }),
+    );
+
+    try {
+      await plugin(bb);
+      createStore(bb.storage.database() as never).insertRun(makeReviewRun());
+      await harness.behavior.callRpc("saveRule", {
+        id: null,
+        rule: {
+          name: "restraint-review",
+          repo: "acme/widgets",
+          request: { projectId: "project", providerId: "codex", model: "test" },
+        },
+      });
+
+      const service = harness.behavior.runService("watcher");
+      await vi.advanceTimersByTimeAsync(0);
+      // The second poll sees PR #7 become ready for review.
+      await vi.advanceTimersByTimeAsync(15_000);
+      service.controller.abort();
+      await service.done;
+
+      // The recovered review still occupies the only slot, so the poll that
+      // sees PR #7 go ready has nothing to give it.
+      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("keeps a run open when BB can no longer describe its thread", async () => {
     vi.useFakeTimers();
     stubGhLogin();
@@ -243,6 +388,51 @@ describe("bb slopcop runs cancel", () => {
       });
       expect(harness.inspection.sdk.callsTo("threads.stop")).toEqual([
         [{ threadId: THREAD_ID }],
+      ]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("keeps a cancellation that lands while the review is still spawning", async () => {
+    stubGh({ readyPullRequest: true });
+    const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    // The operator cancels in the only window where the run has no thread yet.
+    harness.inspection.sdk.stub("threads.spawn", async () => {
+      const pending = store.listRuns({ limit: 1 })[0];
+      await harness.behavior.runCli(["runs", "cancel", pending.id]);
+      return makeThreadResponse({ id: "thr_race" });
+    });
+
+    try {
+      const { rule } = (await harness.behavior.callRpc("saveRule", {
+        id: null,
+        rule: {
+          name: "race-review",
+          repo: "acme/widgets",
+          request: { projectId: "project", providerId: "codex", model: "test" },
+        },
+      })) as { rule: { id: string } };
+      await harness.behavior.callRpc("dispatchNow", {
+        ruleId: rule.id,
+        prNumber: 7,
+      });
+
+      // The spawned agent is stopped and the run stays cancelled: writing
+      // `reviewing` over it would leave it running with nothing to close it.
+      expect(store.listRuns({ limit: 1 })[0]).toMatchObject({
+        status: "cancelled",
+        detail: "cancelled by operator",
+        threadId: "thr_race",
+        finishedAt: expect.any(Number),
+      });
+      expect(harness.inspection.sdk.callsTo("threads.stop")).toEqual([
+        [{ threadId: "thr_race" }],
       ]);
     } finally {
       await harness.lifecycle.dispose();

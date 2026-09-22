@@ -190,7 +190,7 @@ Two consequences worth knowing:
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
 | `bb slopcop runs cancel <run-id>` | Fail an unfinished run and stop its review thread |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
-| `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check |
+| `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check (not a cancelled one: a verdict would dedupe the PR away from its re-review) |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
 
 Plugin settings: `defaultThreadSection` accepts a BB thread section name or ID.
