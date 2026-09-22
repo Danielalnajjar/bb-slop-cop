@@ -15,6 +15,35 @@ import {
   defineRpcContract
 } from "@get-bb/plugin-sdk";
 
+// lib/abort.ts
+async function waitForAbort(work, signal) {
+  signal?.throwIfAborted();
+  if (signal === void 0) return work();
+  let onAbort = () => {
+  };
+  const aborted2 = new Promise((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const result = await Promise.race([work(), aborted2]);
+    signal.throwIfAborted();
+    return result;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+async function sleep(ms, signal) {
+  let timer;
+  try {
+    await waitForAbort(() => new Promise((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }), signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // node_modules/.pnpm/zod@4.5.4/node_modules/zod/v4/classic/external.js
 var external_exports = {};
 __export(external_exports, {
@@ -20388,8 +20417,10 @@ async function plugin(bb) {
   let gh = createGhClient("gh");
   let ghLogin = null;
   let inFlight = 0;
+  let watcherSignal;
+  const waitForWork = (work) => waitForAbort(work, watcherSignal);
   const readSettings = async () => {
-    const values = await settings.get();
+    const values = await waitForWork(() => settings.get());
     const pollSeconds = pollSecondsSchema.parse(values.pollSeconds);
     const maxConcurrent = maxConcurrentReviewsSchema.parse(
       values.maxConcurrentReviews
@@ -20416,7 +20447,7 @@ async function plugin(bb) {
   const checkRunIds = /* @__PURE__ */ new Map();
   async function reportCheck(kind, run2, complete) {
     if (run2.mode !== "live" || run2.headSha.length === 0) return;
-    const request = gh.request.bind(gh);
+    const request = (...args) => waitForWork(() => gh.request(...args));
     const base = {
       repo: run2.repo,
       sha: run2.headSha,
@@ -20426,21 +20457,22 @@ async function plugin(bb) {
     };
     try {
       if (kind === "start") {
-        const id = await startCheckRun(request, base);
+        const id = await waitForWork(() => startCheckRun(request, base));
         if (id !== null) checkRunIds.set(run2.id, id);
         return;
       }
       if (complete === void 0) return;
       try {
-        await completeCheckRun(request, {
+        await waitForWork(() => completeCheckRun(request, {
           ...base,
           ...complete,
           checkRunId: checkRunIds.get(run2.id) ?? null
-        });
+        }));
       } finally {
         checkRunIds.delete(run2.id);
       }
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `check run ${kind} failed for ${run2.repo}#${run2.prNumber}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20452,8 +20484,9 @@ async function plugin(bb) {
     );
     if (!needsFiles || pullRequest.files.length > 0) return;
     try {
-      pullRequest.files = await gh.listFiles(repo, pullRequest.number);
+      pullRequest.files = await waitForWork(() => gh.listFiles(repo, pullRequest.number));
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not list files for ${repo}#${pullRequest.number}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20501,16 +20534,17 @@ async function plugin(bb) {
     };
     let priorComments = [];
     try {
-      const [issues, review, reviews] = await Promise.all([
+      const [issues, review, reviews] = await waitForWork(() => Promise.all([
         gh.listIssueComments(rule.repo, pullRequest.number),
         gh.listReviewComments(rule.repo, pullRequest.number),
         gh.listReviews(rule.repo, pullRequest.number)
-      ]);
+      ]));
       priorComments = collectPriorComments(
         [...issues, ...review, ...reviews],
         rule.name
       );
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not list prior comments for ${rule.repo}#${pullRequest.number}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20539,16 +20573,16 @@ async function plugin(bb) {
       execution.executionInputSources = sources;
       const sectionId = resolveThreadSectionId(
         defaultThreadSection,
-        defaultThreadSection.length > 0 ? await bb.sdk.threadSections.list() : []
+        defaultThreadSection.length > 0 ? await waitForWork(() => bb.sdk.threadSections.list()) : []
       );
       await reportCheck("start", checkRun);
-      const thread = await bb.sdk.threads.spawn({
+      const thread = await waitForWork(() => bb.sdk.threads.spawn({
         ...execution,
         prompt: buildPrompt(context),
         title: buildThreadTitle(context),
         visibility: rule.visibility,
         ...sectionId === void 0 ? {} : { sectionId }
-      });
+      }));
       const threadId = thread.id;
       const reserved = store.getRun(runId);
       if (reserved !== null && reserved.finishedAt !== null) {
@@ -20572,6 +20606,7 @@ async function plugin(bb) {
       }
       return { runId, threadId };
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       store.updateRun(runId, {
         status: "failed",
         detail: error61 instanceof Error ? error61.message : String(error61),
@@ -20611,8 +20646,9 @@ async function plugin(bb) {
     for (const repo of repos) {
       let pullRequests;
       try {
-        pullRequests = await gh.listOpenPullRequests(repo);
+        pullRequests = await waitForWork(() => gh.listOpenPullRequests(repo));
       } catch (error61) {
+        watcherSignal?.throwIfAborted();
         bb.log.warn(
           `poll failed for ${repo}: ${error61 instanceof Error ? error61.message : String(error61)}`
         );
@@ -20703,12 +20739,13 @@ async function plugin(bb) {
   }
   async function readRetryQueue(threadId, requestId) {
     try {
-      const entries = await bb.sdk.threads.queue.list({ threadId });
+      const entries = await waitForWork(() => bb.sdk.threads.queue.list({ threadId }));
       for (const entry of entries) {
         noteRetry(entry);
       }
       return retriedRequestsByThread.get(threadId)?.has(requestId) ?? false;
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not inspect retry queue for ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20717,9 +20754,10 @@ async function plugin(bb) {
   }
   async function retryQueuedFor(threadId) {
     try {
-      const entries = await bb.sdk.threads.queue.list({ threadId });
+      const entries = await waitForWork(() => bb.sdk.threads.queue.list({ threadId }));
       return entries.some((entry) => entry.payload.kind === "retry");
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not inspect retry queue for ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20796,10 +20834,10 @@ async function plugin(bb) {
         authenticatedLogin: ghLogin
       });
       const result = run2.mode === "shadow" ? verifyShadow({ runId: run2.id, finalMessage }) : await (async () => {
-        const first = await runVerify();
+        const first = await waitForWork(() => runVerify());
         if (first.status !== "no_comment") return first;
-        await new Promise((resolve) => setTimeout(resolve, 4e3));
-        const second = await runVerify();
+        await sleep(4e3, watcherSignal);
+        const second = await waitForWork(() => runVerify());
         if (second.comments.length > 0) return second;
         const body = summaryToPost({
           rule: run2.ruleName,
@@ -20808,13 +20846,13 @@ async function plugin(bb) {
           finalMessage
         });
         if (body === null) return second;
-        await gh.request(
+        await waitForWork(() => gh.request(
           "POST",
           `repos/${run2.repo}/issues/${run2.prNumber}/comments`,
           { body }
-        );
+        ));
         bb.log.info(`run ${run2.id}: posted the no-findings summary`);
-        return runVerify();
+        return waitForWork(() => runVerify());
       })();
       store.replaceComments(run2.id, result.comments);
       store.updateRun(run2.id, {
@@ -20833,6 +20871,7 @@ async function plugin(bb) {
         `run ${run2.id} (${run2.ruleName} #${run2.prNumber}) -> ${result.status}`
       );
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       const detail = error61 instanceof Error ? error61.message : String(error61);
       store.updateRun(run2.id, {
         status: "failed",
@@ -20849,7 +20888,9 @@ async function plugin(bb) {
         `verification failed: ${detail}`
       );
     } finally {
-      await archiveReviewThread(bb, threadId);
+      if (!watcherSignal?.aborted) {
+        await waitForWork(() => archiveReviewThread(bb, threadId));
+      }
     }
   }
   function finishRun(threadId, finalMessage, noVerdict) {
@@ -20874,9 +20915,9 @@ async function plugin(bb) {
   async function describeThreadFailure(threadId, reported) {
     if (reported !== null && reported.trim().length > 0) return reported;
     try {
-      const result = await bb.sdk.threads.events.list({
+      const result = await waitForWork(() => bb.sdk.threads.events.list({
         threadId
-      });
+      }));
       const events = Array.isArray(result.events) ? result.events : [];
       for (const raw of [...events].reverse()) {
         const event = raw;
@@ -20886,6 +20927,7 @@ async function plugin(bb) {
         if (message.length > 0) return `${type}: ${message}`;
       }
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not read failure detail for ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20925,7 +20967,7 @@ async function plugin(bb) {
       const threadId = run2.threadId;
       if (threadId === null) continue;
       try {
-        const thread = await bb.sdk.threads.get({ threadId });
+        const thread = await waitForWork(() => bb.sdk.threads.get({ threadId }));
         const outcome = reviewThreadOutcome(thread);
         if (outcome.kind === "running") {
           inFlight += 1;
@@ -20935,7 +20977,7 @@ async function plugin(bb) {
           `reconciling ${run2.id} (${run2.ruleName} #${run2.prNumber}): its thread is ${thread.status}`
         );
         if (outcome.kind === "finished") {
-          const finalMessage = run2.mode === "shadow" ? (await bb.sdk.threads.output({ threadId })).output : null;
+          const finalMessage = run2.mode === "shadow" ? (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output : null;
           await finishRun(threadId, finalMessage, null);
           continue;
         }
@@ -20951,6 +20993,7 @@ async function plugin(bb) {
           outcome.reason ?? await describeThreadFailure(threadId, null)
         );
       } catch (error61) {
+        watcherSignal?.throwIfAborted();
         bb.log.warn(
           `could not reconcile run ${run2.id}: ${error61 instanceof Error ? error61.message : String(error61)}`
         );
@@ -20959,8 +21002,9 @@ async function plugin(bb) {
   }
   async function stopReviewThread(threadId) {
     try {
-      await bb.sdk.threads.stop({ threadId });
+      await waitForWork(() => bb.sdk.threads.stop({ threadId }));
     } catch (error61) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not stop review thread ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -21408,37 +21452,33 @@ Re-run with --force to dispatch anyway.`
   });
   bb.background.service("watcher", {
     async start(signal) {
-      const initial = await readSettings();
-      gh = createGhClient(initial.ghPath);
-      ghLogin = await gh.authenticatedLogin();
-      if (ghLogin === null) {
-        bb.status.needsConfiguration(
-          "`gh` is not authenticated on this machine. Run `gh auth login`, then reload the plugin."
-        );
-        return;
-      }
-      bb.log.info(`gh authenticated as ${ghLogin}`);
-      await reconcileUnfinishedRuns();
-      while (!signal.aborted) {
-        const values = await readSettings();
-        try {
-          await poll(values.maxConcurrent);
-        } catch (error61) {
-          bb.log.error(
-            `poll pass failed: ${error61 instanceof Error ? error61.message : String(error61)}`
+      watcherSignal = signal;
+      try {
+        const initial = await readSettings();
+        gh = createGhClient(initial.ghPath);
+        ghLogin = await waitForWork(() => gh.authenticatedLogin());
+        if (ghLogin === null) {
+          bb.status.needsConfiguration(
+            "`gh` is not authenticated on this machine. Run `gh auth login`, then reload the plugin."
           );
+          return;
         }
-        await new Promise((resolve) => {
-          const timer = setTimeout(resolve, values.pollSeconds * 1e3);
-          signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve(void 0);
-            },
-            { once: true }
-          );
-        });
+        bb.log.info(`gh authenticated as ${ghLogin}`);
+        await reconcileUnfinishedRuns();
+        while (!signal.aborted) {
+          const values = await readSettings();
+          try {
+            await poll(values.maxConcurrent);
+          } catch (error61) {
+            signal.throwIfAborted();
+            bb.log.error(
+              `poll pass failed: ${error61 instanceof Error ? error61.message : String(error61)}`
+            );
+          }
+          await sleep(values.pollSeconds * 1e3, signal);
+        }
+      } catch (error61) {
+        if (!signal.aborted) throw error61;
       }
     }
   });

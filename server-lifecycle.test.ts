@@ -473,3 +473,87 @@ describe("bb slopcop runs cancel", () => {
     }
   });
 });
+
+describe("watcher shutdown", () => {
+  it.each(["login", "poll", "spawn", "reconcile", "verify-retry", "poll-sleep"] as const)(
+    "stops before the host deadline during %s and ignores late results",
+    async (phase) => {
+      vi.useFakeTimers();
+      const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+      let release: (() => void) | undefined;
+      let reached = false;
+      let polls = 0;
+      const pr = {
+        number: 7, title: "Ready PR", draft: false,
+        head: { sha: "sha-7" }, base: { ref: "main" },
+        user: { login: "dana" }, author_association: "MEMBER", labels: [],
+      };
+      vi.mocked(execFile).mockImplementation(((
+        _file: string, args: string[], _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const login = args.includes("user");
+        const poll = args.some((arg) => arg.includes("pulls?"));
+        const response = login ? "test-user" : poll
+          ? JSON.stringify([{ ...pr, draft: ++polls === 1 }]) : "[]";
+        if ((phase === "login" && login) || (phase === "poll" && poll)) {
+          reached = true;
+          release = () => callback(null, response, "");
+        } else {
+          if (phase === "verify-retry" && args.some((arg) => arg.includes("reviews"))) reached = true;
+          if (phase === "poll-sleep" && poll) reached = true;
+          callback(null, response, "");
+        }
+        return undefined as never;
+      }) as unknown as typeof execFile);
+      harness.inspection.sdk.stub("threads.get", () => {
+        if (phase === "reconcile") {
+          reached = true;
+          return new Promise((resolve) => {
+            release = () => resolve(makeThreadResponse({ id: THREAD_ID, status: "idle" }));
+          });
+        }
+        return makeThreadResponse({ id: THREAD_ID, status: "idle" });
+      });
+      harness.inspection.sdk.stub("threads.spawn", () => {
+        reached = true;
+        return new Promise((resolve) => {
+          release = () => resolve(makeThreadResponse({ id: "thr_new" }));
+        });
+      });
+      await plugin(bb);
+      const store = createStore(bb.storage.database() as never);
+      if (phase === "reconcile" || phase === "verify-retry") store.insertRun(makeReviewRun({ mode: "live" }));
+      await harness.behavior.callRpc("saveRule", {
+        id: null,
+        rule: {
+          name: "restraint-review", repo: "acme/widgets",
+          request: { projectId: "project", providerId: "codex", model: "test" },
+        },
+      });
+      const service = harness.behavior.runService("watcher");
+      let stopped = false;
+      void service.done.then(() => { stopped = true; });
+      try {
+        await vi.advanceTimersByTimeAsync(phase === "spawn" ? 15_000 : 0);
+        expect(reached).toBe(true);
+        service.controller.abort();
+        // BB's service stop deadline is 5,000 ms. No I/O is released here.
+        await vi.advanceTimersByTimeAsync(1);
+        expect(stopped).toBe(true);
+        await service.done;
+        const runsAtStop = store.listRuns({});
+        const callsAtStop = vi.mocked(execFile).mock.calls.length;
+        release?.();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(store.listRuns({})).toEqual(runsAtStop);
+        expect(vi.mocked(execFile).mock.calls).toHaveLength(callsAtStop);
+        expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(0);
+      } finally {
+        service.controller.abort();
+        release?.();
+        await harness.lifecycle.dispose();
+      }
+    },
+  );
+});
