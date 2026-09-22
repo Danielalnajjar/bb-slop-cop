@@ -164,7 +164,7 @@ describe("review retry lifecycle", () => {
     await retryFailed;
 
     expect(store.getRun("run_1")).toMatchObject({
-      status: "failed",
+      status: "cancelled",
       detail: "retry was rejected",
       finishedAt: expect.any(Number),
     });
@@ -224,7 +224,7 @@ describe("review retry lifecycle", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await Promise.all([first, duplicate]);
 
-    expect(store.getRun("run_1")?.status).toBe("failed");
+    expect(store.getRun("run_1")?.status).toBe("cancelled");
     expect(harness.inspection.sdk.callsTo("threads.archive")).toEqual([
       [{ threadId: THREAD_ID }],
     ]);

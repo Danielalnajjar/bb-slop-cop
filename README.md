@@ -188,8 +188,9 @@ Two consequences worth knowing:
 | `bb slopcop check <rule> <pr>` | Dry run — match, or the exact reason it did not |
 | `bb slopcop dispatch <rule> <pr> [--force]` | Run now |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
+| `bb slopcop runs cancel <run-id>` | Fail an unfinished run and stop its review thread |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
-| `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check |
+| `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check (not a cancelled one: a verdict would dedupe the PR away from its re-review) |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
 
 Plugin settings: `defaultThreadSection` accepts a BB thread section name or ID.
@@ -219,7 +220,24 @@ Rule flags: `--name --repo --project --provider --model --reasoning --permission
 `shadowed` · `commented` · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
 without posting) · `skipped` (matched nothing, e.g. blocked by the trust gate) ·
-`failed`.
+`cancelled` (the thread ended, errored, was retired, or was cancelled before
+the review reached a verdict) · `failed` (the review ran and its own result or
+posting failed).
+
+`cancelled` and `failed` are kept apart because the merge box reads them
+differently: `failed` puts a red `failure` on the head SHA, so it is reserved
+for a review that produced something and then failed. A thread that errors
+reached no verdict, whether SlopCop saw the event live or reconciled it on
+start, so it completes its check as `cancelled` — and a cancelled run never
+dedupes away a later re-review of the same PR.
+
+Thread lifecycle events are process-local, so a review thread that ended while
+the plugin was not loaded has no event left to fire. The watcher reconciles
+against BB once on start: a thread that errored, or was archived or deleted
+mid-review, cancels its run with the reason recorded, and an idle one is
+verified as if it had just finished. A run whose thread BB can no longer
+describe stays open for `runs cancel`, which cancels it with "cancelled by
+operator" and stops the thread. Cancelling an already-finished run is refused.
 
 ## Development
 

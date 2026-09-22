@@ -518,7 +518,7 @@ const marked = (kind: "summary" | "inline", run = "run_1") =>
   });
 
 describe("live verification", () => {
-  it("refuses shadow, in-flight, and skipped runs", () => {
+  it("refuses shadow, in-flight, skipped, and cancelled runs", () => {
     expect(
       liveVerifyBlockReason({
         mode: "shadow",
@@ -540,6 +540,15 @@ describe("live verification", () => {
         finishedAt: 1,
       }),
     ).toMatch(/skipped/);
+    // Verifying a cancelled run would rewrite it as `no_comment`, which
+    // dedupes away the re-review that `cancelled` exists to keep available.
+    expect(
+      liveVerifyBlockReason({
+        mode: "live",
+        status: "cancelled",
+        finishedAt: 1,
+      }),
+    ).toMatch(/cancelled/);
     expect(
       liveVerifyBlockReason({
         mode: "live",
@@ -694,6 +703,43 @@ describe("github checks", () => {
 
   it("uses the same check name GitHub groups in the merge box", () => {
     expect(CHECK_NAME).toBe("SlopCop");
+  });
+
+  it("cancels the check for a run that never reached a verdict", async () => {
+    expect(conclusionFor("cancelled")).toBe("cancelled");
+    expect(conclusionFor("failed")).toBe("failure");
+
+    const calls: { method: string; endpoint: string; body: unknown }[] = [];
+    const request: GhClient["request"] = async (method, endpoint, body) => {
+      calls.push({ method, endpoint, body });
+      if (method === "GET") {
+        return { check_runs: [{ id: 7, external_id: "run_1", status: "in_progress" }] };
+      }
+      return { id: 7 };
+    };
+
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+      status: "cancelled",
+      commentCount: 0,
+      detail: "the review thread was archived before it reached a verdict",
+    });
+
+    const patch = calls.find((call) => call.method === "PATCH");
+    expect(patch?.endpoint).toBe("repos/acme/checkout-api/check-runs/7");
+    expect(patch?.body).toMatchObject({
+      status: "completed",
+      conclusion: "cancelled",
+      output: {
+        title: "Review cancelled",
+        summary:
+          "SlopCop's review thread for `security-sweep` ended before it reached a verdict on PR #482; no findings recorded.\n\nthe review thread was archived before it reached a verdict",
+      },
+    });
   });
 
   it("creates an in_progress check and later completes the same run", async () => {

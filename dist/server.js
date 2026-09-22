@@ -19318,6 +19318,19 @@ function createStore(db) {
         ...params
       );
     },
+    /**
+     * Runs whose review thread was spawned but never reached a terminal
+     * status. Thread lifecycle events are process-local, so these are what a
+     * restart has to reconcile against BB.
+     */
+    listUnfinishedRuns() {
+      const rows = db.prepare(
+        `SELECT * FROM runs
+           WHERE finished_at IS NULL AND thread_id IS NOT NULL
+           ORDER BY started_at`
+      ).all();
+      return rows.map(rowToRun);
+    },
     findRunByThread(threadId) {
       const row = db.prepare(`SELECT * FROM runs WHERE thread_id = ?`).get(threadId);
       return row === void 0 ? null : rowToRun(row);
@@ -19327,11 +19340,11 @@ function createStore(db) {
       const row = headSha === null ? db.prepare(
         `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ?
-                   AND status NOT IN ('skipped', 'failed') LIMIT 1`
+                   AND status NOT IN ('skipped', 'cancelled', 'failed') LIMIT 1`
       ).get(ruleId, repo, prNumber) : db.prepare(
         `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha = ?
-                   AND status NOT IN ('skipped', 'failed') LIMIT 1`
+                   AND status NOT IN ('skipped', 'cancelled', 'failed') LIMIT 1`
       ).get(ruleId, repo, prNumber, headSha);
       return row !== void 0;
     },
@@ -19654,6 +19667,19 @@ async function archiveReviewThread(bb, threadId) {
     );
   }
 }
+var THREAD_ARCHIVED_REASON = "the review thread was archived before it reached a verdict";
+var THREAD_DELETED_REASON = "the review thread was deleted before it reached a verdict";
+function reviewThreadOutcome(thread) {
+  if (thread.deletedAt != null) {
+    return { kind: "failed", reason: THREAD_DELETED_REASON };
+  }
+  if (thread.status === "error") return { kind: "failed", reason: null };
+  if (thread.status === "idle") return { kind: "finished" };
+  if (thread.archivedAt != null) {
+    return { kind: "failed", reason: THREAD_ARCHIVED_REASON };
+  }
+  return { kind: "running" };
+}
 
 // lib/sections.ts
 function resolveThreadSectionId(configured, sections) {
@@ -19764,6 +19790,10 @@ var runStatusSchema = external_exports.enum([
   "shadowed",
   "no_comment",
   "skipped",
+  // A review that never reached a verdict: its thread ended, errored, was
+  // retired, or was cancelled first. `failed` is reserved for a review that
+  // produced a result and then failed on it.
+  "cancelled",
   "failed"
 ]);
 var commentKindSchema = external_exports.enum(["summary", "inline", "reply"]);
@@ -19924,6 +19954,9 @@ function liveVerifyBlockReason(run2) {
   if (run2.status === "skipped") {
     return "skipped runs never dispatched a review";
   }
+  if (run2.status === "cancelled") {
+    return "cancelled runs never reached a verdict \u2014 dispatch a new review instead";
+  }
   return null;
 }
 async function verifyLive(options) {
@@ -20049,6 +20082,8 @@ function conclusionFor(status) {
       return "neutral";
     case "failed":
       return "failure";
+    case "cancelled":
+      return "cancelled";
     case "skipped":
     case "shadowed":
     case "dispatched":
@@ -20087,6 +20122,11 @@ ${detail}` : "";
       return {
         title: "Review failed",
         summary: `SlopCop failed while reviewing PR #${prNumber} with \`${ruleName}\`.`
+      };
+    case "cancelled":
+      return {
+        title: "Review cancelled",
+        summary: `SlopCop's review thread for \`${ruleName}\` ended before it reached a verdict on PR #${prNumber}; no findings recorded.${extra}`
       };
     default:
       return {
@@ -20487,6 +20527,15 @@ async function plugin(bb) {
         ...sectionId === void 0 ? {} : { sectionId }
       });
       const threadId = thread.id;
+      const reserved = store.getRun(runId);
+      if (reserved !== null && reserved.finishedAt !== null) {
+        store.updateRun(runId, { threadId });
+        await stopReviewThread(threadId);
+        bb.log.info(
+          `run ${runId} was cancelled before ${threadId} spawned; stopped it`
+        );
+        return { runId, threadId };
+      }
       store.updateRun(runId, { status: "reviewing", threadId });
       inFlight += 1;
       announce();
@@ -20496,7 +20545,7 @@ async function plugin(bb) {
       const pending = pendingFinish.get(threadId);
       if (pending !== void 0) {
         pendingFinish.delete(threadId);
-        await finishRun(threadId, pending.finalMessage, pending.failure);
+        await finishRun(threadId, pending.finalMessage, pending.noVerdict);
       }
       return { runId, threadId };
     } catch (error61) {
@@ -20643,6 +20692,17 @@ async function plugin(bb) {
     }
     return false;
   }
+  async function retryQueuedFor(threadId) {
+    try {
+      const entries = await bb.sdk.threads.queue.list({ threadId });
+      return entries.some((entry) => entry.payload.kind === "retry");
+    } catch (error61) {
+      bb.log.warn(
+        `could not inspect retry queue for ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
+      );
+      return false;
+    }
+  }
   async function retryExistsFor(threadId, requestId) {
     if (hasRetry(threadId, requestId)) return true;
     if (await readRetryQueue(threadId, requestId)) return true;
@@ -20681,26 +20741,26 @@ async function plugin(bb) {
   });
   bb.events.on("message.queued", ({ entry }) => noteRetry(entry));
   bb.events.on("message.dispatched", ({ entry }) => noteRetry(entry));
-  async function finishRunOnce(threadId, finalMessage, failure) {
+  async function finishRunOnce(threadId, finalMessage, noVerdict) {
     const run2 = store.findRunByThread(threadId);
     if (run2 === null) {
-      pendingFinish.set(threadId, { finalMessage, failure });
+      pendingFinish.set(threadId, { finalMessage, noVerdict });
       return;
     }
     if (run2.finishedAt !== null) return;
     inFlight = Math.max(0, inFlight - 1);
     try {
-      if (failure !== null) {
+      if (noVerdict !== null) {
         store.updateRun(run2.id, {
-          status: "failed",
-          detail: failure,
+          status: "cancelled",
+          detail: noVerdict,
           finishedAt: Date.now()
         });
         announce();
         await reportCheck("complete", run2, {
-          status: "failed",
+          status: "cancelled",
           commentCount: 0,
-          detail: null
+          detail: noVerdict
         });
         return;
       }
@@ -20754,10 +20814,10 @@ async function plugin(bb) {
       await archiveReviewThread(bb, threadId);
     }
   }
-  function finishRun(threadId, finalMessage, failure) {
+  function finishRun(threadId, finalMessage, noVerdict) {
     const inProgress = finalizing.get(threadId);
     if (inProgress !== void 0) return inProgress;
-    const promise2 = finishRunOnce(threadId, finalMessage, failure).finally(() => {
+    const promise2 = finishRunOnce(threadId, finalMessage, noVerdict).finally(() => {
       finalizing.delete(threadId);
     });
     finalizing.set(threadId, promise2);
@@ -20810,6 +20870,83 @@ async function plugin(bb) {
     clearFailureCorrelation(thread.id);
     await finishRun(thread.id, null, await detail);
   });
+  function hasUnfinishedRun(threadId) {
+    const run2 = store.findRunByThread(threadId);
+    return run2 !== null && run2.finishedAt === null;
+  }
+  bb.events.on("thread.archived", async ({ thread }) => {
+    if (!hasUnfinishedRun(thread.id)) return;
+    await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
+  });
+  bb.events.on("thread.deleted", async ({ thread }) => {
+    if (!hasUnfinishedRun(thread.id)) return;
+    await finishRun(thread.id, null, THREAD_DELETED_REASON);
+  });
+  async function reconcileUnfinishedRuns() {
+    for (const run2 of store.listUnfinishedRuns()) {
+      const threadId = run2.threadId;
+      if (threadId === null) continue;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        const outcome = reviewThreadOutcome(thread);
+        if (outcome.kind === "running") {
+          inFlight += 1;
+          continue;
+        }
+        bb.log.info(
+          `reconciling ${run2.id} (${run2.ruleName} #${run2.prNumber}): its thread is ${thread.status}`
+        );
+        if (outcome.kind === "finished") {
+          const finalMessage = run2.mode === "shadow" ? (await bb.sdk.threads.output({ threadId })).output : null;
+          await finishRun(threadId, finalMessage, null);
+          continue;
+        }
+        if (thread.status === "error" && await retryQueuedFor(threadId)) {
+          bb.log.info(
+            `leaving run ${run2.id} open: a retry is queued for ${threadId}`
+          );
+          continue;
+        }
+        await finishRun(
+          threadId,
+          null,
+          outcome.reason ?? await describeThreadFailure(threadId, null)
+        );
+      } catch (error61) {
+        bb.log.warn(
+          `could not reconcile run ${run2.id}: ${error61 instanceof Error ? error61.message : String(error61)}`
+        );
+      }
+    }
+  }
+  async function stopReviewThread(threadId) {
+    try {
+      await bb.sdk.threads.stop({ threadId });
+    } catch (error61) {
+      bb.log.warn(
+        `could not stop review thread ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
+      );
+    }
+  }
+  const CANCELLED_DETAIL = "cancelled by operator";
+  async function cancelRun(run2) {
+    if (run2.threadId === null) {
+      store.updateRun(run2.id, {
+        status: "cancelled",
+        detail: CANCELLED_DETAIL,
+        finishedAt: Date.now()
+      });
+      announce();
+      await reportCheck("complete", run2, {
+        status: "cancelled",
+        commentCount: 0,
+        detail: CANCELLED_DETAIL
+      });
+      return;
+    }
+    await finishRun(run2.threadId, null, CANCELLED_DETAIL);
+    await stopReviewThread(run2.threadId);
+  }
   function resolveRule(idOrName) {
     const rule = store.getRule(idOrName) ?? store.findRuleByName(idOrName);
     if (rule === null) throw new Error(`no rule named '${idOrName}'`);
@@ -20924,6 +21061,11 @@ async function plugin(bb) {
         name: "runs",
         summary: "Recent review runs",
         usage: "bb slopcop runs [--rule <id|name>] [--limit N] [--json]"
+      },
+      {
+        name: "runs-cancel",
+        summary: "Fail an unfinished run and stop its review thread",
+        usage: "bb slopcop runs cancel <run-id>"
       },
       {
         name: "check",
@@ -21097,6 +21239,28 @@ ${payload.rules} rule(s)`
             `${sub === "enable" ? "Enabled" : "Disabled"} '${rule.name}'.`
           );
         }
+        if (command === "runs" && sub === "cancel") {
+          const runId = argv[2] ?? "";
+          if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
+          const run2 = store.getRun(runId);
+          if (run2 === null) return fail(`no such run '${runId}'`);
+          if (run2.finishedAt !== null) {
+            return fail(
+              `run ${run2.id} already finished as ${run2.status} \u2014 nothing to cancel`
+            );
+          }
+          await cancelRun(run2);
+          const cancelled = store.getRun(run2.id);
+          if (json2) return ok(JSON.stringify(cancelled, null, 2));
+          if (cancelled !== null && cancelled.status !== "cancelled") {
+            return ok(
+              `Run ${run2.id} (${run2.ruleName} #${run2.prNumber}) finished as ${cancelled.status} before the cancellation landed.`
+            );
+          }
+          return ok(
+            `Cancelled ${run2.id} (${run2.ruleName} #${run2.prNumber}) \u2014 ${CANCELLED_DETAIL}.`
+          );
+        }
         if (command === "runs") {
           const ruleFlag = flag("rule");
           const rule = ruleFlag === void 0 ? null : resolveRule(ruleFlag);
@@ -21216,6 +21380,7 @@ Re-run with --force to dispatch anyway.`
         return;
       }
       bb.log.info(`gh authenticated as ${ghLogin}`);
+      await reconcileUnfinishedRuns();
       while (!signal.aborted) {
         const values = await readSettings();
         try {

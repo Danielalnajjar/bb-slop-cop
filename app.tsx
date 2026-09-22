@@ -89,6 +89,7 @@ const STATUS_TONE: Record<string, string> = {
   commented_unattributed: "text-warning-text bg-surface-attention",
   no_comment: "text-warning-text bg-surface-attention",
   skipped: "text-muted-foreground bg-surface-recessed",
+  cancelled: "text-muted-foreground bg-surface-recessed",
   failed: "text-destructive-text bg-surface-destructive",
 };
 
