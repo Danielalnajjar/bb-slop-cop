@@ -102,7 +102,10 @@ that already reached a terminal status.
 
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker
-rather than trusting the agent's transcript. Later runs on the same PR are
+rather than trusting the agent's transcript. The two bodies have different
+owners: the agent posts each finding as a line comment, because only it knows
+the path and line, while the no-findings summary is the thread's final message
+and SlopCop posts it. A live agent never runs `gh pr review`. Later runs on the same PR are
 given this rule's existing comments and told not to post the same finding
 again. GitHub line comments are a title plus two sentences, not the full
 review memo.

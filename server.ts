@@ -30,7 +30,7 @@ import {
 } from "./lib/matcher";
 import {
   liveVerifyBlockReason,
-  unpostedSummary,
+  summaryToPost,
   verifyLive,
   verifyShadow,
 } from "./lib/verify";
@@ -799,32 +799,20 @@ export default async function plugin(bb: BbPluginApi) {
               if (first.status !== "no_comment") return first;
               await new Promise((resolve) => setTimeout(resolve, 4_000));
               const second = await runVerify();
-              if (second.status !== "no_comment") return second;
-              // The agent finished a clean review and ended its turn with the
-              // body instead of posting it. Post it, then re-verify: GitHub
-              // stays the source of truth for what landed.
-              const body = unpostedSummary({
-                runId: run.id,
-                finalMessage,
-              });
+              // SlopCop owns the no-findings summary: the agent posts findings
+              // as line comments and ends a clean review with the summary as
+              // its final message. Nothing on the PR plus that body means the
+              // review is clean, so post it and re-verify — GitHub stays the
+              // source of truth for what landed.
+              if (second.comments.length > 0) return second;
+              const body = summaryToPost({ runId: run.id, finalMessage });
               if (body === null) return second;
-              try {
-                await gh.request(
-                  "POST",
-                  `repos/${run.repo}/issues/${run.prNumber}/comments`,
-                  { body },
-                );
-              } catch (error) {
-                bb.log.warn(
-                  `run ${run.id}: posting the agent's unposted summary failed: ${
-                    error instanceof Error ? error.message : String(error)
-                  }`,
-                );
-                return second;
-              }
-              bb.log.info(
-                `run ${run.id}: posted the clean summary the agent left unposted`,
+              await gh.request(
+                "POST",
+                `repos/${run.repo}/issues/${run.prNumber}/comments`,
+                { body },
               );
+              bb.log.info(`run ${run.id}: posted the no-findings summary`);
               return runVerify();
             })();
 

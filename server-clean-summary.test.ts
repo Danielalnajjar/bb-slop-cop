@@ -1,10 +1,9 @@
-// The posting step, end to end through the plugin host.
+// The no-findings summary, end to end through the plugin host.
 //
-// A live agent sometimes finishes a clean review and ends its turn with the
-// summary body instead of running `gh` (skills PR #292). The run is not a
-// no-op: the review is written and marked, so SlopCop posts it itself and the
-// check reports a posted review. `gh` is the only seam that matters here, so
-// `node:child_process` is mocked and the plugin drives its real gh client.
+// SlopCop owns that body: the agent posts findings as line comments and ends a
+// clean review with the summary as its final message. `gh` is the only seam
+// that matters here, so `node:child_process` is mocked and the plugin drives
+// its real gh client.
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { execFile, spawn } from "node:child_process";
@@ -51,10 +50,13 @@ function liveRun(): Run {
 let writes: { endpoint: string; body: unknown }[];
 /** Issue comments GitHub currently returns. Grows when the plugin posts one. */
 let issueComments: unknown[];
+/** Inline review comments GitHub currently returns — the agent's findings. */
+let reviewComments: unknown[];
 
 beforeEach(() => {
   writes = [];
   issueComments = [];
+  reviewComments = [];
 
   vi.mocked(execFile).mockImplementation(((
     _file: string,
@@ -67,7 +69,11 @@ beforeEach(() => {
       callback(null, "slopcop-bot\n", "");
       return undefined as never;
     }
-    const rows = endpoint.includes("/issues/42/comments") ? issueComments : [];
+    const rows = endpoint.includes("/issues/42/comments")
+      ? issueComments
+      : endpoint.includes("/pulls/42/comments")
+        ? reviewComments
+        : [];
     callback(null, JSON.stringify(rows), "");
     return undefined as never;
   }) as never);
@@ -128,7 +134,7 @@ async function finishThreadWith(finalMessage: string | null) {
   return { store, harness };
 }
 
-it("posts the clean summary an agent finished but never sent to the PR", async () => {
+it("posts the no-findings summary from the agent's final message", async () => {
   const { store, harness } = await finishThreadWith(summaryBody());
   try {
     expect(
@@ -146,28 +152,40 @@ it("posts the clean summary an agent finished but never sent to the PR", async (
   }
 });
 
-it("leaves an unmarked final message as no_comment rather than posting it", async () => {
-  const { store, harness } = await finishThreadWith(
-    "🚨 **SLOP COP** 🚨 · `restraint-review`\n\nClean, but the marker is gone.",
-  );
-  try {
-    expect(
-      writes.filter((write) => write.endpoint.includes("/issues/42/comments")),
-    ).toEqual([]);
-    expect(store.findRunByThread(THREAD_ID)?.status).toBe("no_comment");
-  } finally {
-    await harness.lifecycle.dispose();
-  }
-});
-
-it("does not post a finding body: it has no path or line to attach to", async () => {
-  const { store, harness } = await finishThreadWith(
-    decorateBody("Speculative retry layer.", "inline", {
+it("posts no summary when the agent posted findings as line comments", async () => {
+  reviewComments.push({
+    id: 91,
+    body: decorateBody("Speculative retry layer.", "inline", {
       rule: "restraint-review",
       run: RUN_ID,
       sha: "abc123",
       kind: "inline",
     }),
+    path: "lib/retry.ts",
+    line: 12,
+    html_url: "https://github.com/acme/widgets/pull/42#discussion_r91",
+    user: { login: "slopcop-bot" },
+    created_at: new Date(2_000).toISOString(),
+  });
+
+  const { store, harness } = await finishThreadWith(
+    "Posted 1 line comment: https://github.com/acme/widgets/pull/42#discussion_r91",
+  );
+  try {
+    expect(
+      writes.filter((write) => write.endpoint.includes("/issues/42/comments")),
+    ).toEqual([]);
+    const run = store.findRunByThread(THREAD_ID);
+    expect(run?.status).toBe("commented");
+    expect(run?.commentCount).toBe(1);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("stays no_comment when nothing posted and the final message has no marker", async () => {
+  const { store, harness } = await finishThreadWith(
+    "🚨 **SLOP COP** 🚨 · `restraint-review`\n\nClean, but the marker is gone.",
   );
   try {
     expect(

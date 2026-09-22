@@ -19520,18 +19520,20 @@ try to read, print, or pass a token yourself.`;
   const repo = context.rule.repo;
   const pr = context.pullRequest.number;
   const sha = context.pullRequest.headRefOid;
-  return `## LIVE MODE \u2014 YOU MUST POST
+  return `## LIVE MODE \u2014 POST EVERY FINDING
 
-This rule is live. The review exists only once it is on the PR. Post with
-\`${ghCommand}\` before you end your turn, including when you have no findings \u2014
-your final message in this thread does not count as posting.
+This rule is live. A finding exists only once it is a line comment on the PR,
+so post each one with \`${ghCommand}\` before you end your turn.
+
+You do not post the no-findings summary and you never run \`gh pr review\`:
+SlopCop posts that body itself, from your final message.
 
 ## POSTING
 
 Post with \`${ghCommand}\`.
 
-Findings are line comments on the diff. Do not put finding text in the
-Conversation review body \u2014 \`gh pr review --comment\` cannot attach to a file.
+Findings are line comments on the diff. Do not put finding text in a
+Conversation review body \u2014 it cannot attach to a file, and it is not yours.
 
 Write every body to its own file first, with a quoted heredoc delimiter so
 the text lands exactly as written, and pass the file to \`gh\`. Never pass a
@@ -19554,16 +19556,9 @@ For each finding, post one review comment on the line (commit is the head SHA):
 \`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
 and pass \`-f subject_type=file\`.
 
-If there are no findings, post one review summary:
+Line comments publish immediately; that is the finding.
 
-    cat >/tmp/slopcop-summary.md <<'BODY'
-    \u2026header, one sentence, marker\u2026
-    BODY
-    ${ghCommand} pr review ${pr} --comment --body-file /tmp/slopcop-summary.md
-
-Do not post a summary that contains findings. Do not also run
-\`gh pr review\` after line comments \u2014 that opens a second Conversation card.
-Line comments publish immediately; that is the finding.${note}`;
+If you have no findings at all, post nothing.${note}`;
 }
 function formatBodyContract(context) {
   const { rule, pullRequest, runId } = context;
@@ -19655,9 +19650,13 @@ ${formatBodyContract(context)}
 ## FINISHING
 
 ${shadow ? `End your turn with the full review text you would have posted, formatted
-exactly as specified above (header + body + marker). Nothing is posted.` : `Post first. Ending the turn without having posted is a failed run, even
-when the review is clean. After posting, end your turn with a one-line summary
-and the URL of each comment you created.`}`;
+exactly as specified above (header + body + marker). Nothing is posted.` : `With findings, post every line comment first \u2014 ending the turn with an
+unposted finding is a failed run \u2014 then end your turn with a one-line summary
+and the URL of each comment you created.
+
+With no findings, post nothing and end your turn with the no-findings review
+body, formatted exactly as specified above (header + one sentence + marker).
+SlopCop posts that body to the PR.`}`;
 }
 function buildThreadTitle(context) {
   const prefix = context.rule.mode === "shadow" ? "SlopCop (shadow)" : "SlopCop";
@@ -20032,13 +20031,11 @@ async function verifyLive(options) {
     comments: []
   };
 }
-function unpostedSummary(options) {
+function summaryToPost(options) {
   const body = (options.finalMessage ?? "").trim();
-  if (body.length === 0) return null;
   const marker = parseMarker(body);
   if (marker === null) return null;
   if (marker.run !== options.runId || marker.kind !== "summary") return null;
-  if (!hasVisibleHeader(body)) return null;
   return body;
 }
 function verifyShadow(options) {
@@ -20793,27 +20790,15 @@ async function plugin(bb) {
         if (first.status !== "no_comment") return first;
         await new Promise((resolve) => setTimeout(resolve, 4e3));
         const second = await runVerify();
-        if (second.status !== "no_comment") return second;
-        const body = unpostedSummary({
-          runId: run2.id,
-          finalMessage
-        });
+        if (second.comments.length > 0) return second;
+        const body = summaryToPost({ runId: run2.id, finalMessage });
         if (body === null) return second;
-        try {
-          await gh.request(
-            "POST",
-            `repos/${run2.repo}/issues/${run2.prNumber}/comments`,
-            { body }
-          );
-        } catch (error61) {
-          bb.log.warn(
-            `run ${run2.id}: posting the agent's unposted summary failed: ${error61 instanceof Error ? error61.message : String(error61)}`
-          );
-          return second;
-        }
-        bb.log.info(
-          `run ${run2.id}: posted the clean summary the agent left unposted`
+        await gh.request(
+          "POST",
+          `repos/${run2.repo}/issues/${run2.prNumber}/comments`,
+          { body }
         );
+        bb.log.info(`run ${run2.id}: posted the no-findings summary`);
         return runVerify();
       })();
       store.replaceComments(run2.id, result.comments);

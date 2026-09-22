@@ -164,28 +164,21 @@ export async function verifyLive(options: {
 }
 
 /**
- * A finished clean review the agent wrote but never posted.
+ * The no-findings summary, which SlopCop posts rather than the agent.
  *
- * A live agent sometimes ends its turn with the summary body instead of
- * running `gh` — PR #292 of the skills repo is the observed case: the body was
- * complete and correctly marked, and nothing reached GitHub. The review is
- * done; only the posting step is missing, so SlopCop posts it rather than
- * discard a finished review and report `no_comment`.
- *
- * Only the zero-findings summary qualifies. A finding is a line comment that
- * needs a path and a line the final message does not carry, and a body without
- * this run's marker cannot be attributed once posted.
+ * The agent owns findings — they are line comments needing a path and a line
+ * only it knows — and ends a clean review with the summary as its final
+ * message. The marker is the whole test: it carries this run's id and
+ * `kind=summary`, and without it a posted body could not be attributed.
  */
-export function unpostedSummary(options: {
+export function summaryToPost(options: {
   runId: string;
   finalMessage: string | null;
 }): string | null {
   const body = (options.finalMessage ?? "").trim();
-  if (body.length === 0) return null;
   const marker = parseMarker(body);
   if (marker === null) return null;
   if (marker.run !== options.runId || marker.kind !== "summary") return null;
-  if (!hasVisibleHeader(body)) return null;
   return body;
 }
 

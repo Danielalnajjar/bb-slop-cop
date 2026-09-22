@@ -10,7 +10,8 @@ BB agents can set them up for you.
 ```
 GitHub  ←(gh)—  watcher  →  rule matcher  →  dispatcher  →  BB agent
                    │                                          │
-             plugin SQLite  ←—— verified runs ——  gh pr review / gh pr comment
+             plugin SQLite  ←—— verified runs ——  findings by the agent,
+                                                   summary by SlopCop
 ```
 
 ## Install
@@ -92,9 +93,13 @@ wrote it, plus a hidden marker so SlopCop can find its own comments later:
 <!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=inline -->
 ```
 
-Findings are line comments on the diff. A Conversation review body is only for
-the no-findings case (`kind=summary`). A later run on a new commit is told
-which comments this rule already left, so it should not open a twin thread.
+Findings are line comments on the diff, and the agent posts them: only it knows
+the path and line each one belongs on. The no-findings summary (`kind=summary`)
+has one owner too, and it is not the agent — a clean review ends with that body
+as the thread's final message, and SlopCop posts it. A live agent is told never
+to run `gh pr review`, so its no-findings behavior is the same live and in
+shadow mode. A later run on a new commit is told which comments this rule
+already left, so it should not open a twin thread.
 
 When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
 polls GitHub's three separate comment surfaces (issue comments, inline review comments,
