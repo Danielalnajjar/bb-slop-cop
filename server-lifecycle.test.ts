@@ -73,7 +73,7 @@ afterEach(() => {
 });
 
 describe("reconciling runs a restart stranded", () => {
-  it("fails a run whose thread errored while the plugin was not loaded", async () => {
+  it("cancels a run whose thread errored while the plugin was not loaded", async () => {
     vi.useFakeTimers();
     stubGhLogin();
     const { harness, store } = await setup();
@@ -87,8 +87,10 @@ describe("reconciling runs a restart stranded", () => {
     try {
       await startWatcher(harness);
 
+      // A thread that died three minutes in never reached a verdict, so the
+      // run is cancelled, not failed.
       expect(store.getRun("run_1")).toMatchObject({
-        status: "failed",
+        status: "cancelled",
         detail: "provider/error: model rejected the request",
         finishedAt: expect.any(Number),
       });
@@ -172,7 +174,7 @@ describe("reconciling runs a restart stranded", () => {
 });
 
 describe("threads retired mid-review", () => {
-  it("fails a run whose thread is archived before it finishes", async () => {
+  it("cancels a run whose thread is archived before it finishes", async () => {
     const { harness, store } = await setup();
     try {
       await harness.behavior.emitThreadEvent("thread.archived", {
@@ -180,8 +182,8 @@ describe("threads retired mid-review", () => {
       });
 
       expect(store.getRun("run_1")).toMatchObject({
-        status: "failed",
-        detail: "the review thread was archived before it finished",
+        status: "cancelled",
+        detail: "the review thread was archived before it reached a verdict",
         finishedAt: expect.any(Number),
       });
     } finally {
@@ -189,7 +191,7 @@ describe("threads retired mid-review", () => {
     }
   });
 
-  it("fails a run whose thread is deleted before it finishes", async () => {
+  it("cancels a run whose thread is deleted before it finishes", async () => {
     const { harness, store } = await setup();
     try {
       await harness.behavior.emitThreadEvent("thread.deleted", {
@@ -197,8 +199,8 @@ describe("threads retired mid-review", () => {
       });
 
       expect(store.getRun("run_1")).toMatchObject({
-        status: "failed",
-        detail: "the review thread was deleted before it finished",
+        status: "cancelled",
+        detail: "the review thread was deleted before it reached a verdict",
         finishedAt: expect.any(Number),
       });
     } finally {
@@ -228,14 +230,14 @@ describe("threads retired mid-review", () => {
 });
 
 describe("bb slopcop runs cancel", () => {
-  it("fails a reviewing run and stops its thread", async () => {
+  it("cancels a reviewing run and stops its thread", async () => {
     const { harness, store } = await setup();
     try {
       const result = await harness.behavior.runCli(["runs", "cancel", "run_1"]);
 
       expect(result.exitCode).toBe(0);
       expect(store.getRun("run_1")).toMatchObject({
-        status: "failed",
+        status: "cancelled",
         detail: "cancelled by operator",
         finishedAt: expect.any(Number),
       });

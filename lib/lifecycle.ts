@@ -22,9 +22,9 @@ export async function archiveReviewThread(
  * reconciled thread has no event left to read one from.
  */
 export const THREAD_ARCHIVED_REASON =
-  "the review thread was archived before it finished";
+  "the review thread was archived before it reached a verdict";
 export const THREAD_DELETED_REASON =
-  "the review thread was deleted before it finished";
+  "the review thread was deleted before it reached a verdict";
 
 /**
  * What a review thread has already become, read from the thread row rather

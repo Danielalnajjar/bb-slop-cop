@@ -589,9 +589,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Host delivers thread.idle/failed on setImmediate; that can beat spawn's
   // HTTP response, so finishRun stashes until dispatch stores threadId.
+  /**
+   * How a run ended without a verdict. `failed` is a review that ran and
+   * failed; `cancelled` is one whose thread ended, was retired, or was
+   * cancelled before it produced anything to verify.
+   */
+  type RunFailure = { status: "failed" | "cancelled"; detail: string };
+
   const pendingFinish = new Map<
     string,
-    { finalMessage: string | null; failure: string | null }
+    { finalMessage: string | null; failure: RunFailure | null }
   >();
 
   // provider-retry and SlopCop both observe a failed turn. Correlate the
@@ -713,7 +720,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function finishRunOnce(
     threadId: string,
     finalMessage: string | null,
-    failure: string | null,
+    failure: RunFailure | null,
   ): Promise<void> {
     const run = store.findRunByThread(threadId);
     if (run === null) {
@@ -726,15 +733,17 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       if (failure !== null) {
         store.updateRun(run.id, {
-          status: "failed",
-          detail: failure,
+          status: failure.status,
+          detail: failure.detail,
           finishedAt: Date.now(),
         });
         announce();
         await reportCheck("complete", run, {
-          status: "failed",
+          status: failure.status,
           commentCount: 0,
-          detail: null,
+          // A cancelled check says what stopped the review; a failed one has
+          // always been the bare "review failed" row.
+          detail: failure.status === "cancelled" ? failure.detail : null,
         });
         return;
       }
@@ -801,7 +810,7 @@ export default async function plugin(bb: BbPluginApi) {
   function finishRun(
     threadId: string,
     finalMessage: string | null,
-    failure: string | null,
+    failure: RunFailure | null,
   ): Promise<void> {
     const inProgress = finalizing.get(threadId);
     if (inProgress !== undefined) return inProgress;
@@ -880,7 +889,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     clearFailureCorrelation(thread.id);
-    await finishRun(thread.id, null, await detail);
+    await finishRun(thread.id, null, { status: "failed", detail: await detail });
   });
 
   function hasUnfinishedRun(threadId: string): boolean {
@@ -899,12 +908,18 @@ export default async function plugin(bb: BbPluginApi) {
    */
   bb.events.on("thread.archived", async ({ thread }) => {
     if (!hasUnfinishedRun(thread.id)) return;
-    await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
+    await finishRun(thread.id, null, {
+      status: "cancelled",
+      detail: THREAD_ARCHIVED_REASON,
+    });
   });
 
   bb.events.on("thread.deleted", async ({ thread }) => {
     if (!hasUnfinishedRun(thread.id)) return;
-    await finishRun(thread.id, null, THREAD_DELETED_REASON);
+    await finishRun(thread.id, null, {
+      status: "cancelled",
+      detail: THREAD_DELETED_REASON,
+    });
   });
 
   /**
@@ -936,11 +951,13 @@ export default async function plugin(bb: BbPluginApi) {
           await finishRun(threadId, output, null);
           continue;
         }
-        await finishRun(
-          threadId,
-          null,
-          outcome.reason ?? (await describeThreadFailure(threadId, null)),
-        );
+        // Nothing reconciled here produced a verdict, whatever ended the
+        // thread, so none of it earns a `failure` row on the PR.
+        await finishRun(threadId, null, {
+          status: "cancelled",
+          detail:
+            outcome.reason ?? (await describeThreadFailure(threadId, null)),
+        });
       } catch (error) {
         // A run left behind by a thread BB can no longer describe stays open
         // for `bb slopcop runs cancel`; guessing its outcome would be worse.
@@ -964,19 +981,22 @@ export default async function plugin(bb: BbPluginApi) {
   async function cancelRun(run: Run): Promise<void> {
     if (run.threadId === null) {
       store.updateRun(run.id, {
-        status: "failed",
+        status: "cancelled",
         detail: CANCELLED_DETAIL,
         finishedAt: Date.now(),
       });
       announce();
       await reportCheck("complete", run, {
-        status: "failed",
+        status: "cancelled",
         commentCount: 0,
-        detail: null,
+        detail: CANCELLED_DETAIL,
       });
       return;
     }
-    await finishRun(run.threadId, null, CANCELLED_DETAIL);
+    await finishRun(run.threadId, null, {
+      status: "cancelled",
+      detail: CANCELLED_DETAIL,
+    });
     try {
       await bb.sdk.threads.stop({ threadId: run.threadId });
     } catch (error) {

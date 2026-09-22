@@ -336,14 +336,14 @@ export function createStore(db: Database) {
               .prepare(
                 `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ?
-                   AND status NOT IN ('skipped', 'failed') LIMIT 1`,
+                   AND status NOT IN ('skipped', 'cancelled', 'failed') LIMIT 1`,
               )
               .get(ruleId, repo, prNumber)
           : db
               .prepare(
                 `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha = ?
-                   AND status NOT IN ('skipped', 'failed') LIMIT 1`,
+                   AND status NOT IN ('skipped', 'cancelled', 'failed') LIMIT 1`,
               )
               .get(ruleId, repo, prNumber, headSha);
       return row !== undefined;

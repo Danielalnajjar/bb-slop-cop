@@ -220,16 +220,21 @@ Rule flags: `--name --repo --project --provider --model --reasoning --permission
 `shadowed` · `commented` · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
 without posting) · `skipped` (matched nothing, e.g. blocked by the trust gate) ·
-`failed`.
+`cancelled` (the thread ended, was retired, or was cancelled before the review
+reached a verdict) · `failed` (a review that ran and failed).
+
+`cancelled` and `failed` are kept apart because the merge box reads them
+differently: `failed` puts a red `failure` on the head SHA, so it is reserved
+for a review that actually ran. A run with no verdict completes its check as
+`cancelled` and never dedupes away a later re-review of the same PR.
 
 Thread lifecycle events are process-local, so a review thread that ended while
 the plugin was not loaded has no event left to fire. The watcher reconciles
-against BB once on start: an errored thread fails its run with the detail from
-the thread's event log, an idle one is verified as if it had just finished, and
-a thread archived or deleted mid-review fails its run with that reason. A run
-whose thread BB can no longer describe stays open for `runs cancel`, which
-marks it `failed` with "cancelled by operator" and stops the thread. Cancelling
-an already-finished run is refused.
+against BB once on start: a thread that errored, or was archived or deleted
+mid-review, cancels its run with the reason recorded, and an idle one is
+verified as if it had just finished. A run whose thread BB can no longer
+describe stays open for `runs cancel`, which cancels it with "cancelled by
+operator" and stops the thread. Cancelling an already-finished run is refused.
 
 ## Development
 

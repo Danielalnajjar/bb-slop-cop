@@ -8,7 +8,11 @@ import type { RunStatus } from "./types";
 
 export const CHECK_NAME = "SlopCop";
 
-export type CheckConclusion = "success" | "failure" | "neutral";
+export type CheckConclusion =
+  | "success"
+  | "failure"
+  | "neutral"
+  | "cancelled";
 
 export type CheckRequest = GhClient["request"];
 
@@ -39,7 +43,9 @@ function prUrl(repo: string, prNumber: number): string {
 
 /**
  * Posted reviews are `success` even with findings: the comments are the
- * findings. A red X would block merges the way required CI does.
+ * findings. A red X would block merges the way required CI does, and it is
+ * reserved for a review that ran and failed — a run that never reached a
+ * verdict is `cancelled`, which is what GitHub shows for work that stopped.
  */
 export function conclusionFor(status: RunStatus): CheckConclusion | null {
   switch (status) {
@@ -52,6 +58,8 @@ export function conclusionFor(status: RunStatus): CheckConclusion | null {
       return "neutral";
     case "failed":
       return "failure";
+    case "cancelled":
+      return "cancelled";
     case "skipped":
     case "shadowed":
     case "dispatched":
@@ -92,6 +100,11 @@ export function outputFor(input: CompleteCheckInput): {
       return {
         title: "Review failed",
         summary: `SlopCop failed while reviewing PR #${prNumber} with \`${ruleName}\`.`,
+      };
+    case "cancelled":
+      return {
+        title: "Review cancelled",
+        summary: `SlopCop's review thread for \`${ruleName}\` ended before it reached a verdict on PR #${prNumber}; no findings recorded.${extra}`,
       };
     default:
       return {

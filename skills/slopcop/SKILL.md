@@ -84,12 +84,18 @@ the single decisive reason (draft, trust gate, a specific condition).
 GitHub by marker) · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted but attribution degraded — the prompt contract
 slipped) · `no_comment` (thread finished without posting) · `skipped` (a rule
-matched nothing, e.g. blocked by the trust gate) · `failed`.
+matched nothing, e.g. blocked by the trust gate) · `cancelled` (the thread
+ended, was retired, or was cancelled before the review reached a verdict) ·
+`failed` (a review that ran and failed).
+
+`failed` is the only one that puts a red `failure` on the head SHA, so a run
+with no verdict is `cancelled` instead — and a cancelled run never dedupes away
+a later re-review of the same PR.
 
 A run stays at `reviewing` only while BB still says its thread is working. The
 watcher reconciles once on start, so a thread that errored, went idle, or was
 archived or deleted while the plugin was down is finished then — errored and
-retired threads fail their run with the reason recorded. `runs cancel` is for
+retired threads are cancelled with the reason recorded. `runs cancel` is for
 the remainder: a run whose thread BB can no longer describe. It refuses a run
 that already reached a terminal status.
 
