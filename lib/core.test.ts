@@ -151,6 +151,20 @@ describe("bot posting command", () => {
     expect(buildPrompt(context("   "))).toContain("Post with `gh`.");
   });
 
+  it("keeps plain string fields on -f and the file-read body on -F", () => {
+    const prompt = buildPrompt(context());
+    for (const field of [
+      "-f commit_id=a1b2c3d",
+      "-f path=FILE",
+      "-F line=LINE",
+      "-f side=RIGHT",
+      "-F body=@/tmp/slopcop-finding-N.md",
+    ]) {
+      expect(prompt).toContain(field);
+    }
+    expect(prompt).toContain("The body flag is `-F`, not `-f`");
+  });
+
   it("tells live agents to pin findings on the line, not the review body", () => {
     const prompt = buildPrompt(context());
     expect(prompt).toContain("api repos/acme/checkout-api/pulls/482/comments");
@@ -174,7 +188,9 @@ describe("bot posting command", () => {
 
   it("makes live agents post bodies from files, never inline quotes", () => {
     const prompt = buildPrompt(context());
-    expect(prompt).toContain("-f body=@/tmp/slopcop-finding-N.md");
+    expect(prompt).toContain("-F body=@/tmp/slopcop-finding-N.md");
+    // `gh api` expands `@FILE` only for `-F`; `-f` posts the path itself.
+    expect(prompt).not.toContain("-f body=");
     expect(prompt).not.toContain("body='");
     expect(prompt).not.toContain(" -b '");
     expect(prompt).not.toContain("--request-changes");

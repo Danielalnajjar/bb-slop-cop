@@ -61,7 +61,8 @@ Conversation review body — it cannot attach to a file, and it is not yours.
 Write every body to its own file first, with a quoted heredoc delimiter so
 the text lands exactly as written, and pass the file to \`gh\`. Never pass a
 body inline in quotes: a \`\\n\` typed inside quotes reaches GitHub as two
-literal characters, not a line break.
+literal characters, not a line break. The body flag is \`-F\`, not \`-f\`:
+only \`-F\` reads \`@FILE\`, and \`-f\` would post the path as the comment.
 
 For each finding, post one review comment on the line (commit is the head SHA):
 
@@ -73,7 +74,7 @@ For each finding, post one review comment on the line (commit is the head SHA):
       -f path=FILE \\
       -F line=LINE \\
       -f side=RIGHT \\
-      -f body=@/tmp/slopcop-finding-N.md
+      -F body=@/tmp/slopcop-finding-N.md
 
 \`path\` is repo-relative. \`line\` is the new-file line (RIGHT side). Use
 \`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
