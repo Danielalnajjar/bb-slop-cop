@@ -69,6 +69,7 @@ bb slopcop status                      # gh auth, watched repos, poll interval
 bb slopcop check <rule> <pr-number>    # dry run: match or the exact reason it did not
 bb slopcop runs [--rule <r>] [--json]  # recent runs and their status
 bb slopcop show [run-id]               # the review body a run produced
+bb slopcop runs cancel <run-id>        # fail an unfinished run and stop its thread
 bb slopcop verify [run-id]             # re-check GitHub and complete the merge-box check
 bb slopcop dispatch <rule> <pr> [--force]
 bb slopcop rules edit|enable|disable|rm <rule>
@@ -84,6 +85,13 @@ GitHub by marker) · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted but attribution degraded — the prompt contract
 slipped) · `no_comment` (thread finished without posting) · `skipped` (a rule
 matched nothing, e.g. blocked by the trust gate) · `failed`.
+
+A run stays at `reviewing` only while BB still says its thread is working. The
+watcher reconciles once on start, so a thread that errored, went idle, or was
+archived or deleted while the plugin was down is finished then — errored and
+retired threads fail their run with the reason recorded. `runs cancel` is for
+the remainder: a run whose thread BB can no longer describe. It refuses a run
+that already reached a terminal status.
 
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker

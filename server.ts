@@ -13,7 +13,12 @@ import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
-import { archiveReviewThread } from "./lib/lifecycle";
+import {
+  archiveReviewThread,
+  reviewThreadOutcome,
+  THREAD_ARCHIVED_REASON,
+  THREAD_DELETED_REASON,
+} from "./lib/lifecycle";
 import { collectPriorComments } from "./lib/prior";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
@@ -878,6 +883,111 @@ export default async function plugin(bb: BbPluginApi) {
     await finishRun(thread.id, null, await detail);
   });
 
+  function hasUnfinishedRun(threadId: string): boolean {
+    const run = store.findRunByThread(threadId);
+    return run !== null && run.finishedAt === null;
+  }
+
+  /**
+   * A review thread can also end without its turn ever failing: someone
+   * archives or deletes it mid-review. Neither announces `thread.idle` or
+   * `thread.failed`, so without these the run sits at `reviewing` forever.
+   *
+   * Every archive and delete in BB reaches these handlers, including the
+   * archive `finishRun` itself performs, so both answer only for a run that is
+   * still open.
+   */
+  bb.events.on("thread.archived", async ({ thread }) => {
+    if (!hasUnfinishedRun(thread.id)) return;
+    await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
+  });
+
+  bb.events.on("thread.deleted", async ({ thread }) => {
+    if (!hasUnfinishedRun(thread.id)) return;
+    await finishRun(thread.id, null, THREAD_DELETED_REASON);
+  });
+
+  /**
+   * Those announcements are process-local. A review thread that reached its
+   * terminal state while this plugin was not loaded — a BB restart, a plugin
+   * reload, a crash — has no event left to fire, and its run stayed at
+   * `reviewing` indefinitely with no way to close it. One pass when the
+   * watcher starts asks BB what those threads actually became and replays the
+   * missed transition through `finishRun`, so a reconciled run is recorded by
+   * exactly the code an announced one is.
+   */
+  async function reconcileUnfinishedRuns(): Promise<void> {
+    for (const run of store.listUnfinishedRuns()) {
+      const threadId = run.threadId;
+      if (threadId === null) continue;
+      try {
+        const thread = (await bb.sdk.threads.get({ threadId })) as {
+          status: string;
+          archivedAt?: number | null;
+          deletedAt?: number | null;
+        };
+        const outcome = reviewThreadOutcome(thread);
+        if (outcome.kind === "running") continue;
+        bb.log.info(
+          `reconciling ${run.id} (${run.ruleName} #${run.prNumber}): its thread is ${thread.status}`,
+        );
+        if (outcome.kind === "finished") {
+          const { output } = await bb.sdk.threads.output({ threadId });
+          await finishRun(threadId, output, null);
+          continue;
+        }
+        await finishRun(
+          threadId,
+          null,
+          outcome.reason ?? (await describeThreadFailure(threadId, null)),
+        );
+      } catch (error) {
+        // A run left behind by a thread BB can no longer describe stays open
+        // for `bb slopcop runs cancel`; guessing its outcome would be worse.
+        bb.log.warn(
+          `could not reconcile run ${run.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
+  const CANCELLED_DETAIL = "cancelled by operator";
+
+  /**
+   * The operator's way out of a run nothing else can close. The run is
+   * finalized before the thread is stopped: stopping an active thread makes BB
+   * announce `thread.idle`, and a finished run turns that announcement into a
+   * no-op rather than a verification pass that overwrites the reason.
+   */
+  async function cancelRun(run: Run): Promise<void> {
+    if (run.threadId === null) {
+      store.updateRun(run.id, {
+        status: "failed",
+        detail: CANCELLED_DETAIL,
+        finishedAt: Date.now(),
+      });
+      announce();
+      await reportCheck("complete", run, {
+        status: "failed",
+        commentCount: 0,
+        detail: null,
+      });
+      return;
+    }
+    await finishRun(run.threadId, null, CANCELLED_DETAIL);
+    try {
+      await bb.sdk.threads.stop({ threadId: run.threadId });
+    } catch (error) {
+      bb.log.warn(
+        `could not stop review thread ${run.threadId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   // --- shared helpers for rpc + cli ---------------------------------------
 
   function resolveRule(idOrName: string): Rule {
@@ -1021,6 +1131,11 @@ export default async function plugin(bb: BbPluginApi) {
         name: "runs",
         summary: "Recent review runs",
         usage: "bb slopcop runs [--rule <id|name>] [--limit N] [--json]",
+      },
+      {
+        name: "runs-cancel",
+        summary: "Fail an unfinished run and stop its review thread",
+        usage: "bb slopcop runs cancel <run-id>",
       },
       {
         name: "check",
@@ -1251,6 +1366,24 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
 
+        if (command === "runs" && sub === "cancel") {
+          const runId = argv[2] ?? "";
+          if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
+          const run = store.getRun(runId);
+          if (run === null) return fail(`no such run '${runId}'`);
+          if (run.finishedAt !== null) {
+            return fail(
+              `run ${run.id} already finished as ${run.status} — nothing to cancel`,
+            );
+          }
+          await cancelRun(run);
+          const cancelled = store.getRun(run.id);
+          if (json) return ok(JSON.stringify(cancelled, null, 2));
+          return ok(
+            `Cancelled ${run.id} (${run.ruleName} #${run.prNumber}) — ${CANCELLED_DETAIL}.`,
+          );
+        }
+
         if (command === "runs") {
           const ruleFlag = flag("rule");
           const rule = ruleFlag === undefined ? null : resolveRule(ruleFlag);
@@ -1398,6 +1531,7 @@ export default async function plugin(bb: BbPluginApi) {
         return;
       }
       bb.log.info(`gh authenticated as ${ghLogin}`);
+      await reconcileUnfinishedRuns();
 
       while (!signal.aborted) {
         const values = await readSettings();

@@ -19318,6 +19318,19 @@ function createStore(db) {
         ...params
       );
     },
+    /**
+     * Runs whose review thread was spawned but never reached a terminal
+     * status. Thread lifecycle events are process-local, so these are what a
+     * restart has to reconcile against BB.
+     */
+    listUnfinishedRuns() {
+      const rows = db.prepare(
+        `SELECT * FROM runs
+           WHERE finished_at IS NULL AND thread_id IS NOT NULL
+           ORDER BY started_at`
+      ).all();
+      return rows.map(rowToRun);
+    },
     findRunByThread(threadId) {
       const row = db.prepare(`SELECT * FROM runs WHERE thread_id = ?`).get(threadId);
       return row === void 0 ? null : rowToRun(row);
@@ -19653,6 +19666,19 @@ async function archiveReviewThread(bb, threadId) {
       `could not archive completed review thread ${threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
     );
   }
+}
+var THREAD_ARCHIVED_REASON = "the review thread was archived before it finished";
+var THREAD_DELETED_REASON = "the review thread was deleted before it finished";
+function reviewThreadOutcome(thread) {
+  if (thread.deletedAt != null) {
+    return { kind: "failed", reason: THREAD_DELETED_REASON };
+  }
+  if (thread.status === "error") return { kind: "failed", reason: null };
+  if (thread.status === "idle") return { kind: "finished" };
+  if (thread.archivedAt != null) {
+    return { kind: "failed", reason: THREAD_ARCHIVED_REASON };
+  }
+  return { kind: "running" };
 }
 
 // lib/sections.ts
@@ -20810,6 +20836,71 @@ async function plugin(bb) {
     clearFailureCorrelation(thread.id);
     await finishRun(thread.id, null, await detail);
   });
+  function hasUnfinishedRun(threadId) {
+    const run2 = store.findRunByThread(threadId);
+    return run2 !== null && run2.finishedAt === null;
+  }
+  bb.events.on("thread.archived", async ({ thread }) => {
+    if (!hasUnfinishedRun(thread.id)) return;
+    await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
+  });
+  bb.events.on("thread.deleted", async ({ thread }) => {
+    if (!hasUnfinishedRun(thread.id)) return;
+    await finishRun(thread.id, null, THREAD_DELETED_REASON);
+  });
+  async function reconcileUnfinishedRuns() {
+    for (const run2 of store.listUnfinishedRuns()) {
+      const threadId = run2.threadId;
+      if (threadId === null) continue;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        const outcome = reviewThreadOutcome(thread);
+        if (outcome.kind === "running") continue;
+        bb.log.info(
+          `reconciling ${run2.id} (${run2.ruleName} #${run2.prNumber}): its thread is ${thread.status}`
+        );
+        if (outcome.kind === "finished") {
+          const { output: output2 } = await bb.sdk.threads.output({ threadId });
+          await finishRun(threadId, output2, null);
+          continue;
+        }
+        await finishRun(
+          threadId,
+          null,
+          outcome.reason ?? await describeThreadFailure(threadId, null)
+        );
+      } catch (error61) {
+        bb.log.warn(
+          `could not reconcile run ${run2.id}: ${error61 instanceof Error ? error61.message : String(error61)}`
+        );
+      }
+    }
+  }
+  const CANCELLED_DETAIL = "cancelled by operator";
+  async function cancelRun(run2) {
+    if (run2.threadId === null) {
+      store.updateRun(run2.id, {
+        status: "failed",
+        detail: CANCELLED_DETAIL,
+        finishedAt: Date.now()
+      });
+      announce();
+      await reportCheck("complete", run2, {
+        status: "failed",
+        commentCount: 0,
+        detail: null
+      });
+      return;
+    }
+    await finishRun(run2.threadId, null, CANCELLED_DETAIL);
+    try {
+      await bb.sdk.threads.stop({ threadId: run2.threadId });
+    } catch (error61) {
+      bb.log.warn(
+        `could not stop review thread ${run2.threadId}: ${error61 instanceof Error ? error61.message : String(error61)}`
+      );
+    }
+  }
   function resolveRule(idOrName) {
     const rule = store.getRule(idOrName) ?? store.findRuleByName(idOrName);
     if (rule === null) throw new Error(`no rule named '${idOrName}'`);
@@ -20924,6 +21015,11 @@ async function plugin(bb) {
         name: "runs",
         summary: "Recent review runs",
         usage: "bb slopcop runs [--rule <id|name>] [--limit N] [--json]"
+      },
+      {
+        name: "runs-cancel",
+        summary: "Fail an unfinished run and stop its review thread",
+        usage: "bb slopcop runs cancel <run-id>"
       },
       {
         name: "check",
@@ -21097,6 +21193,23 @@ ${payload.rules} rule(s)`
             `${sub === "enable" ? "Enabled" : "Disabled"} '${rule.name}'.`
           );
         }
+        if (command === "runs" && sub === "cancel") {
+          const runId = argv[2] ?? "";
+          if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
+          const run2 = store.getRun(runId);
+          if (run2 === null) return fail(`no such run '${runId}'`);
+          if (run2.finishedAt !== null) {
+            return fail(
+              `run ${run2.id} already finished as ${run2.status} \u2014 nothing to cancel`
+            );
+          }
+          await cancelRun(run2);
+          const cancelled = store.getRun(run2.id);
+          if (json2) return ok(JSON.stringify(cancelled, null, 2));
+          return ok(
+            `Cancelled ${run2.id} (${run2.ruleName} #${run2.prNumber}) \u2014 ${CANCELLED_DETAIL}.`
+          );
+        }
         if (command === "runs") {
           const ruleFlag = flag("rule");
           const rule = ruleFlag === void 0 ? null : resolveRule(ruleFlag);
@@ -21216,6 +21329,7 @@ Re-run with --force to dispatch anyway.`
         return;
       }
       bb.log.info(`gh authenticated as ${ghLogin}`);
+      await reconcileUnfinishedRuns();
       while (!signal.aborted) {
         const values = await readSettings();
         try {

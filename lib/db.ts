@@ -300,6 +300,22 @@ export function createStore(db: Database) {
       );
     },
 
+    /**
+     * Runs whose review thread was spawned but never reached a terminal
+     * status. Thread lifecycle events are process-local, so these are what a
+     * restart has to reconcile against BB.
+     */
+    listUnfinishedRuns(): Run[] {
+      const rows = db
+        .prepare(
+          `SELECT * FROM runs
+           WHERE finished_at IS NULL AND thread_id IS NOT NULL
+           ORDER BY started_at`,
+        )
+        .all();
+      return (rows as Row[]).map(rowToRun);
+    },
+
     findRunByThread(threadId: string): Run | null {
       const row = db
         .prepare(`SELECT * FROM runs WHERE thread_id = ?`)

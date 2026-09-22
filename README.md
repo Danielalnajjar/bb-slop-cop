@@ -188,6 +188,7 @@ Two consequences worth knowing:
 | `bb slopcop check <rule> <pr>` | Dry run — match, or the exact reason it did not |
 | `bb slopcop dispatch <rule> <pr> [--force]` | Run now |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
+| `bb slopcop runs cancel <run-id>` | Fail an unfinished run and stop its review thread |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
 | `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
@@ -220,6 +221,15 @@ Rule flags: `--name --repo --project --provider --model --reasoning --permission
 `commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
 without posting) · `skipped` (matched nothing, e.g. blocked by the trust gate) ·
 `failed`.
+
+Thread lifecycle events are process-local, so a review thread that ended while
+the plugin was not loaded has no event left to fire. The watcher reconciles
+against BB once on start: an errored thread fails its run with the detail from
+the thread's event log, an idle one is verified as if it had just finished, and
+a thread archived or deleted mid-review fails its run with that reason. A run
+whose thread BB can no longer describe stays open for `runs cancel`, which
+marks it `failed` with "cancelled by operator" and stops the thread. Cancelling
+an already-finished run is refused.
 
 ## Development
 
