@@ -14,7 +14,7 @@ import {
   isTrustedAuthor,
   matchGlob,
 } from "./matcher";
-import { buildPrompt } from "./dispatch";
+import { buildPrompt, buildThreadTitle } from "./dispatch";
 import { collectPriorComments, titleFromBody } from "./prior";
 import {
   liveVerifyBlockReason,
@@ -976,4 +976,11 @@ describe("github checks", () => {
       endpoint: "repos/acme/checkout-api/check-runs/1",
     });
   });
+});
+
+
+it("identifies each dispatch run in its recovery title", () => {
+  const context = { rule: { name: "review", mode: "shadow" as const }, pullRequest: { number: 42 } };
+  expect(buildThreadTitle({ ...context, runId: "run_one" })).toBe("SlopCop (shadow): review — PR #42 [run_one]");
+  expect(buildThreadTitle({ ...context, runId: "run_two" })).toBe("SlopCop (shadow): review — PR #42 [run_two]");
 });

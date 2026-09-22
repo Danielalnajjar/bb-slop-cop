@@ -9,6 +9,7 @@ import {
   type BbPluginApi,
   type PluginThreadEventPayloads,
 } from "@get-bb/plugin-sdk";
+import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
@@ -230,8 +231,12 @@ export default async function plugin(bb: BbPluginApi) {
   let ghLogin: string | null = null;
   let inFlight = 0;
 
+  let watcherSignal: AbortSignal | undefined;
+  const waitForWork = <T>(work: () => Promise<T>): Promise<T> =>
+    waitForAbort(work, watcherSignal);
+
   const readSettings = async () => {
-    const values = await settings.get();
+    const values = await waitForWork(() => settings.get());
     // Stored values bypass save-time validation, so validate before scheduling.
     const pollSeconds = pollSecondsSchema.parse(values.pollSeconds);
     const maxConcurrent = maxConcurrentReviewsSchema.parse(
@@ -274,7 +279,8 @@ export default async function plugin(bb: BbPluginApi) {
     complete?: Pick<CompleteCheckInput, "status" | "commentCount" | "detail">,
   ): Promise<void> {
     if (run.mode !== "live" || run.headSha.length === 0) return;
-    const request = gh.request.bind(gh);
+    const request: GhClient["request"] = (...args) =>
+      waitForWork(() => gh.request(...args));
     const base = {
       repo: run.repo,
       sha: run.headSha,
@@ -284,21 +290,22 @@ export default async function plugin(bb: BbPluginApi) {
     };
     try {
       if (kind === "start") {
-        const id = await startCheckRun(request, base);
+        const id = await waitForWork(() => startCheckRun(request, base));
         if (id !== null) checkRunIds.set(run.id, id);
         return;
       }
       if (complete === undefined) return;
       try {
-        await completeCheckRun(request, {
+        await waitForWork(() => completeCheckRun(request, {
           ...base,
           ...complete,
           checkRunId: checkRunIds.get(run.id) ?? null,
-        });
+        }));
       } finally {
         checkRunIds.delete(run.id);
       }
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `check run ${kind} failed for ${run.repo}#${run.prNumber}: ${
           error instanceof Error ? error.message : String(error)
@@ -322,8 +329,9 @@ export default async function plugin(bb: BbPluginApi) {
     );
     if (!needsFiles || pullRequest.files.length > 0) return;
     try {
-      pullRequest.files = await gh.listFiles(repo, pullRequest.number);
+      pullRequest.files = await waitForWork(() => gh.listFiles(repo, pullRequest.number));
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not list files for ${repo}#${pullRequest.number}: ${
           error instanceof Error ? error.message : String(error)
@@ -368,6 +376,20 @@ export default async function plugin(bb: BbPluginApi) {
     });
     announce();
 
+    const throwIfDispatchAborted = () => {
+      if (!watcherSignal?.aborted) return;
+      const reserved = store.getRun(runId);
+      if (reserved?.status === "dispatched") {
+        store.updateRun(runId, {
+          status: "cancelled",
+          detail: "plugin stopped before dispatch completed",
+          finishedAt: null,
+        });
+        announce();
+      }
+      watcherSignal.throwIfAborted();
+    };
+
     if (rule.request === null) {
       store.updateRun(runId, {
         status: "failed",
@@ -389,16 +411,17 @@ export default async function plugin(bb: BbPluginApi) {
     };
     let priorComments: ReturnType<typeof collectPriorComments> = [];
     try {
-      const [issues, review, reviews] = await Promise.all([
+      const [issues, review, reviews] = await waitForWork(() => Promise.all([
         gh.listIssueComments(rule.repo, pullRequest.number),
         gh.listReviewComments(rule.repo, pullRequest.number),
         gh.listReviews(rule.repo, pullRequest.number),
-      ]);
+      ]));
       priorComments = collectPriorComments(
         [...issues, ...review, ...reviews],
         rule.name,
       );
     } catch (error) {
+      throwIfDispatchAborted();
       bb.log.warn(
         `could not list prior comments for ${rule.repo}#${pullRequest.number}: ${
           error instanceof Error ? error.message : String(error)
@@ -442,24 +465,34 @@ export default async function plugin(bb: BbPluginApi) {
       const sectionId = resolveThreadSectionId(
         defaultThreadSection,
         defaultThreadSection.length > 0
-          ? await bb.sdk.threadSections.list()
+          ? await waitForWork(() => bb.sdk.threadSections.list())
           : [],
       );
       // thread.idle / thread.failed already run finishRun concurrently.
       await reportCheck("start", checkRun);
-      const thread = await bb.sdk.threads.spawn({
-        ...execution,
-        prompt: buildPrompt(context),
-        title: buildThreadTitle(context),
-        visibility: rule.visibility,
-        ...(sectionId === undefined ? {} : { sectionId }),
-      } as never);
+      const dispatchSignal = watcherSignal;
+      const logInfo = bb.log.info;
+      const thread = await waitForWork(async () => {
+        const thread = await bb.sdk.threads.spawn({
+          ...execution,
+          prompt: buildPrompt(context),
+          title: buildThreadTitle(context),
+          visibility: rule.visibility,
+          ...(sectionId === undefined ? {} : { sectionId }),
+        } as never);
+        if (dispatchSignal?.aborted) {
+          logInfo(`run ${runId}: ignored spawn result after shutdown (thread ${(thread as { id?: string }).id ?? "unknown"})`);
+          return thread;
+        }
+        store.updateRun(runId, { threadId: (thread as { id: string }).id });
+        return thread;
+      });
       const threadId = (thread as { id: string }).id;
       // `runs cancel` can finalize this run while it still has no thread. The
       // cancellation stays; writing `reviewing` over it here would leave the
       // agent running with no event able to close the run again.
       const reserved = store.getRun(runId);
-      if (reserved !== null && reserved.finishedAt !== null) {
+      if (reserved !== null && !isReviewInProgress(reserved)) {
         store.updateRun(runId, { threadId });
         await stopReviewThread(threadId);
         bb.log.info(
@@ -480,17 +513,14 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return { runId, threadId };
     } catch (error) {
+      throwIfDispatchAborted();
       store.updateRun(runId, {
         status: "failed",
         detail: error instanceof Error ? error.message : String(error),
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", checkRun, {
-        status: "failed",
-        commentCount: 0,
-        detail: null,
-      });
+      await finalizeRun(store.getRun(runId)!);
       return { runId, threadId: null };
     }
   }
@@ -531,8 +561,9 @@ export default async function plugin(bb: BbPluginApi) {
     for (const repo of repos) {
       let pullRequests: PullRequest[];
       try {
-        pullRequests = await gh.listOpenPullRequests(repo);
+        pullRequests = await waitForWork(() => gh.listOpenPullRequests(repo));
       } catch (error) {
+        watcherSignal?.throwIfAborted();
         bb.log.warn(
           `poll failed for ${repo}: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -664,12 +695,13 @@ export default async function plugin(bb: BbPluginApi) {
     requestId: string,
   ): Promise<boolean> {
     try {
-      const entries = await bb.sdk.threads.queue.list({ threadId });
+      const entries = await waitForWork(() => bb.sdk.threads.queue.list({ threadId }));
       for (const entry of entries) {
         noteRetry(entry);
       }
       return retriedRequestsByThread.get(threadId)?.has(requestId) ?? false;
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not inspect retry queue for ${threadId}: ${
           error instanceof Error ? error.message : String(error)
@@ -686,9 +718,10 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function retryQueuedFor(threadId: string): Promise<boolean> {
     try {
-      const entries = await bb.sdk.threads.queue.list({ threadId });
+      const entries = await waitForWork(() => bb.sdk.threads.queue.list({ threadId }));
       return entries.some((entry) => entry.payload.kind === "retry");
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not inspect retry queue for ${threadId}: ${
           error instanceof Error ? error.message : String(error)
@@ -746,6 +779,20 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("message.queued", ({ entry }) => noteRetry(entry));
   bb.events.on("message.dispatched", ({ entry }) => noteRetry(entry));
 
+  function isReviewInProgress(run: Run): boolean {
+    return run.status === "dispatched" || run.status === "reviewing";
+  }
+
+  async function finalizeRun(run: Run): Promise<void> {
+    await reportCheck("complete", run, run);
+    const threadId = run.threadId;
+    if (threadId !== null) {
+      await waitForWork(() => archiveReviewThread(bb, threadId));
+    }
+    store.updateRun(run.id, { finishedAt: Date.now() });
+    announce();
+  }
+
   async function finishRunOnce(
     threadId: string,
     finalMessage: string | null,
@@ -757,6 +804,10 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     if (run.finishedAt !== null) return;
+    if (!isReviewInProgress(run)) {
+      await finalizeRun(run);
+      return;
+    }
     inFlight = Math.max(0, inFlight - 1);
 
     try {
@@ -768,14 +819,9 @@ export default async function plugin(bb: BbPluginApi) {
         store.updateRun(run.id, {
           status: "cancelled",
           detail: noVerdict,
-          finishedAt: Date.now(),
+          finishedAt: null,
         });
         announce();
-        await reportCheck("complete", run, {
-          status: "cancelled",
-          commentCount: 0,
-          detail: noVerdict,
-        });
         return;
       }
 
@@ -795,10 +841,10 @@ export default async function plugin(bb: BbPluginApi) {
           : await (async () => {
               // GitHub's list endpoints can lag a just-submitted review, so a
               // bare no_comment gets one retry before it is believed.
-              const first = await runVerify();
+              const first = await waitForWork(() => runVerify());
               if (first.status !== "no_comment") return first;
-              await new Promise((resolve) => setTimeout(resolve, 4_000));
-              const second = await runVerify();
+              await sleep(4_000, watcherSignal);
+              const second = await waitForWork(() => runVerify());
               // SlopCop owns the no-findings summary: the agent posts findings
               // as line comments and ends a clean review with the summary as
               // its final message. Nothing on the PR plus that body means the
@@ -813,13 +859,13 @@ export default async function plugin(bb: BbPluginApi) {
                 finalMessage,
               });
               if (body === null) return second;
-              await gh.request(
+              await waitForWork(() => gh.request(
                 "POST",
                 `repos/${run.repo}/issues/${run.prNumber}/comments`,
                 { body },
-              );
+              ));
               bb.log.info(`run ${run.id}: posted the no-findings summary`);
-              return runVerify();
+              return waitForWork(() => runVerify());
             })();
 
       store.replaceComments(run.id, result.comments);
@@ -827,35 +873,29 @@ export default async function plugin(bb: BbPluginApi) {
         status: result.status,
         detail: result.detail,
         commentCount: result.comments.length,
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", run, {
-        status: result.status,
-        commentCount: result.comments.length,
-        detail: result.detail,
-      });
       bb.log.info(
         `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
       );
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       const detail = error instanceof Error ? error.message : String(error);
       store.updateRun(run.id, {
         status: "failed",
         detail,
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", run, {
-        status: "failed",
-        commentCount: 0,
-        detail: null,
-      });
       bb.log.error(
         `verification failed: ${detail}`,
       );
     } finally {
-      await archiveReviewThread(bb, threadId);
+      const selected = store.getRun(run.id);
+      if (selected !== null && !isReviewInProgress(selected) && !watcherSignal?.aborted) {
+        await finalizeRun(selected);
+      }
     }
   }
 
@@ -896,9 +936,9 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<string> {
     if (reported !== null && reported.trim().length > 0) return reported;
     try {
-      const result = (await bb.sdk.threads.events.list({
+      const result = (await waitForWork(() => bb.sdk.threads.events.list({
         threadId,
-      } as never)) as { events?: unknown[] };
+      } as never))) as { events?: unknown[] };
       const events = Array.isArray(result.events) ? result.events : [];
       for (const raw of [...events].reverse()) {
         const event = raw as { type?: unknown; message?: unknown; error?: unknown };
@@ -913,6 +953,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (message.length > 0) return `${type}: ${message}`;
       }
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not read failure detail for ${threadId}: ${
           error instanceof Error ? error.message : String(error)
@@ -944,9 +985,9 @@ export default async function plugin(bb: BbPluginApi) {
     await finishRun(thread.id, null, await detail);
   });
 
-  function hasUnfinishedRun(threadId: string): boolean {
+  function hasReviewInProgress(threadId: string): boolean {
     const run = store.findRunByThread(threadId);
-    return run !== null && run.finishedAt === null;
+    return run !== null && isReviewInProgress(run);
   }
 
   /**
@@ -959,14 +1000,36 @@ export default async function plugin(bb: BbPluginApi) {
    * still open.
    */
   bb.events.on("thread.archived", async ({ thread }) => {
-    if (!hasUnfinishedRun(thread.id)) return;
+    if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
   });
 
   bb.events.on("thread.deleted", async ({ thread }) => {
-    if (!hasUnfinishedRun(thread.id)) return;
+    if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_DELETED_REASON);
   });
+
+  async function findDispatchedThreads(run: Run): Promise<string[]> {
+    const title = buildThreadTitle({
+      runId: run.id,
+      rule: { name: run.ruleName, mode: run.mode },
+      pullRequest: { number: run.prNumber },
+    });
+    const matches = new Set<string>();
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += 100) {
+        const threads = await waitForWork(() => bb.sdk.threads.list({
+          originPluginId: bb.pluginId, includeHidden: true, archived, limit: 100, offset,
+        }));
+        for (const thread of threads) {
+          if (thread.originPluginId === bb.pluginId && thread.title === title) matches.add(thread.id);
+        }
+        if (matches.size > 1 || threads.length < 100) break;
+      }
+      if (matches.size > 1) break;
+    }
+    return [...matches];
+  }
 
   /**
    * Those announcements are process-local. A review thread that reached its
@@ -978,11 +1041,33 @@ export default async function plugin(bb: BbPluginApi) {
    * exactly the code an announced one is.
    */
   async function reconcileUnfinishedRuns(): Promise<void> {
-    for (const run of store.listUnfinishedRuns()) {
-      const threadId = run.threadId;
-      if (threadId === null) continue;
+    for (let run of store.listUnfinishedRuns()) {
+      let threadId = run.threadId;
       try {
-        const thread = (await bb.sdk.threads.get({ threadId })) as {
+        if (threadId === null && (isReviewInProgress(run) ||
+            run.detail === "plugin stopped before dispatch completed")) {
+          const matches = await findDispatchedThreads(run);
+          if (matches.length !== 1) {
+            run = { ...run, status: "cancelled", detail: matches.length === 0
+              ? "dispatch recovery found no matching thread"
+              : "dispatch recovery found multiple matching threads" };
+            store.updateRun(run.id, run);
+            await finalizeRun(run);
+            continue;
+          }
+          threadId = matches[0]!;
+          run = { ...run, threadId, status: "reviewing", detail: null };
+          store.updateRun(run.id, run);
+          announce();
+        }
+        if (!isReviewInProgress(run)) {
+          if (threadId === null) await finalizeRun(run);
+          else await finishRun(threadId, null, null);
+          continue;
+        }
+        if (threadId === null) continue;
+        const recoveredThreadId = threadId;
+        const thread = (await waitForWork(() => bb.sdk.threads.get({ threadId: recoveredThreadId }))) as {
           status: string;
           archivedAt?: number | null;
           deletedAt?: number | null;
@@ -1003,7 +1088,7 @@ export default async function plugin(bb: BbPluginApi) {
           // strand the run whenever that call fails.
           const finalMessage =
             run.mode === "shadow"
-              ? (await bb.sdk.threads.output({ threadId })).output
+              ? (await waitForWork(() => bb.sdk.threads.output({ threadId: recoveredThreadId }))).output
               : null;
           await finishRun(threadId, finalMessage, null);
           continue;
@@ -1023,6 +1108,7 @@ export default async function plugin(bb: BbPluginApi) {
           outcome.reason ?? (await describeThreadFailure(threadId, null)),
         );
       } catch (error) {
+        watcherSignal?.throwIfAborted();
         // A run left behind by a thread BB can no longer describe stays open
         // for `bb slopcop runs cancel`; guessing its outcome would be worse.
         bb.log.warn(
@@ -1036,8 +1122,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function stopReviewThread(threadId: string): Promise<void> {
     try {
-      await bb.sdk.threads.stop({ threadId });
+      await waitForWork(() => bb.sdk.threads.stop({ threadId }));
     } catch (error) {
+      watcherSignal?.throwIfAborted();
       bb.log.warn(
         `could not stop review thread ${threadId}: ${
           error instanceof Error ? error.message : String(error)
@@ -1050,23 +1137,18 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The operator's way out of a run nothing else can close. The run is
-   * finalized before the thread is stopped: stopping an active thread makes BB
-   * announce `thread.idle`, and a finished run turns that announcement into a
-   * no-op rather than a verification pass that overwrites the reason.
+   * assigned its terminal verdict before the thread is stopped: BB can announce
+   * `thread.idle` during cleanup, which must not overwrite that verdict.
    */
   async function cancelRun(run: Run): Promise<void> {
     if (run.threadId === null) {
       store.updateRun(run.id, {
         status: "cancelled",
         detail: CANCELLED_DETAIL,
-        finishedAt: Date.now(),
+        finishedAt: null,
       });
       announce();
-      await reportCheck("complete", run, {
-        status: "cancelled",
-        commentCount: 0,
-        detail: CANCELLED_DETAIL,
-      });
+      await finalizeRun({ ...run, status: "cancelled", detail: CANCELLED_DETAIL });
       return;
     }
     await finishRun(run.threadId, null, CANCELLED_DETAIL);
@@ -1456,7 +1538,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
           const run = store.getRun(runId);
           if (run === null) return fail(`no such run '${runId}'`);
-          if (run.finishedAt !== null) {
+          if (!isReviewInProgress(run)) {
             return fail(
               `run ${run.id} already finished as ${run.status} — nothing to cancel`,
             );
@@ -1613,38 +1695,34 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.background.service("watcher", {
     async start(signal) {
-      const initial = await readSettings();
-      gh = createGhClient(initial.ghPath);
-      ghLogin = await gh.authenticatedLogin();
-      if (ghLogin === null) {
-        bb.status.needsConfiguration(
-          "`gh` is not authenticated on this machine. Run `gh auth login`, then reload the plugin.",
-        );
-        return;
-      }
-      bb.log.info(`gh authenticated as ${ghLogin}`);
-      await reconcileUnfinishedRuns();
-
-      while (!signal.aborted) {
-        const values = await readSettings();
-        try {
-          await poll(values.maxConcurrent);
-        } catch (error) {
-          bb.log.error(
-            `poll pass failed: ${error instanceof Error ? error.message : String(error)}`,
+      watcherSignal = signal;
+      try {
+        const initial = await readSettings();
+        gh = createGhClient(initial.ghPath);
+        ghLogin = await waitForWork(() => gh.authenticatedLogin());
+        if (ghLogin === null) {
+          bb.status.needsConfiguration(
+            "`gh` is not authenticated on this machine. Run `gh auth login`, then reload the plugin.",
           );
+          return;
         }
-        await new Promise((resolve) => {
-          const timer = setTimeout(resolve, values.pollSeconds * 1_000);
-          signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve(undefined);
-            },
-            { once: true },
-          );
-        });
+        bb.log.info(`gh authenticated as ${ghLogin}`);
+        await reconcileUnfinishedRuns();
+
+        while (!signal.aborted) {
+          const values = await readSettings();
+          try {
+            await poll(values.maxConcurrent);
+          } catch (error) {
+            signal.throwIfAborted();
+            bb.log.error(
+              `poll pass failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          await sleep(values.pollSeconds * 1_000, signal);
+        }
+      } catch (error) {
+        if (!signal.aborted) throw error;
       }
     },
   });

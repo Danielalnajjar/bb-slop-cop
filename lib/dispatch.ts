@@ -192,7 +192,11 @@ SlopCop posts that body to the PR.`
 }
 
 /** A concise title for the spawned thread, shown in the BB sidebar. */
-export function buildThreadTitle(context: DispatchContext): string {
+export function buildThreadTitle(context: {
+  runId: string;
+  rule: Pick<DispatchContext["rule"], "mode" | "name">;
+  pullRequest: Pick<DispatchContext["pullRequest"], "number">;
+}): string {
   const prefix = context.rule.mode === "shadow" ? "SlopCop (shadow)" : "SlopCop";
-  return `${prefix}: ${context.rule.name} — PR #${context.pullRequest.number}`;
+  return `${prefix}: ${context.rule.name} — PR #${context.pullRequest.number} [${context.runId}]`;
 }

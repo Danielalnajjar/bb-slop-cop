@@ -301,15 +301,14 @@ export function createStore(db: Database) {
     },
 
     /**
-     * Runs whose review thread was spawned but never reached a terminal
-     * status. Thread lifecycle events are process-local, so these are what a
-     * restart has to reconcile against BB.
+     * Runs still reviewing or awaiting terminal check/thread cleanup.
+     * A selected verdict stays unfinished until its finalization completes.
      */
     listUnfinishedRuns(): Run[] {
       const rows = db
         .prepare(
           `SELECT * FROM runs
-           WHERE finished_at IS NULL AND thread_id IS NOT NULL
+           WHERE finished_at IS NULL
            ORDER BY started_at`,
         )
         .all();
