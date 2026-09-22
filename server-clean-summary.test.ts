@@ -18,11 +18,11 @@ vi.mock("node:child_process", () => ({ execFile: vi.fn(), spawn: vi.fn() }));
 const THREAD_ID = "thr_review";
 const RUN_ID = "run_1";
 
-const summaryBody = (run = RUN_ID) =>
+const summaryBody = (run = RUN_ID, sha = "abc123") =>
   decorateBody("Nothing survives the review.", "summary", {
     rule: "restraint-review",
     run,
-    sha: "abc123",
+    sha,
     kind: "summary",
   });
 
@@ -180,6 +180,74 @@ it("posts no summary when the agent posted findings as line comments", async () 
     expect(run?.commentCount).toBe(1);
   } finally {
     await harness.lifecycle.dispose();
+  }
+});
+
+it("stamps the canonical marker over a run id the agent mistyped", async () => {
+  // The observed failure: one character dropped from the run id.
+  const { store, harness } = await finishThreadWith(
+    summaryBody(RUN_ID.slice(0, -1)),
+  );
+  try {
+    expect(
+      writes.filter((write) => write.endpoint.includes("/issues/42/comments")),
+    ).toEqual([
+      {
+        endpoint: "repos/acme/widgets/issues/42/comments",
+        body: { body: summaryBody() },
+      },
+    ]);
+    expect(store.findRunByThread(THREAD_ID)?.status).toBe("commented");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("stamps the canonical marker over a sha the agent mistyped", async () => {
+  const { store, harness } = await finishThreadWith(
+    summaryBody(RUN_ID, "abc12"),
+  );
+  try {
+    expect(
+      writes.filter((write) => write.endpoint.includes("/issues/42/comments")),
+    ).toEqual([
+      {
+        endpoint: "repos/acme/widgets/issues/42/comments",
+        body: { body: summaryBody() },
+      },
+    ]);
+    expect(store.findRunByThread(THREAD_ID)?.status).toBe("commented");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("posts nothing for a marker of another kind or another rule", async () => {
+  for (const finalMessage of [
+    decorateBody("Speculative retry layer.", "inline", {
+      rule: "restraint-review",
+      run: RUN_ID,
+      sha: "abc123",
+      kind: "inline",
+    }),
+    decorateBody("Nothing survives the review.", "summary", {
+      rule: "some-other-rule",
+      run: RUN_ID,
+      sha: "abc123",
+      kind: "summary",
+    }),
+  ]) {
+    const { store, harness } = await finishThreadWith(finalMessage);
+    try {
+      expect(
+        writes.filter((write) =>
+          write.endpoint.includes("/issues/42/comments"),
+        ),
+      ).toEqual([]);
+      expect(store.findRunByThread(THREAD_ID)?.status).toBe("no_comment");
+    } finally {
+      await harness.lifecycle.dispose();
+    }
   }
 });
 

@@ -694,33 +694,54 @@ describe("shadow verification", () => {
 });
 
 describe("the summary SlopCop posts", () => {
-  it("takes the final message when it carries this run's summary marker", () => {
+  const post = (finalMessage: string | null) =>
+    summaryToPost({
+      rule: "security-sweep",
+      runId: "run_1",
+      sha: "a1b2c3d",
+      finalMessage,
+    });
+
+  it("takes the final message when it carries this rule's summary marker", () => {
+    expect(post(marked("summary"))).toBe(marked("summary"));
+  });
+
+  it("stamps the canonical marker over a mistyped run id or sha", () => {
+    // The agent transcribes both by hand; the server knows them exactly.
+    expect(post(marked("summary", "run_"))).toBe(marked("summary"));
     expect(
-      summaryToPost({ runId: "run_1", finalMessage: marked("summary") }),
+      post(
+        decorateBody("a finding", "summary", {
+          rule: "security-sweep",
+          run: "run_1",
+          sha: "a1b2c3",
+          kind: "summary",
+        }),
+      ),
     ).toBe(marked("summary"));
   });
 
-  it("refuses a body without this run's summary marker", () => {
+  it("refuses a marker for another rule or another kind", () => {
     expect(
-      summaryToPost({
-        runId: "run_1",
-        finalMessage: "🚨 **SLOP COP** 🚨 · `r`\n\nclean, but no marker",
-      }),
+      post(
+        decorateBody("a finding", "summary", {
+          rule: "other-rule",
+          run: "run_1",
+          sha: "a1b2c3d",
+          kind: "summary",
+        }),
+      ),
     ).toBeNull();
-    expect(
-      summaryToPost({
-        runId: "run_1",
-        finalMessage: marked("summary", "run_OTHER"),
-      }),
-    ).toBeNull();
-    expect(
-      summaryToPost({ runId: "run_1", finalMessage: marked("inline") }),
-    ).toBeNull();
+    expect(post(marked("inline"))).toBeNull();
+  });
+
+  it("refuses a body with no marker at all", () => {
+    expect(post("🚨 **SLOP COP** 🚨 · `r`\n\nclean, but no marker")).toBeNull();
   });
 
   it("refuses an empty turn", () => {
-    expect(summaryToPost({ runId: "run_1", finalMessage: null })).toBeNull();
-    expect(summaryToPost({ runId: "run_1", finalMessage: "  " })).toBeNull();
+    expect(post(null)).toBeNull();
+    expect(post("  ")).toBeNull();
   });
 });
 
