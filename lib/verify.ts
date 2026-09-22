@@ -4,7 +4,13 @@
 // GitHub's three comment surfaces and matches on the marker; in shadow mode
 // there is nothing to poll, so it asserts the agent produced a well-formed body
 // instead. Both paths converge on the same status vocabulary.
-import { attributeBody, hasVisibleHeader, parseMarker } from "./marker";
+import {
+  attributeBody,
+  hasVisibleHeader,
+  markerBelongsToRule,
+  parseMarker,
+  restampMarker,
+} from "./marker";
 import type { GhClient, GhComment } from "./gh";
 import type { CommentKind, RunComment, RunStatus } from "./types";
 
@@ -168,18 +174,27 @@ export async function verifyLive(options: {
  *
  * The agent owns findings — they are line comments needing a path and a line
  * only it knows — and ends a clean review with the summary as its final
- * message. The marker is the whole test: it carries this run's id and
- * `kind=summary`, and without it a posted body could not be attributed.
+ * message. What the agent has to get right is the rule and the kind; the run
+ * id and head SHA are the server's own facts, so the returned body carries the
+ * canonical marker rather than whatever the agent transcribed.
  */
 export function summaryToPost(options: {
+  rule: string;
   runId: string;
+  sha: string;
   finalMessage: string | null;
 }): string | null {
   const body = (options.finalMessage ?? "").trim();
   const marker = parseMarker(body);
   if (marker === null) return null;
-  if (marker.run !== options.runId || marker.kind !== "summary") return null;
-  return body;
+  if (!markerBelongsToRule(marker, options.rule)) return null;
+  if (marker.kind !== "summary") return null;
+  return restampMarker(body, {
+    rule: options.rule,
+    run: options.runId,
+    sha: options.sha,
+    kind: "summary",
+  });
 }
 
 /**

@@ -802,10 +802,16 @@ export default async function plugin(bb: BbPluginApi) {
               // SlopCop owns the no-findings summary: the agent posts findings
               // as line comments and ends a clean review with the summary as
               // its final message. Nothing on the PR plus that body means the
-              // review is clean, so post it and re-verify — GitHub stays the
-              // source of truth for what landed.
+              // review is clean, so post it — carrying this run's canonical
+              // marker, not the agent's transcription of it — and re-verify,
+              // because GitHub stays the source of truth for what landed.
               if (second.comments.length > 0) return second;
-              const body = summaryToPost({ runId: run.id, finalMessage });
+              const body = summaryToPost({
+                rule: run.ruleName,
+                runId: run.id,
+                sha: run.headSha,
+                finalMessage,
+              });
               if (body === null) return second;
               await gh.request(
                 "POST",

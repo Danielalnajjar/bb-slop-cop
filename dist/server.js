@@ -19444,6 +19444,9 @@ function parseMarker(body) {
   }
   return { rule, run: run2, sha: fields.get("sha") ?? "", kind };
 }
+function restampMarker(body, marker) {
+  return body.replace(MARKER_PATTERN, buildMarker(marker));
+}
 function markerBelongsToRule(marker, ruleName) {
   return marker.rule === sanitize(ruleName);
 }
@@ -20035,8 +20038,14 @@ function summaryToPost(options) {
   const body = (options.finalMessage ?? "").trim();
   const marker = parseMarker(body);
   if (marker === null) return null;
-  if (marker.run !== options.runId || marker.kind !== "summary") return null;
-  return body;
+  if (!markerBelongsToRule(marker, options.rule)) return null;
+  if (marker.kind !== "summary") return null;
+  return restampMarker(body, {
+    rule: options.rule,
+    run: options.runId,
+    sha: options.sha,
+    kind: "summary"
+  });
 }
 function verifyShadow(options) {
   const body = options.finalMessage ?? "";
@@ -20791,7 +20800,12 @@ async function plugin(bb) {
         await new Promise((resolve) => setTimeout(resolve, 4e3));
         const second = await runVerify();
         if (second.comments.length > 0) return second;
-        const body = summaryToPost({ runId: run2.id, finalMessage });
+        const body = summaryToPost({
+          rule: run2.ruleName,
+          runId: run2.id,
+          sha: run2.headSha,
+          finalMessage
+        });
         if (body === null) return second;
         await gh.request(
           "POST",

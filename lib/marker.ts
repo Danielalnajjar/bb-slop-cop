@@ -57,6 +57,18 @@ export function parseMarker(body: string): Marker | null {
   return { rule, run, sha: fields.get("sha") ?? "", kind };
 }
 
+/**
+ * Replaces the body's marker with `marker`.
+ *
+ * The run id and head SHA are the server's facts, and an agent transcribing
+ * them by hand gets them wrong — a dropped character in the run id is enough
+ * to make a correct review unattributable. Stamp the canonical marker instead
+ * of asking the transcription to be perfect.
+ */
+export function restampMarker(body: string, marker: Marker): string {
+  return body.replace(MARKER_PATTERN, buildMarker(marker));
+}
+
 /** True when this marker belongs to `ruleName` (after the same sanitizing). */
 export function markerBelongsToRule(marker: Marker, ruleName: string): boolean {
   return marker.rule === sanitize(ruleName);
