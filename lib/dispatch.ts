@@ -42,7 +42,13 @@ try to read, print, or pass a token yourself.`;
   const sha = context.pullRequest.headRefOid;
   // `gh pr review --comment` submits a Conversation-root review body. It cannot
   // attach to a file, which is how findings ended up only in the top card.
-  return `## POSTING
+  return `## LIVE MODE — YOU MUST POST
+
+This rule is live. The review exists only once it is on the PR. Post with
+\`${ghCommand}\` before you end your turn, including when you have no findings —
+your final message in this thread does not count as posting.
+
+## POSTING
 
 Post with \`${ghCommand}\`.
 
@@ -178,8 +184,9 @@ ${
   shadow
     ? `End your turn with the full review text you would have posted, formatted
 exactly as specified above (header + body + marker). Nothing is posted.`
-    : `After posting, end your turn with a one-line summary and the URL of each
-comment you created.`
+    : `Post first. Ending the turn without having posted is a failed run, even
+when the review is clean. After posting, end your turn with a one-line summary
+and the URL of each comment you created.`
 }`;
 }
 

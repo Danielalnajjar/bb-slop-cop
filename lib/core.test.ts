@@ -16,7 +16,12 @@ import {
 } from "./matcher";
 import { buildPrompt } from "./dispatch";
 import { collectPriorComments, titleFromBody } from "./prior";
-import { liveVerifyBlockReason, verifyLive, verifyShadow } from "./verify";
+import {
+  liveVerifyBlockReason,
+  unpostedSummary,
+  verifyLive,
+  verifyShadow,
+} from "./verify";
 import {
   CHECK_NAME,
   completeCheckRun,
@@ -158,6 +163,15 @@ describe("bot posting command", () => {
     expect(prompt).toContain("only when there are zero findings");
     expect(prompt).toContain("pr review 482 --comment");
     expect(prompt).toContain("Do not also run");
+  });
+
+  it("tells a live agent it is live and must post before ending the turn", () => {
+    const prompt = buildPrompt(context());
+    expect(prompt).toContain("LIVE MODE — YOU MUST POST");
+    expect(prompt).toContain("This rule is live.");
+    expect(prompt).toContain("including when you have no findings");
+    expect(prompt).toContain("does not count as posting");
+    expect(prompt).toContain("Ending the turn without having posted is a failed run");
   });
 
   it("makes live agents post bodies from files, never inline quotes", () => {
@@ -680,6 +694,42 @@ describe("shadow verification", () => {
     expect(verifyShadow({ runId: "run_1", finalMessage: null }).status).toBe(
       "no_comment",
     );
+  });
+});
+
+describe("unposted clean summary", () => {
+  it("recovers a marked summary the agent left as its final message", () => {
+    expect(
+      unpostedSummary({ runId: "run_1", finalMessage: marked("summary") }),
+    ).toBe(marked("summary"));
+  });
+
+  it("refuses a body without this run's marker", () => {
+    expect(
+      unpostedSummary({
+        runId: "run_1",
+        finalMessage: "🚨 **SLOP COP** 🚨 · `r`\n\nclean, but no marker",
+      }),
+    ).toBeNull();
+    expect(
+      unpostedSummary({
+        runId: "run_1",
+        finalMessage: marked("summary", "run_OTHER"),
+      }),
+    ).toBeNull();
+  });
+
+  it("refuses a finding: an inline body has no path or line to post on", () => {
+    expect(
+      unpostedSummary({ runId: "run_1", finalMessage: marked("inline") }),
+    ).toBeNull();
+  });
+
+  it("refuses an empty turn", () => {
+    expect(
+      unpostedSummary({ runId: "run_1", finalMessage: null }),
+    ).toBeNull();
+    expect(unpostedSummary({ runId: "run_1", finalMessage: "  " })).toBeNull();
   });
 });
 
