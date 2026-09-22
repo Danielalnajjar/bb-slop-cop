@@ -28,7 +28,12 @@ import {
   evaluateRule,
   isDangerousCombination,
 } from "./lib/matcher";
-import { liveVerifyBlockReason, verifyLive, verifyShadow } from "./lib/verify";
+import {
+  liveVerifyBlockReason,
+  summaryToPost,
+  verifyLive,
+  verifyShadow,
+} from "./lib/verify";
 import {
   completeCheckRun,
   startCheckRun,
@@ -793,6 +798,21 @@ export default async function plugin(bb: BbPluginApi) {
               const first = await runVerify();
               if (first.status !== "no_comment") return first;
               await new Promise((resolve) => setTimeout(resolve, 4_000));
+              const second = await runVerify();
+              // SlopCop owns the no-findings summary: the agent posts findings
+              // as line comments and ends a clean review with the summary as
+              // its final message. Nothing on the PR plus that body means the
+              // review is clean, so post it and re-verify — GitHub stays the
+              // source of truth for what landed.
+              if (second.comments.length > 0) return second;
+              const body = summaryToPost({ runId: run.id, finalMessage });
+              if (body === null) return second;
+              await gh.request(
+                "POST",
+                `repos/${run.repo}/issues/${run.prNumber}/comments`,
+                { body },
+              );
+              bb.log.info(`run ${run.id}: posted the no-findings summary`);
               return runVerify();
             })();
 

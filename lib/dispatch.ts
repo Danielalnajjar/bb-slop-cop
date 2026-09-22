@@ -40,14 +40,23 @@ try to read, print, or pass a token yourself.`;
   const repo = context.rule.repo;
   const pr = context.pullRequest.number;
   const sha = context.pullRequest.headRefOid;
-  // `gh pr review --comment` submits a Conversation-root review body. It cannot
-  // attach to a file, which is how findings ended up only in the top card.
-  return `## POSTING
+  // One owner per body. The agent posts findings, which need a path and a line
+  // only it knows; SlopCop posts the no-findings summary from the final
+  // message, so the agent's no-findings behavior is the same live and shadow.
+  return `## LIVE MODE — POST EVERY FINDING
+
+This rule is live. A finding exists only once it is a line comment on the PR,
+so post each one with \`${ghCommand}\` before you end your turn.
+
+You do not post the no-findings summary and you never run \`gh pr review\`:
+SlopCop posts that body itself, from your final message.
+
+## POSTING
 
 Post with \`${ghCommand}\`.
 
-Findings are line comments on the diff. Do not put finding text in the
-Conversation review body — \`gh pr review --comment\` cannot attach to a file.
+Findings are line comments on the diff. Do not put finding text in a
+Conversation review body — it cannot attach to a file, and it is not yours.
 
 Write every body to its own file first, with a quoted heredoc delimiter so
 the text lands exactly as written, and pass the file to \`gh\`. Never pass a
@@ -70,16 +79,9 @@ For each finding, post one review comment on the line (commit is the head SHA):
 \`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
 and pass \`-f subject_type=file\`.
 
-If there are no findings, post one review summary:
+Line comments publish immediately; that is the finding.
 
-    cat >/tmp/slopcop-summary.md <<'BODY'
-    …header, one sentence, marker…
-    BODY
-    ${ghCommand} pr review ${pr} --comment --body-file /tmp/slopcop-summary.md
-
-Do not post a summary that contains findings. Do not also run
-\`gh pr review\` after line comments — that opens a second Conversation card.
-Line comments publish immediately; that is the finding.${note}`;
+If you have no findings at all, post nothing.${note}`;
 }
 
 function formatBodyContract(context: DispatchContext): string {
@@ -178,8 +180,13 @@ ${
   shadow
     ? `End your turn with the full review text you would have posted, formatted
 exactly as specified above (header + body + marker). Nothing is posted.`
-    : `After posting, end your turn with a one-line summary and the URL of each
-comment you created.`
+    : `With findings, post every line comment first — ending the turn with an
+unposted finding is a failed run — then end your turn with a one-line summary
+and the URL of each comment you created.
+
+With no findings, post nothing and end your turn with the no-findings review
+body, formatted exactly as specified above (header + one sentence + marker).
+SlopCop posts that body to the PR.`
 }`;
 }
 

@@ -164,6 +164,25 @@ export async function verifyLive(options: {
 }
 
 /**
+ * The no-findings summary, which SlopCop posts rather than the agent.
+ *
+ * The agent owns findings — they are line comments needing a path and a line
+ * only it knows — and ends a clean review with the summary as its final
+ * message. The marker is the whole test: it carries this run's id and
+ * `kind=summary`, and without it a posted body could not be attributed.
+ */
+export function summaryToPost(options: {
+  runId: string;
+  finalMessage: string | null;
+}): string | null {
+  const body = (options.finalMessage ?? "").trim();
+  const marker = parseMarker(body);
+  if (marker === null) return null;
+  if (marker.run !== options.runId || marker.kind !== "summary") return null;
+  return body;
+}
+
+/**
  * Shadow verification. Nothing was posted, so correctness means "the agent
  * produced a body we could have posted" — which is exactly what we want to
  * confirm before promoting a rule to live.
