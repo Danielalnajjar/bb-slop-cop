@@ -376,6 +376,20 @@ export default async function plugin(bb: BbPluginApi) {
     });
     announce();
 
+    const throwIfDispatchAborted = () => {
+      if (!watcherSignal?.aborted) return;
+      const reserved = store.getRun(runId);
+      if (reserved?.status === "dispatched" && reserved.threadId === null) {
+        store.updateRun(runId, {
+          status: "cancelled",
+          detail: "plugin stopped before dispatch completed",
+          finishedAt: Date.now(),
+        });
+        announce();
+      }
+      watcherSignal.throwIfAborted();
+    };
+
     if (rule.request === null) {
       store.updateRun(runId, {
         status: "failed",
@@ -407,7 +421,7 @@ export default async function plugin(bb: BbPluginApi) {
         rule.name,
       );
     } catch (error) {
-      watcherSignal?.throwIfAborted();
+      throwIfDispatchAborted();
       bb.log.warn(
         `could not list prior comments for ${rule.repo}#${pullRequest.number}: ${
           error instanceof Error ? error.message : String(error)
@@ -489,7 +503,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return { runId, threadId };
     } catch (error) {
-      watcherSignal?.throwIfAborted();
+      throwIfDispatchAborted();
       store.updateRun(runId, {
         status: "failed",
         detail: error instanceof Error ? error.message : String(error),

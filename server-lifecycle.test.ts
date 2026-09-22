@@ -475,7 +475,7 @@ describe("bb slopcop runs cancel", () => {
 });
 
 describe("watcher shutdown", () => {
-  it.each(["login", "poll", "spawn", "reconcile", "verify-retry", "poll-sleep"] as const)(
+  it.each(["login", "poll", "prior-comments", "spawn", "reconcile", "verify-retry", "poll-sleep"] as const)(
     "stops before the host deadline during %s and ignores late results",
     async (phase) => {
       vi.useFakeTimers();
@@ -496,7 +496,8 @@ describe("watcher shutdown", () => {
         const poll = args.some((arg) => arg.includes("pulls?"));
         const response = login ? "test-user" : poll
           ? JSON.stringify([{ ...pr, draft: ++polls === 1 }]) : "[]";
-        if ((phase === "login" && login) || (phase === "poll" && poll)) {
+        if ((phase === "login" && login) || (phase === "poll" && poll) ||
+          (phase === "prior-comments" && args.some((arg) => arg.includes("issues/7/comments")))) {
           reached = true;
           release = () => callback(null, response, "");
         } else {
@@ -535,7 +536,7 @@ describe("watcher shutdown", () => {
       let stopped = false;
       void service.done.then(() => { stopped = true; });
       try {
-        await vi.advanceTimersByTimeAsync(phase === "spawn" ? 15_000 : 0);
+        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" ? 15_000 : 0);
         expect(reached).toBe(true);
         service.controller.abort();
         // BB's service stop deadline is 5,000 ms. No I/O is released here.
@@ -543,6 +544,14 @@ describe("watcher shutdown", () => {
         expect(stopped).toBe(true);
         await service.done;
         const runsAtStop = store.listRuns({});
+        if (phase === "spawn" || phase === "prior-comments") {
+          expect(runsAtStop).toHaveLength(1);
+          expect(runsAtStop[0]).toMatchObject({
+            status: "cancelled", threadId: null, finishedAt: expect.any(Number),
+            detail: "plugin stopped before dispatch completed",
+          });
+          expect(store.hasRunFor(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7")).toBe(false);
+        }
         const callsAtStop = vi.mocked(execFile).mock.calls.length;
         release?.();
         await vi.advanceTimersByTimeAsync(60_000);

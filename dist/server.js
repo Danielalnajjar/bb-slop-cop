@@ -20515,6 +20515,19 @@ async function plugin(bb) {
       finishedAt: null
     });
     announce();
+    const throwIfDispatchAborted = () => {
+      if (!watcherSignal?.aborted) return;
+      const reserved = store.getRun(runId);
+      if (reserved?.status === "dispatched" && reserved.threadId === null) {
+        store.updateRun(runId, {
+          status: "cancelled",
+          detail: "plugin stopped before dispatch completed",
+          finishedAt: Date.now()
+        });
+        announce();
+      }
+      watcherSignal.throwIfAborted();
+    };
     if (rule.request === null) {
       store.updateRun(runId, {
         status: "failed",
@@ -20544,7 +20557,7 @@ async function plugin(bb) {
         rule.name
       );
     } catch (error61) {
-      watcherSignal?.throwIfAborted();
+      throwIfDispatchAborted();
       bb.log.warn(
         `could not list prior comments for ${rule.repo}#${pullRequest.number}: ${error61 instanceof Error ? error61.message : String(error61)}`
       );
@@ -20606,7 +20619,7 @@ async function plugin(bb) {
       }
       return { runId, threadId };
     } catch (error61) {
-      watcherSignal?.throwIfAborted();
+      throwIfDispatchAborted();
       store.updateRun(runId, {
         status: "failed",
         detail: error61 instanceof Error ? error61.message : String(error61),
