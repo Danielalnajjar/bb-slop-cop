@@ -85,11 +85,12 @@ GitHub by marker) · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted but attribution degraded — the prompt contract
 slipped) · `no_comment` (thread finished without posting) · `skipped` (a rule
 matched nothing, e.g. blocked by the trust gate) · `cancelled` (the thread
-ended, was retired, or was cancelled before the review reached a verdict) ·
-`failed` (a review that ran and failed).
+ended, errored, was retired, or was cancelled before the review reached a
+verdict) · `failed` (the review ran and its own result or posting failed).
 
 `failed` is the only one that puts a red `failure` on the head SHA, so a run
-with no verdict is `cancelled` instead — and a cancelled run never dedupes away
+with no verdict is `cancelled` instead — including a thread that errors, live
+or reconciled — and a cancelled run never dedupes away
 a later re-review of the same PR.
 
 A run stays at `reviewing` only while BB still says its thread is working. The

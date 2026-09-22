@@ -44,8 +44,9 @@ function prUrl(repo: string, prNumber: number): string {
 /**
  * Posted reviews are `success` even with findings: the comments are the
  * findings. A red X would block merges the way required CI does, and it is
- * reserved for a review that ran and failed — a run that never reached a
- * verdict is `cancelled`, which is what GitHub shows for work that stopped.
+ * reserved for a review that produced a result and then failed on it — a run
+ * that never reached a verdict is `cancelled`, which is what GitHub shows for
+ * work that stopped.
  */
 export function conclusionFor(status: RunStatus): CheckConclusion | null {
   switch (status) {

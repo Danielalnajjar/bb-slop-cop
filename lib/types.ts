@@ -138,8 +138,9 @@ export const runStatusSchema = z.enum([
   "shadowed",
   "no_comment",
   "skipped",
-  // A review that never reached a verdict: its thread ended, was retired, or
-  // was cancelled first. `failed` is reserved for a review that actually ran.
+  // A review that never reached a verdict: its thread ended, errored, was
+  // retired, or was cancelled first. `failed` is reserved for a review that
+  // produced a result and then failed on it.
   "cancelled",
   "failed",
 ]);

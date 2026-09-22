@@ -220,13 +220,16 @@ Rule flags: `--name --repo --project --provider --model --reasoning --permission
 `shadowed` · `commented` · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
 without posting) · `skipped` (matched nothing, e.g. blocked by the trust gate) ·
-`cancelled` (the thread ended, was retired, or was cancelled before the review
-reached a verdict) · `failed` (a review that ran and failed).
+`cancelled` (the thread ended, errored, was retired, or was cancelled before
+the review reached a verdict) · `failed` (the review ran and its own result or
+posting failed).
 
 `cancelled` and `failed` are kept apart because the merge box reads them
 differently: `failed` puts a red `failure` on the head SHA, so it is reserved
-for a review that actually ran. A run with no verdict completes its check as
-`cancelled` and never dedupes away a later re-review of the same PR.
+for a review that produced something and then failed. A thread that errors
+reached no verdict, whether SlopCop saw the event live or reconciled it on
+start, so it completes its check as `cancelled` — and a cancelled run never
+dedupes away a later re-review of the same PR.
 
 Thread lifecycle events are process-local, so a review thread that ended while
 the plugin was not loaded has no event left to fire. The watcher reconciles
