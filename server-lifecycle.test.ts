@@ -8,6 +8,7 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
 import { createStore } from "./lib/db";
+import { buildThreadTitle } from "./lib/dispatch";
 import type { Run } from "./lib/types";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn(), spawn: vi.fn() }));
@@ -561,6 +562,79 @@ describe("watcher shutdown", () => {
     }
   });
 
+  it.each(["before", "after", "after-dispose"] as const)("ignores a spawn result delivered %s abort without stale storage access", async (timing) => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true });
+    const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "restraint-review", repo: "acme/widgets", mode: "shadow",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } });
+    let release!: () => void;
+    harness.inspection.sdk.stub("threads.spawn", () => new Promise((resolve) => {
+      release = () => resolve(makeThreadResponse({ id: THREAD_ID }));
+    }));
+    const service = harness.behavior.runService("watcher");
+    let replacement: ReturnType<typeof createFakePluginHost> | undefined;
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(release).toBeTypeOf("function");
+      if (timing === "before") release();
+      service.controller.abort();
+      await service.done;
+      const reserved = store.listRuns({})[0]!;
+      if (timing === "after") release();
+      if (timing === "after-dispose") replacement = await harness.lifecycle.reload(plugin);
+      if (timing === "after-dispose") release();
+      await vi.advanceTimersByTimeAsync(0);
+      const currentStore = replacement === undefined ? store : createStore(replacement.bb.storage.database() as never);
+      expect(currentStore.getRun(reserved.id)).toEqual(reserved);
+      expect(reserved.threadId).toBeNull();
+      expect(harness.inspection.logEntries.filter((entry) => entry.message.includes("ignored spawn result"))).toEqual([
+        { level: "info", message: `run ${reserved.id}: ignored spawn result after shutdown (thread ${THREAD_ID})` },
+      ]);
+    } finally {
+      service.controller.abort();
+      await (replacement?.harness ?? harness).lifecycle.dispose();
+    }
+  });
+
+  it.each([0, 1, 2])("recovers a threadless dispatch with %i matching plugin threads", async (count) => {
+    vi.useFakeTimers();
+    stubGhLogin();
+    const { bb, harness, store } = await setup({
+      status: "cancelled", threadId: null, detail: "plugin stopped before dispatch completed",
+    });
+    const title = buildThreadTitle({ runId: "run_1", rule: { name: "restraint-review", mode: "shadow" }, pullRequest: { number: 42 } });
+    harness.inspection.sdk.stub("threads.list", (args) => args.archived ? [] : count === 1 && args.offset === 0
+      ? Array.from({ length: 100 }, (_, i) => makeThreadResponse({ id: `unrelated_${i}`, title: "another review", originPluginId: bb.pluginId })) : [
+      // A same-title thread from another plugin must never be adopted.
+      makeThreadResponse({ id: "foreign", title, originPluginId: "another-plugin" }),
+      ...Array.from({ length: count }, (_, i) => makeThreadResponse({ id: `thr_match_${i}`, title, originPluginId: bb.pluginId })),
+    ]);
+    harness.inspection.sdk.stub("threads.get", ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    harness.inspection.sdk.stub("threads.output", () => ({ output: "No findings.\n<!-- slopcop:rule=restraint-review run=run_1 sha=abc123 kind=summary -->" }));
+    try {
+      await startWatcher(harness);
+      const run = store.getRun("run_1")!;
+      if (count === 1) {
+        expect(run).toMatchObject({ threadId: "thr_match_0", status: "shadowed", finishedAt: expect.any(Number) });
+        expect(harness.inspection.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "thr_match_0" }]]);
+      } else {
+        expect(run).toMatchObject({ threadId: null, status: "cancelled", finishedAt: expect.any(Number),
+          detail: count === 0 ? "dispatch recovery found no matching thread" : "dispatch recovery found multiple matching threads" });
+        expect(store.hasRunFor("rule_1", "acme/widgets", 42, "abc123")).toBe(false);
+      }
+      expect(harness.inspection.sdk.callsTo("threads.list")[0]).toEqual([
+        { originPluginId: bb.pluginId, includeHidden: true, archived: false, limit: 100, offset: 0 },
+      ]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("completes an aborted dispatch check after reloading its threadless reservation", async () => {
     vi.useFakeTimers();
     const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
@@ -585,6 +659,7 @@ describe("watcher shutdown", () => {
       const reserved = store.listRuns({})[0]!;
       expect(reserved).toMatchObject({ status: "cancelled", threadId: null });
       replacement = await harness.lifecycle.reload(plugin);
+      replacement.harness.inspection.sdk.stub("threads.list", () => []);
       vi.mocked(execFile).mockImplementation(((
         _file: string, args: string[], _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,

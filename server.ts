@@ -379,7 +379,7 @@ export default async function plugin(bb: BbPluginApi) {
     const throwIfDispatchAborted = () => {
       if (!watcherSignal?.aborted) return;
       const reserved = store.getRun(runId);
-      if (reserved?.status === "dispatched" && reserved.threadId === null) {
+      if (reserved?.status === "dispatched") {
         store.updateRun(runId, {
           status: "cancelled",
           detail: "plugin stopped before dispatch completed",
@@ -470,13 +470,23 @@ export default async function plugin(bb: BbPluginApi) {
       );
       // thread.idle / thread.failed already run finishRun concurrently.
       await reportCheck("start", checkRun);
-      const thread = await waitForWork(() => bb.sdk.threads.spawn({
-        ...execution,
-        prompt: buildPrompt(context),
-        title: buildThreadTitle(context),
-        visibility: rule.visibility,
-        ...(sectionId === undefined ? {} : { sectionId }),
-      } as never));
+      const dispatchSignal = watcherSignal;
+      const logInfo = bb.log.info;
+      const thread = await waitForWork(async () => {
+        const thread = await bb.sdk.threads.spawn({
+          ...execution,
+          prompt: buildPrompt(context),
+          title: buildThreadTitle(context),
+          visibility: rule.visibility,
+          ...(sectionId === undefined ? {} : { sectionId }),
+        } as never);
+        if (dispatchSignal?.aborted) {
+          logInfo(`run ${runId}: ignored spawn result after shutdown (thread ${(thread as { id?: string }).id ?? "unknown"})`);
+          return thread;
+        }
+        store.updateRun(runId, { threadId: (thread as { id: string }).id });
+        return thread;
+      });
       const threadId = (thread as { id: string }).id;
       // `runs cancel` can finalize this run while it still has no thread. The
       // cancellation stays; writing `reviewing` over it here would leave the
@@ -999,6 +1009,28 @@ export default async function plugin(bb: BbPluginApi) {
     await finishRun(thread.id, null, THREAD_DELETED_REASON);
   });
 
+  async function findDispatchedThreads(run: Run): Promise<string[]> {
+    const title = buildThreadTitle({
+      runId: run.id,
+      rule: { name: run.ruleName, mode: run.mode },
+      pullRequest: { number: run.prNumber },
+    });
+    const matches = new Set<string>();
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += 100) {
+        const threads = await waitForWork(() => bb.sdk.threads.list({
+          originPluginId: bb.pluginId, includeHidden: true, archived, limit: 100, offset,
+        }));
+        for (const thread of threads) {
+          if (thread.originPluginId === bb.pluginId && thread.title === title) matches.add(thread.id);
+        }
+        if (matches.size > 1 || threads.length < 100) break;
+      }
+      if (matches.size > 1) break;
+    }
+    return [...matches];
+  }
+
   /**
    * Those announcements are process-local. A review thread that reached its
    * terminal state while this plugin was not loaded — a BB restart, a plugin
@@ -1009,22 +1041,33 @@ export default async function plugin(bb: BbPluginApi) {
    * exactly the code an announced one is.
    */
   async function reconcileUnfinishedRuns(): Promise<void> {
-    for (const run of store.listUnfinishedRuns()) {
-      const threadId = run.threadId;
+    for (let run of store.listUnfinishedRuns()) {
+      let threadId = run.threadId;
       try {
+        if (threadId === null && (isReviewInProgress(run) ||
+            run.detail === "plugin stopped before dispatch completed")) {
+          const matches = await findDispatchedThreads(run);
+          if (matches.length !== 1) {
+            run = { ...run, status: "cancelled", detail: matches.length === 0
+              ? "dispatch recovery found no matching thread"
+              : "dispatch recovery found multiple matching threads" };
+            store.updateRun(run.id, run);
+            await finalizeRun(run);
+            continue;
+          }
+          threadId = matches[0]!;
+          run = { ...run, threadId, status: "reviewing", detail: null };
+          store.updateRun(run.id, run);
+          announce();
+        }
         if (!isReviewInProgress(run)) {
           if (threadId === null) await finalizeRun(run);
           else await finishRun(threadId, null, null);
           continue;
         }
-        if (threadId === null) {
-          const cancelled = { ...run, status: "cancelled" as const,
-            detail: "plugin stopped before dispatch completed" };
-          store.updateRun(run.id, cancelled);
-          await finalizeRun(cancelled);
-          continue;
-        }
-        const thread = (await waitForWork(() => bb.sdk.threads.get({ threadId }))) as {
+        if (threadId === null) continue;
+        const recoveredThreadId = threadId;
+        const thread = (await waitForWork(() => bb.sdk.threads.get({ threadId: recoveredThreadId }))) as {
           status: string;
           archivedAt?: number | null;
           deletedAt?: number | null;
@@ -1045,7 +1088,7 @@ export default async function plugin(bb: BbPluginApi) {
           // strand the run whenever that call fails.
           const finalMessage =
             run.mode === "shadow"
-              ? (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output
+              ? (await waitForWork(() => bb.sdk.threads.output({ threadId: recoveredThreadId }))).output
               : null;
           await finishRun(threadId, finalMessage, null);
           continue;

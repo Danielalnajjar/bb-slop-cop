@@ -19692,7 +19692,7 @@ SlopCop posts that body to the PR.`}`;
 }
 function buildThreadTitle(context) {
   const prefix = context.rule.mode === "shadow" ? "SlopCop (shadow)" : "SlopCop";
-  return `${prefix}: ${context.rule.name} \u2014 PR #${context.pullRequest.number}`;
+  return `${prefix}: ${context.rule.name} \u2014 PR #${context.pullRequest.number} [${context.runId}]`;
 }
 
 // lib/lifecycle.ts
@@ -20517,7 +20517,7 @@ async function plugin(bb) {
     const throwIfDispatchAborted = () => {
       if (!watcherSignal?.aborted) return;
       const reserved = store.getRun(runId);
-      if (reserved?.status === "dispatched" && reserved.threadId === null) {
+      if (reserved?.status === "dispatched") {
         store.updateRun(runId, {
           status: "cancelled",
           detail: "plugin stopped before dispatch completed",
@@ -20588,13 +20588,23 @@ async function plugin(bb) {
         defaultThreadSection.length > 0 ? await waitForWork(() => bb.sdk.threadSections.list()) : []
       );
       await reportCheck("start", checkRun);
-      const thread = await waitForWork(() => bb.sdk.threads.spawn({
-        ...execution,
-        prompt: buildPrompt(context),
-        title: buildThreadTitle(context),
-        visibility: rule.visibility,
-        ...sectionId === void 0 ? {} : { sectionId }
-      }));
+      const dispatchSignal = watcherSignal;
+      const logInfo = bb.log.info;
+      const thread = await waitForWork(async () => {
+        const thread2 = await bb.sdk.threads.spawn({
+          ...execution,
+          prompt: buildPrompt(context),
+          title: buildThreadTitle(context),
+          visibility: rule.visibility,
+          ...sectionId === void 0 ? {} : { sectionId }
+        });
+        if (dispatchSignal?.aborted) {
+          logInfo(`run ${runId}: ignored spawn result after shutdown (thread ${thread2.id ?? "unknown"})`);
+          return thread2;
+        }
+        store.updateRun(runId, { threadId: thread2.id });
+        return thread2;
+      });
       const threadId = thread.id;
       const reserved = store.getRun(runId);
       if (reserved !== null && !isReviewInProgress(reserved)) {
@@ -20972,26 +20982,56 @@ async function plugin(bb) {
     if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_DELETED_REASON);
   });
+  async function findDispatchedThreads(run2) {
+    const title = buildThreadTitle({
+      runId: run2.id,
+      rule: { name: run2.ruleName, mode: run2.mode },
+      pullRequest: { number: run2.prNumber }
+    });
+    const matches = /* @__PURE__ */ new Set();
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += 100) {
+        const threads = await waitForWork(() => bb.sdk.threads.list({
+          originPluginId: bb.pluginId,
+          includeHidden: true,
+          archived,
+          limit: 100,
+          offset
+        }));
+        for (const thread of threads) {
+          if (thread.originPluginId === bb.pluginId && thread.title === title) matches.add(thread.id);
+        }
+        if (matches.size > 1 || threads.length < 100) break;
+      }
+      if (matches.size > 1) break;
+    }
+    return [...matches];
+  }
   async function reconcileUnfinishedRuns() {
-    for (const run2 of store.listUnfinishedRuns()) {
-      const threadId = run2.threadId;
+    for (let run2 of store.listUnfinishedRuns()) {
+      let threadId = run2.threadId;
       try {
+        if (threadId === null && (isReviewInProgress(run2) || run2.detail === "plugin stopped before dispatch completed")) {
+          const matches = await findDispatchedThreads(run2);
+          if (matches.length !== 1) {
+            run2 = { ...run2, status: "cancelled", detail: matches.length === 0 ? "dispatch recovery found no matching thread" : "dispatch recovery found multiple matching threads" };
+            store.updateRun(run2.id, run2);
+            await finalizeRun(run2);
+            continue;
+          }
+          threadId = matches[0];
+          run2 = { ...run2, threadId, status: "reviewing", detail: null };
+          store.updateRun(run2.id, run2);
+          announce();
+        }
         if (!isReviewInProgress(run2)) {
           if (threadId === null) await finalizeRun(run2);
           else await finishRun(threadId, null, null);
           continue;
         }
-        if (threadId === null) {
-          const cancelled = {
-            ...run2,
-            status: "cancelled",
-            detail: "plugin stopped before dispatch completed"
-          };
-          store.updateRun(run2.id, cancelled);
-          await finalizeRun(cancelled);
-          continue;
-        }
-        const thread = await waitForWork(() => bb.sdk.threads.get({ threadId }));
+        if (threadId === null) continue;
+        const recoveredThreadId = threadId;
+        const thread = await waitForWork(() => bb.sdk.threads.get({ threadId: recoveredThreadId }));
         const outcome = reviewThreadOutcome(thread);
         if (outcome.kind === "running") {
           inFlight += 1;
@@ -21001,7 +21041,7 @@ async function plugin(bb) {
           `reconciling ${run2.id} (${run2.ruleName} #${run2.prNumber}): its thread is ${thread.status}`
         );
         if (outcome.kind === "finished") {
-          const finalMessage = run2.mode === "shadow" ? (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output : null;
+          const finalMessage = run2.mode === "shadow" ? (await waitForWork(() => bb.sdk.threads.output({ threadId: recoveredThreadId }))).output : null;
           await finishRun(threadId, finalMessage, null);
           continue;
         }
