@@ -69,6 +69,11 @@ export function restampMarker(body: string, marker: Marker): string {
   return body.replace(MARKER_PATTERN, buildMarker(marker));
 }
 
+/** The rule name as a marker carries it. */
+export function markerRuleName(ruleName: string): string {
+  return sanitize(ruleName);
+}
+
 /** True when this marker belongs to `ruleName` (after the same sanitizing). */
 export function markerBelongsToRule(marker: Marker, ruleName: string): boolean {
   return marker.rule === sanitize(ruleName);
@@ -93,6 +98,14 @@ export function buildHeader(kind: CommentKind, ruleName: string): string {
  */
 export function hasVisibleHeader(body: string): boolean {
   return /🚨\s*(\*\*)?\s*SLOP\s*COP|🚨\s*`?slopcop\//i.test(body);
+}
+
+/** The rule name a well-formed header shows, or null when there is none. */
+export function headerRuleName(body: string): string | null {
+  const match =
+    /🚨\s*`slopcop\/([^`]+)`/.exec(body) ??
+    /SLOP\s*COP\s*(?:\*\*)?\s*🚨\s*·\s*`([^`]+)`/.exec(body);
+  return match?.[1] ?? null;
 }
 
 /** Wraps an agent-authored body in the header and marker. */

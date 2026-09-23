@@ -588,6 +588,7 @@ describe("live verification", () => {
     repo: "acme/checkout-api",
     prNumber: 482,
     ruleName: "security-sweep",
+    otherRuleNames: ["test-review"],
     runId: "run_1",
     startedAt: 1_000,
     authenticatedLogin: "octocat",
@@ -639,6 +640,18 @@ describe("live verification", () => {
     });
     expect(result.status).toBe("no_comment");
     expect(result.comments).toEqual([]);
+  });
+
+  it("ignores another rule's unmarked comment by the rule its header names", async () => {
+    const result = await verifyLive({
+      ...base,
+      gh: fakeGh({
+        review: [
+          ghComment({ id: "other", body: "🚨 `slopcop/test-review` — no marker" }),
+        ],
+      }),
+    });
+    expect(result.status).toBe("no_comment");
   });
 
   it("ignores comments predating the run and comments by other people", async () => {

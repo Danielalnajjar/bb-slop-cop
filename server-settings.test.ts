@@ -162,3 +162,22 @@ it.each([
     await harness.lifecycle.dispose();
   }
 });
+
+it("refuses a second rule whose comments would carry the same rule name", async () => {
+  const { bb, harness } = createFakePluginHost();
+  try {
+    await plugin(bb);
+    const request = { projectId: "project", providerId: "codex", model: "test" };
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "pr review", repo: "acme/widgets", request,
+    } }) as { rule: { id: string } };
+    await expect(harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "pr_review", repo: "acme/other", request,
+    } })).rejects.toThrow("already uses the name");
+    await harness.behavior.callRpc("saveRule", { id: rule.id, rule: {
+      name: "pr review", repo: "acme/widgets", request,
+    } });
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});

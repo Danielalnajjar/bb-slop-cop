@@ -20,6 +20,7 @@ import {
   THREAD_ARCHIVED_REASON,
   THREAD_DELETED_REASON,
 } from "./lib/lifecycle";
+import { markerRuleName } from "./lib/marker";
 import { collectPriorComments } from "./lib/prior";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
@@ -831,6 +832,7 @@ export default async function plugin(bb: BbPluginApi) {
           repo: run.repo,
           prNumber: run.prNumber,
           ruleName: run.ruleName,
+          otherRuleNames: otherRuleNames(run),
           runId: run.id,
           startedAt: run.startedAt,
           authenticatedLogin: ghLogin,
@@ -1171,12 +1173,31 @@ export default async function plugin(bb: BbPluginApi) {
     return { pullRequest, result };
   }
 
+  function otherRuleNames(run: Run): string[] {
+    return store
+      .listRules()
+      .filter((rule) => rule.repo === run.repo && rule.name !== run.ruleName)
+      .map((rule) => rule.name);
+  }
+
   function saveRule(
     id: string | null,
     input: z.infer<typeof ruleInputSchema>,
   ): Rule {
     const now = Date.now();
     const existing = id === null ? null : store.getRule(id);
+    // Comments name their rule, so two rules sharing a name could claim each
+    // other's reviews.
+    const clash = store
+      .listRules()
+      .find(
+        (rule) =>
+          rule.id !== existing?.id &&
+          markerRuleName(rule.name) === markerRuleName(input.name),
+      );
+    if (clash !== undefined) {
+      throw new Error(`rule '${clash.name}' already uses the name '${input.name}'`);
+    }
     const rule: Rule = {
       id: existing?.id ?? newId("rule"),
       createdAt: existing?.createdAt ?? now,
@@ -1596,6 +1617,7 @@ export default async function plugin(bb: BbPluginApi) {
             repo: run.repo,
             prNumber: run.prNumber,
             ruleName: run.ruleName,
+            otherRuleNames: otherRuleNames(run),
             runId: run.id,
             startedAt: run.startedAt,
             authenticatedLogin: ghLogin,
