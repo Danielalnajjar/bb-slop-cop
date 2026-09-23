@@ -87,6 +87,8 @@ export async function verifyLive(options: {
   ruleName: string;
   /** The names of the repo's other rules, whose headers this run must not claim. */
   otherRuleNames: string[];
+  /** True for a run id SlopCop has recorded, so a marker naming it is that run's. */
+  isRecordedRun: (runId: string) => boolean;
   runId: string;
   startedAt: number;
   authenticatedLogin: string | null;
@@ -97,6 +99,7 @@ export async function verifyLive(options: {
     prNumber,
     ruleName,
     otherRuleNames,
+    isRecordedRun,
     runId,
     startedAt,
     authenticatedLogin,
@@ -133,8 +136,11 @@ export async function verifyLive(options: {
       // Every rule posts from the same account, so another rule's review on
       // this PR also carries the header. Its marker names its own rule, and
       // without a marker its header still does.
+      // An overlapping run of this rule, on an earlier or later head, marks
+      // its comments with its own recorded run id.
       const marker = parseMarker(comment.body);
       if (marker !== null && !markerBelongsToRule(marker, ruleName)) continue;
+      if (marker !== null && isRecordedRun(marker.run)) continue;
       const headerRule = headerRuleName(comment.body);
       if (marker === null && headerRule !== null && otherRuleNames.includes(headerRule)) {
         continue;
