@@ -740,7 +740,6 @@ describe("watcher shutdown", () => {
       let release: (() => void) | undefined;
       let reached = false;
       let polls = 0;
-  let reads = 0;
       const pr = {
         number: 7, title: "Ready PR", draft: false,
         head: { sha: "sha-7" }, base: { ref: "main" },
