@@ -83,11 +83,13 @@ export async function verifyLive(options: {
   gh: GhClient;
   repo: string;
   prNumber: number;
+  ruleName: string;
   runId: string;
   startedAt: number;
   authenticatedLogin: string | null;
 }): Promise<VerifyResult> {
-  const { gh, repo, prNumber, runId, startedAt, authenticatedLogin } = options;
+  const { gh, repo, prNumber, ruleName, runId, startedAt, authenticatedLogin } =
+    options;
 
   const [issueComments, reviewComments, reviews] = await Promise.all([
     gh.listIssueComments(repo, prNumber),
@@ -117,6 +119,10 @@ export async function verifyLive(options: {
         matched.push(toRunComment(comment, runId, source.kind, "marker"));
         continue;
       }
+      // Every rule posts from the same account, so another rule's review on
+      // this PR also carries the header. Its marker names its own rule.
+      const marker = parseMarker(comment.body);
+      if (marker !== null && !markerBelongsToRule(marker, ruleName)) continue;
       // Only bodies this run could plausibly have created are considered:
       // ours by account, and newer than the run started.
       const isRecentOwn =
