@@ -1177,8 +1177,30 @@ export default async function plugin(bb: BbPluginApi) {
     return rule;
   }
 
-  async function checkPr(rule: Rule, prNumber: number) {
-    const pullRequest = await gh.getPullRequest(rule.repo, prNumber);
+  async function checkPr(rule: Rule, prNumber: number, expectedHead?: string) {
+    let pullRequest: PullRequest;
+    if (expectedHead === undefined) {
+      pullRequest = await gh.getPullRequest(rule.repo, prNumber);
+    } else {
+      const timeout = new AbortController();
+      let observedHead = "not observed";
+      const timer = setTimeout(() => timeout.abort(new Error(
+        `PR #${prNumber} head did not match within 60 seconds: expected ${expectedHead}, observed ${observedHead}. No run created.`,
+      )), 60_000);
+      const signal = watcherSignal === undefined
+        ? timeout.signal
+        : AbortSignal.any([watcherSignal, timeout.signal]);
+      try {
+        while (true) {
+          pullRequest = await waitForAbort(() => gh.getPullRequest(rule.repo, prNumber), signal);
+          observedHead = pullRequest.headRefOid;
+          if (observedHead === expectedHead) break;
+          await sleep(2_000, signal);
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     await hydrateFiles([rule], rule.repo, pullRequest);
     const result = evaluateRule(rule, pullRequest, "manual");
     return { pullRequest, result };
@@ -1345,7 +1367,7 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "dispatch",
         summary: "Run a rule against a PR now",
-        usage: "bb slopcop dispatch <id|name> <pr-number> [--force]",
+        usage: "bb slopcop dispatch <id|name> <pr-number> [--force] [--head <sha>]",
       },
       {
         name: "verify",
@@ -1702,7 +1724,11 @@ export default async function plugin(bb: BbPluginApi) {
             );
           }
 
-          const { pullRequest, result } = await checkPr(rule, prNumber);
+          const expectedHead = flag("head");
+          if (has("head") && (!expectedHead || expectedHead.startsWith("--"))) {
+            return fail("--head requires the exact pushed commit SHA");
+          }
+          const { pullRequest, result } = await checkPr(rule, prNumber, expectedHead);
           if (!result.matched && !has("force")) {
             return fail(
               `'${rule.name}' does not match PR #${prNumber}: ${result.reason}\nRe-run with --force to dispatch anyway.`,
@@ -1713,8 +1739,8 @@ export default async function plugin(bb: BbPluginApi) {
           });
           return ok(
             json
-              ? JSON.stringify(dispatched, null, 2)
-              : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
+              ? JSON.stringify({ ...dispatched, headSha: pullRequest.headRefOid }, null, 2)
+              : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }
 
