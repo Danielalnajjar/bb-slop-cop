@@ -54,8 +54,9 @@ function stubGhLogin(): void {
  * draft on the first poll and ready on the second, which is the
  * `ready_for_review` transition a rule triggers on.
  */
-function stubGh(options: { readyPullRequest?: boolean } = {}): void {
+function stubGh(options: { readyPullRequest?: boolean; heads?: string[] } = {}): void {
   let polls = 0;
+  let reads = 0;
   const pullRequest = {
     number: 7,
     title: "A PR nobody is reviewing yet",
@@ -75,7 +76,9 @@ function stubGh(options: { readyPullRequest?: boolean } = {}): void {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
     else if (args.includes("repos/acme/widgets/pulls/7")) {
-      response = JSON.stringify(pullRequest);
+      response = JSON.stringify({ ...pullRequest, head: { sha:
+        options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7",
+      } });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       response =
         options.readyPullRequest === true
@@ -737,6 +740,7 @@ describe("watcher shutdown", () => {
       let release: (() => void) | undefined;
       let reached = false;
       let polls = 0;
+  let reads = 0;
       const pr = {
         number: 7, title: "Ready PR", draft: false,
         head: { sha: "sha-7" }, base: { ref: "main" },
@@ -825,4 +829,44 @@ describe("watcher shutdown", () => {
       }
     },
   );
+});
+
+
+describe("manual dispatch head selection", () => {
+  it.each([
+    { name: "waits for the pushed head before reserving", heads: ["old", "old", "pushed"], expected: "pushed", success: true },
+    { name: "refuses an unobserved head without reserving", heads: ["old"], expected: "pushed", success: false },
+    { name: "prints the dispatched head without --head", heads: ["old"], expected: undefined, success: true },
+  ])("$name", async ({ heads, expected, success }) => {
+    vi.useFakeTimers();
+    stubGh({ heads });
+    const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    try {
+      await harness.behavior.callRpc("saveRule", { id: null, rule: {
+        name: "head-review", repo: "acme/widgets",
+        request: { projectId: "project", providerId: "codex", model: "test" },
+      } });
+      const pending = harness.behavior.runCli([
+        "dispatch", "head-review", "7", ...(expected ? ["--head", expected] : []),
+      ]);
+      await vi.advanceTimersByTimeAsync(0);
+      if (expected) expect(store.listRuns({ limit: 10 })).toEqual([]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await pending;
+      expect(result.exitCode).toBe(success ? 0 : 1);
+      if (success) {
+        expect(store.listRuns({ limit: 10 })).toMatchObject([{ headSha: expected ?? "old", status: "reviewing" }]);
+        expect(result.stdout).toContain(`head=${expected ?? "old"}`);
+      } else {
+        expect(store.listRuns({ limit: 10 })).toEqual([]);
+        expect(result.stderr).toContain("expected pushed");
+        expect(result.stderr).toContain("observed old");
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
 });
