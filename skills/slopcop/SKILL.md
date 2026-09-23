@@ -34,7 +34,7 @@ bb slopcop rules add \
   --name security-sweep \
   --repo owner/repo \
   --project <bb-project-name> \
-  --model claude-opus-5 \
+  --model "claude-opus-5-5[1m]" \
   --paths "src/auth/**,src/payments/**" \
   --base main \
   --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."

@@ -1533,7 +1533,7 @@ export default async function plugin(bb: BbPluginApi) {
               ...previous,
               projectId: project?.id ?? (previous.projectId as string),
               providerId: flag("provider") ?? previous.providerId ?? "claude-code",
-              model: flag("model") ?? previous.model ?? "claude-opus-5",
+              model: flag("model") ?? previous.model ?? "claude-opus-5-5[1m]",
               reasoningLevel:
                 flag("reasoning") ?? previous.reasoningLevel ?? "high",
               // BB's permission modes are full | auto | accept-edits — there is
