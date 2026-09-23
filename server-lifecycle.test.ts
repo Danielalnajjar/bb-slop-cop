@@ -213,7 +213,7 @@ describe("reconciling runs a restart stranded", () => {
     }
   });
 
-  it("verifies a recovered live run without reading its transcript", async () => {
+  it("finalizes a recovered live run when its transcript is unavailable", async () => {
     vi.useFakeTimers();
     stubGh();
     const { harness, store } = await setup({ mode: "live" });
@@ -237,7 +237,7 @@ describe("reconciling runs a restart stranded", () => {
         status: "no_comment",
         finishedAt: expect.any(Number),
       });
-      expect(harness.inspection.sdk.callsTo("threads.output")).toHaveLength(0);
+      expect(harness.inspection.sdk.callsTo("threads.output")).toHaveLength(1);
     } finally {
       await harness.lifecycle.dispose();
     }
@@ -601,6 +601,51 @@ describe("watcher shutdown", () => {
     }
   });
 
+  it("ignores a late spawn after cancellation is finalized and the service shuts down", async () => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true });
+    const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "restraint-review", repo: "acme/widgets", mode: "shadow",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } });
+    let release!: () => void;
+    harness.inspection.sdk.stub("threads.spawn", () => new Promise((resolve) => {
+      release = () => resolve(makeThreadResponse({ id: THREAD_ID }));
+    }));
+    const service = harness.behavior.runService("watcher");
+    let replacement: ReturnType<typeof createFakePluginHost> | undefined;
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+      const reserved = store.listRuns({})[0]!;
+      await harness.behavior.runCli(["runs", "cancel", reserved.id]);
+      const finalized = store.getRun(reserved.id)!;
+      expect(finalized).toMatchObject({
+        status: "cancelled", threadId: null, finishedAt: expect.any(Number),
+      });
+      service.controller.abort();
+      await service.done;
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store.getRun(reserved.id)).toEqual(finalized);
+      replacement = await harness.lifecycle.reload(plugin);
+      const title = buildThreadTitle({ runId: reserved.id,
+        rule: { name: "restraint-review", mode: "shadow" }, pullRequest: { number: 7 } });
+      replacement.harness.inspection.sdk.stub("threads.list", () => [
+        makeThreadResponse({ id: THREAD_ID, title, originPluginId: bb.pluginId }),
+      ]);
+      await startWatcher(replacement.harness);
+      expect(createStore(replacement.bb.storage.database() as never).getRun(reserved.id)).toEqual(finalized);
+      expect(replacement.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(0);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await (replacement?.harness ?? harness).lifecycle.dispose();
+    }
+  });
+
   it.each([0, 1, 2])("recovers a threadless dispatch with %i matching plugin threads", async (count) => {
     vi.useFakeTimers();
     stubGhLogin();
@@ -684,7 +729,7 @@ describe("watcher shutdown", () => {
     }
   });
 
-  it.each(["login", "poll", "prior-comments", "spawn", "reconcile", "verify-retry", "poll-sleep"] as const)(
+  it.each(["login", "poll", "prior-comments", "spawn", "reconcile", "reconcile-output", "verify-retry", "poll-sleep"] as const)(
     "stops before the host deadline during %s and ignores late results",
     async (phase) => {
       vi.useFakeTimers();
@@ -731,9 +776,15 @@ describe("watcher shutdown", () => {
           release = () => resolve(makeThreadResponse({ id: "thr_new" }));
         });
       });
+      harness.inspection.sdk.stub("threads.output", () => {
+        reached = true;
+        return new Promise((resolve) => {
+          release = () => resolve({ output: "No findings." });
+        });
+      });
       await plugin(bb);
       const store = createStore(bb.storage.database() as never);
-      if (phase === "reconcile" || phase === "verify-retry") store.insertRun(makeReviewRun({ mode: "live" }));
+      if (phase === "reconcile" || phase === "reconcile-output" || phase === "verify-retry") store.insertRun(makeReviewRun({ mode: "live" }));
       await harness.behavior.callRpc("saveRule", {
         id: null,
         rule: {
@@ -745,7 +796,7 @@ describe("watcher shutdown", () => {
       let stopped = false;
       void service.done.then(() => { stopped = true; });
       try {
-        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" ? 15_000 : 0);
+        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" ? 15_000 : phase === "reconcile-output" ? 4_000 : 0);
         expect(reached).toBe(true);
         service.controller.abort();
         // BB's service stop deadline is 5,000 ms. No I/O is released here.

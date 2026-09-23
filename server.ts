@@ -798,6 +798,7 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     finalMessage: string | null,
     noVerdict: string | null,
+    recoverLiveOutput = false,
   ): Promise<void> {
     const run = store.findRunByThread(threadId);
     if (run === null) {
@@ -856,6 +857,14 @@ export default async function plugin(bb: BbPluginApi) {
               // marker, not the agent's transcription of it — and re-verify,
               // because GitHub stays the source of truth for what landed.
               if (second.comments.length > 0) return second;
+              if (recoverLiveOutput) {
+                try {
+                  finalMessage = (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output;
+                } catch (error) {
+                  watcherSignal?.throwIfAborted();
+                  bb.log.warn(`could not read recovered run ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+              }
               const body = summaryToPost({
                 rule: run.ruleName,
                 runId: run.id,
@@ -907,10 +916,11 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     finalMessage: string | null,
     noVerdict: string | null,
+    recoverLiveOutput = false,
   ): Promise<void> {
     const inProgress = finalizing.get(threadId);
     if (inProgress !== undefined) return inProgress;
-    const promise = finishRunOnce(threadId, finalMessage, noVerdict).finally(() => {
+    const promise = finishRunOnce(threadId, finalMessage, noVerdict, recoverLiveOutput).finally(() => {
       finalizing.delete(threadId);
     });
     finalizing.set(threadId, promise);
@@ -1087,14 +1097,14 @@ export default async function plugin(bb: BbPluginApi) {
           `reconciling ${run.id} (${run.ruleName} #${run.prNumber}): its thread is ${thread.status}`,
         );
         if (outcome.kind === "finished") {
-          // Only a shadow review is read from its transcript; a live one is
-          // verified against GitHub. Fetching an output nobody reads would
-          // strand the run whenever that call fails.
+          // Clean live summaries remain in the transcript until we post them.
+          // finishRun reads live output only after GitHub verification finds no
+          // comments to use; an unavailable transcript must not strand the run.
           const finalMessage =
             run.mode === "shadow"
               ? (await waitForWork(() => bb.sdk.threads.output({ threadId: recoveredThreadId }))).output
               : null;
-          await finishRun(threadId, finalMessage, null);
+          await finishRun(threadId, finalMessage, null, run.mode === "live");
           continue;
         }
         // The live `thread.failed` path leaves an errored thread alone while a

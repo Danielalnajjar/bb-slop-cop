@@ -264,3 +264,66 @@ it("stays no_comment when nothing posted and the final message has no marker", a
     await harness.lifecycle.dispose();
   }
 });
+
+
+it("posts a recovered live run's clean transcript summary during reconciliation", async () => {
+  vi.useFakeTimers();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.queue.list", () => []);
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  harness.inspection.sdk.stub("threads.get", () =>
+    makeThreadResponse({ id: THREAD_ID, status: "idle" }),
+  );
+  harness.inspection.sdk.stub("threads.output", () => ({ output: summaryBody("mistyped", "oldsha") }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  store.insertRun(liveRun());
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(writes.filter((write) => write.endpoint.includes("/issues/42/comments")))
+      .toEqual([{ endpoint: "repos/acme/widgets/issues/42/comments", body: { body: summaryBody() } }]);
+    expect(store.getRun(RUN_ID)).toMatchObject({
+      status: "commented", commentCount: 1, finishedAt: expect.any(Number),
+    });
+    expect(writes.find((write) => write.endpoint.includes("check-runs"))?.body)
+      .toMatchObject({ conclusion: "success" });
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+
+it("reconciles an already-posted live summary without fetching its transcript", async () => {
+  vi.useFakeTimers();
+  issueComments.push({
+    id: 7, body: summaryBody(),
+    html_url: "https://github.com/acme/widgets/pull/42#issuecomment-7",
+    user: { login: "slopcop-bot" }, created_at: new Date(2_000).toISOString(),
+  });
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.queue.list", () => []);
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  harness.inspection.sdk.stub("threads.get", () =>
+    makeThreadResponse({ id: THREAD_ID, status: "idle" }),
+  );
+  harness.inspection.sdk.stub("threads.output", () => new Promise(() => {}));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  store.insertRun(liveRun());
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(store.getRun(RUN_ID)).toMatchObject({
+      status: "commented", commentCount: 1, finishedAt: expect.any(Number),
+    });
+    expect(writes.filter((write) => write.endpoint.includes("/issues/42/comments"))).toEqual([]);
+    expect(harness.inspection.sdk.callsTo("threads.output")).toHaveLength(0);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});

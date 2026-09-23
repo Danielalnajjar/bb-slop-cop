@@ -7,7 +7,7 @@ allowBuilds:
 enableGlobalVirtualStore: false
 
 minimumReleaseAgeExclude:
-  - "@get-bb/plugin-sdk@0.4.34"
+  - "@get-bb/plugin-sdk@0.5.9"
 
 strictDepBuilds: true
 
