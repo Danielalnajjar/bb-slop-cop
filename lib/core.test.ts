@@ -589,6 +589,7 @@ describe("live verification", () => {
     prNumber: 482,
     ruleName: "security-sweep",
     otherRuleNames: ["test-review"],
+    isRecordedRun: (id: string) => id === "run_0",
     runId: "run_1",
     startedAt: 1_000,
     authenticatedLogin: "octocat",
@@ -616,15 +617,24 @@ describe("live verification", () => {
     expect(result.detail).toContain("without posting");
   });
 
-  it("ignores another run's comments", async () => {
+  it("flags a marker whose run id no run recorded", async () => {
     const result = await verifyLive({
       ...base,
       gh: fakeGh({
         issues: [ghComment({ body: marked("summary", "run_OTHER") })],
       }),
     });
-    // Still ours by header, so it is flagged rather than counted as a success.
+    // A mistranscribed run id: still ours by header, so it is flagged rather
+    // than counted as a success.
     expect(result.status).toBe("commented_unmarked");
+  });
+
+  it("ignores an overlapping run of the same rule", async () => {
+    const result = await verifyLive({
+      ...base,
+      gh: fakeGh({ reviews: [ghComment({ body: marked("summary", "run_0") })] }),
+    });
+    expect(result.status).toBe("no_comment");
   });
 
   it("ignores another rule's review on the same PR", async () => {
