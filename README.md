@@ -105,7 +105,10 @@ When the review thread finishes, SlopCop **does not trust the agent's transcript
 polls GitHub's three separate comment surfaces (issue comments, inline review comments,
 review bodies) and matches on the marker. A run that claims success but posted nothing
 is reported as `no_comment`, not as a success. If the header is present but the marker
-is missing, the comment is still attributed — and flagged as prompt drift.
+is missing, the comment is still attributed — and flagged as prompt drift. Every rule
+posts from the same account, so a body whose marker names a different rule, or that
+has no marker and whose header names another rule on the repo, is never counted as this
+run's. For the same reason, two rules cannot share a name.
 
 ### Shadow mode makes a prompt change safe to test
 
