@@ -178,12 +178,13 @@ export interface Run {
   finishedAt: number | null;
 }
 
-/** The PR fields SlopCop reads, as returned by `gh pr list --json`. */
+/** The PR fields SlopCop reads from the GitHub REST API. */
 export interface PullRequest {
   number: number;
   title: string;
   isDraft: boolean;
   headRefOid: string;
+  baseRefOid: string;
   baseRefName: string;
   author: { login: string } | null;
   authorAssociation: AuthorAssociation | string;

@@ -74,7 +74,7 @@ it.each([
       polls += 1;
       response = JSON.stringify(Array.from({ length: 5 }, (_, index) => ({
         number: index + 1, title: `PR ${index + 1}`, draft: polls === 1,
-        head: { sha: `sha-${index}` }, base: { ref: "main" },
+        head: { sha: `sha-${index}` }, base: { ref: "main", sha: "base-sha" },
         user: { login: "dana" }, author_association: "MEMBER", labels: [],
       })));
     }
@@ -119,7 +119,7 @@ it.each([
   let polls = 0;
   const pullRequest = {
     number: 42, title: "Retry after correcting settings", draft: false,
-    head: { sha: "same-head" }, base: { ref: "main" },
+    head: { sha: "same-head" }, base: { ref: "main", sha: "base-sha" },
     user: { login: "dana" }, author_association: "MEMBER", labels: [],
   };
   vi.mocked(execFile).mockImplementation(((_file: string, args: string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {

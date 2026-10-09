@@ -116,14 +116,14 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-async function finishThreadWith(finalMessage: string | null) {
+async function finishThreadWith(finalMessage: string | null, mode: "live" | "shadow" = "live") {
   vi.useFakeTimers();
   const { bb, harness } = createFakePluginHost();
   harness.inspection.sdk.stub("threads.queue.list", () => []);
   harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
   await plugin(bb);
   const store = createStore(bb.storage.database() as never);
-  store.insertRun(liveRun());
+  store.insertRun({ ...liveRun(), mode });
 
   await harness.behavior.emitThreadEvent("thread.idle", {
     thread: makeThreadResponse({ id: THREAD_ID, status: "idle" }),
@@ -148,6 +148,46 @@ it("posts the no-findings summary from the agent's final message", async () => {
     const check = writes.find((write) => write.endpoint.includes("check-runs"));
     expect(check?.body).toMatchObject({ conclusion: "success" });
   } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each(["live", "shadow"] as const)("keeps an incomplete %s input check unreviewed even if it contains a summary marker", async (mode) => {
+  const { store, harness } = await finishThreadWith(`Review incomplete: tracked files differ from captured head.\n${summaryBody()}`, mode);
+  try {
+    expect(store.findRunByThread(THREAD_ID)).toMatchObject({
+      status: "cancelled", detail: expect.stringContaining("tracked files differ"), commentCount: 0, finishedAt: expect.any(Number),
+    });
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([]);
+    if (mode === "live") {
+      expect(writes.find(write => write.endpoint.includes("check-runs"))?.body).toMatchObject({ conclusion: "cancelled" });
+    } else {
+      expect(writes).toEqual([]);
+    }
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("does not publish a recovered incomplete input check as a clean summary", async () => {
+  vi.useFakeTimers();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.queue.list", () => []);
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "idle" }));
+  harness.inspection.sdk.stub("threads.output", () => ({ output: `Review incomplete: captured base is unavailable.\n${summaryBody()}` }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  store.insertRun(liveRun());
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(store.getRun(RUN_ID)).toMatchObject({ status: "cancelled", detail: expect.stringContaining("base is unavailable"), commentCount: 0, finishedAt: expect.any(Number) });
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([]);
+    expect(writes.find(write => write.endpoint.includes("check-runs"))?.body).toMatchObject({ conclusion: "cancelled" });
+  } finally {
+    service.controller.abort();
+    await service.done;
     await harness.lifecycle.dispose();
   }
 });

@@ -14,6 +14,7 @@ import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { buildReviewEnvironment } from "./lib/review-input";
 import {
   archiveReviewThread,
   reviewThreadOutcome,
@@ -31,6 +32,7 @@ import {
   isDangerousCombination,
 } from "./lib/matcher";
 import {
+  incompleteReviewReason,
   liveVerifyBlockReason,
   summaryToPost,
   verifyLive,
@@ -436,6 +438,7 @@ export default async function plugin(bb: BbPluginApi) {
       ghCommand: botGhPath,
       priorComments,
     };
+    let preparingInputs = false;
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
       // `input`, so it must be dropped here — the prompt SlopCop builds from
@@ -471,11 +474,20 @@ export default async function plugin(bb: BbPluginApi) {
       );
       // thread.idle / thread.failed already run finishRun concurrently.
       await reportCheck("start", checkRun);
+      preparingInputs = true;
+      const environment = await waitForWork(() =>
+        buildReviewEnvironment(bb.sdk, rule.request!, pullRequest),
+      );
+      const prepared = store.getRun(runId);
+      if (prepared !== null && !isReviewInProgress(prepared)) {
+        return { runId, threadId: null };
+      }
       const dispatchSignal = watcherSignal;
       const logInfo = bb.log.info;
       const thread = await waitForWork(async () => {
         const thread = await bb.sdk.threads.spawn({
           ...execution,
+          environment,
           prompt: buildPrompt(context),
           title: buildThreadTitle(context),
           visibility: rule.visibility,
@@ -488,6 +500,7 @@ export default async function plugin(bb: BbPluginApi) {
         store.updateRun(runId, { threadId: (thread as { id: string }).id });
         return thread;
       });
+      preparingInputs = false;
       const threadId = (thread as { id: string }).id;
       // `runs cancel` can finalize this run while it still has no thread. The
       // cancellation stays; writing `reviewing` over it here would leave the
@@ -516,7 +529,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       throwIfDispatchAborted();
       store.updateRun(runId, {
-        status: "failed",
+        status: preparingInputs ? "cancelled" : "failed",
         detail: error instanceof Error ? error.message : String(error),
         finishedAt: null,
       });
@@ -813,6 +826,7 @@ export default async function plugin(bb: BbPluginApi) {
     inFlight = Math.max(0, inFlight - 1);
 
     try {
+      noVerdict ??= incompleteReviewReason(finalMessage);
       // The thread ended, errored, was retired, or was cancelled before
       // producing anything to verify. That is `cancelled`, however it happened
       // and whenever SlopCop learned of it: `failed` belongs to a review that
@@ -864,6 +878,10 @@ export default async function plugin(bb: BbPluginApi) {
                   watcherSignal?.throwIfAborted();
                   bb.log.warn(`could not read recovered run ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
                 }
+              }
+              const incomplete = incompleteReviewReason(finalMessage);
+              if (incomplete !== null) {
+                return { status: "cancelled" as const, detail: incomplete, comments: [] };
               }
               const body = summaryToPost({
                 rule: run.ruleName,

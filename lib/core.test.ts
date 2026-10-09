@@ -62,6 +62,7 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     title: "Rotate webhook signing secrets",
     isDraft: false,
     headRefOid: "a1b2c3d",
+    baseRefOid: "base-sha",
     baseRefName: "main",
     author: { login: "dana" },
     authorAssociation: "MEMBER",
@@ -792,6 +793,10 @@ describe("the summary SlopCop posts", () => {
 
   it("refuses a body with no marker at all", () => {
     expect(post("🚨 **SLOP COP** 🚨 · `r`\n\nclean, but no marker")).toBeNull();
+  });
+
+  it("refuses an incomplete input check even when a summary marker follows", () => {
+    expect(post(`Review incomplete: HEAD differs from the captured SHA.\n${marked("summary")}`)).toBeNull();
   });
 
   it("refuses an empty turn", () => {
