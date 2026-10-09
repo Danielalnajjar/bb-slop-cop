@@ -54,17 +54,23 @@ function stubGhLogin(): void {
  * draft on the first poll and ready on the second, which is the
  * `ready_for_review` transition a rule triggers on.
  */
-function stubGh(options: { readyPullRequest?: boolean; heads?: string[] } = {}): void {
+function stubGh(options: {
+  readyPullRequest?: boolean;
+  heads?: string[];
+  baseSha?: string | null;
+  association?: string;
+  fork?: boolean;
+} = {}): void {
   let polls = 0;
   let reads = 0;
   const pullRequest = {
     number: 7,
     title: "A PR nobody is reviewing yet",
     draft: false,
-    head: { sha: "sha-7" },
-    base: { ref: "main" },
+    head: { sha: "sha-7", repo: { full_name: options.fork ? "dana/widgets" : "acme/widgets" } },
+    base: { ref: "main", sha: options.baseSha === null ? undefined : options.baseSha ?? "base-7", repo: { full_name: "acme/widgets" } },
     user: { login: "dana" },
-    author_association: "MEMBER",
+    author_association: options.association ?? "MEMBER",
     labels: [],
   };
   vi.mocked(execFile).mockImplementation(((
@@ -76,7 +82,7 @@ function stubGh(options: { readyPullRequest?: boolean; heads?: string[] } = {}):
     let response = "[]";
     if (args.includes("user")) response = "test-user";
     else if (args.includes("repos/acme/widgets/pulls/7")) {
-      response = JSON.stringify({ ...pullRequest, head: { sha:
+      response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha:
         options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7",
       } });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
@@ -422,6 +428,7 @@ describe("bb slopcop runs cancel", () => {
   it("keeps a cancellation that lands while the review is still spawning", async () => {
     stubGh({ readyPullRequest: true });
     const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     harness.inspection.sdk.stub("threads.queue.list", () => []);
     harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
     harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
@@ -569,6 +576,7 @@ describe("watcher shutdown", () => {
     vi.useFakeTimers();
     stubGh({ readyPullRequest: true });
     const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     await plugin(bb);
     const store = createStore(bb.storage.database() as never);
     await harness.behavior.callRpc("saveRule", { id: null, rule: {
@@ -608,6 +616,7 @@ describe("watcher shutdown", () => {
     vi.useFakeTimers();
     stubGh({ readyPullRequest: true });
     const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     await plugin(bb);
     const store = createStore(bb.storage.database() as never);
     await harness.behavior.callRpc("saveRule", { id: null, rule: {
@@ -686,6 +695,7 @@ describe("watcher shutdown", () => {
   it("completes an aborted dispatch check after reloading its threadless reservation", async () => {
     vi.useFakeTimers();
     const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     const writes = stubCheckWrites();
     stubGh({ readyPullRequest: true });
     await plugin(bb);
@@ -737,12 +747,13 @@ describe("watcher shutdown", () => {
     async (phase) => {
       vi.useFakeTimers();
       const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+      harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
       let release: (() => void) | undefined;
       let reached = false;
       let polls = 0;
       const pr = {
         number: 7, title: "Ready PR", draft: false,
-        head: { sha: "sha-7" }, base: { ref: "main" },
+        head: { sha: "sha-7" }, base: { ref: "main", sha: "base-7" },
         user: { login: "dana" }, author_association: "MEMBER", labels: [],
       };
       vi.mocked(execFile).mockImplementation(((
@@ -840,6 +851,7 @@ describe("manual dispatch head selection", () => {
     vi.useFakeTimers();
     stubGh({ heads });
     const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
     await plugin(bb);
     const store = createStore(bb.storage.database() as never);
@@ -868,4 +880,211 @@ describe("manual dispatch head selection", () => {
       await harness.lifecycle.dispose();
     }
   });
+});
+
+it.each([
+  { name: "implicit project default", environment: undefined, machine: { type: "existing", hostId: "host_configured_default" }, usesDefault: true },
+  { name: "project default", environment: { type: "project-default" }, machine: { type: "existing", hostId: "host_configured_default" }, usesDefault: true },
+  { name: "host without hostId", environment: { type: "host", workspace: { type: "unmanaged", path: "/owner/dirty" } }, machine: { type: "existing", hostId: "host_configured_default" }, usesDefault: true },
+  { name: "provider without machine", environment: { type: "provider", environmentProviderId: "git-worktree" }, machine: { type: "existing", hostId: "host_configured_default" }, usesDefault: true },
+  { name: "host checkout", environment: { type: "host", hostId: "host_air", workspace: { type: "unmanaged", path: "/owner/dirty" } }, machine: { type: "existing", hostId: "host_air" } },
+  { name: "provider existing path", environment: { type: "provider", environmentProviderId: "git-worktree", inputs: { kind: "existing", path: "/owner/dirty" }, machine: { type: "existing", hostId: "host_air" } }, machine: { type: "existing", hostId: "host_air" } },
+  { name: "reused environment", environment: { type: "reuse", environmentId: "env_owner" }, machine: { type: "existing", hostId: "host_air" } },
+  { name: "new machine selection", environment: { type: "provider", environmentProviderId: "project-checkout", machine: { type: "new", machineProviderId: "cloud", inputs: { region: "west" } } }, machine: { type: "new", machineProviderId: "cloud", inputs: { region: "west" } } },
+])("pins the captured fork head in a fresh worktree instead of $name", async ({ environment, machine, usesDefault }) => {
+  const head = "d2759ef1b6fe51657eda5a45a3cc7a4ad1638394";
+  const base = "c875a8e02967cb885eaf1e28147479238a2da522";
+  stubGh({ heads: [head, "later-head"], baseSha: base, fork: true });
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.spawn", (request) => {
+    const selection = (request as { environment: { machine?: unknown } }).environment;
+    if (selection.machine === undefined) throw new Error("HTTP 400: git-worktree requires a machine selection");
+    return makeThreadResponse({ id: THREAD_ID });
+  });
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [
+    { hostId: "host_first", isDefault: false },
+    { hostId: "host_configured_default", isDefault: true },
+    { hostId: "host_last", isDefault: false },
+  ] }));
+  harness.inspection.sdk.stub("environments.get", () => ({ projectId: "project", hostId: "host_air" }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "exact-review", repo: "acme/widgets", visibility: "hidden",
+      request: { projectId: "project", providerId: "codex", model: "test", reasoningLevel: "high", permissionMode: "full", input: [{ type: "text", text: "old draft" }], ...(environment === undefined ? {} : { environment }) },
+    } }) as { rule: { id: string } };
+    const dispatched = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(dispatched).toMatchObject({ threadId: THREAD_ID, blockedReason: null });
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(1);
+    const request = spawns[0]![0] as Record<string, unknown>;
+    expect(request).toMatchObject({
+      projectId: "project", providerId: "codex", model: "test", reasoningLevel: "high", permissionMode: "full", visibility: "hidden",
+      executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" },
+    });
+    expect(request.environment).toEqual({
+      type: "provider", environmentProviderId: "git-worktree",
+      inputs: { branch: { kind: "named", name: head } },
+      machine,
+    });
+    expect(harness.inspection.sdk.callsTo("projects.get")).toEqual(usesDefault ? [[{ projectId: "project" }]] : []);
+    expect(request).not.toHaveProperty("input");
+    // These values came from the captured API metadata, not main or a later head.
+    expect(request.prompt).toContain(`- Base SHA: ${base}`);
+    expect(request.prompt).toContain(`git diff ${base}...${head}`);
+    expect(request.prompt).toContain("- From a fork: yes");
+    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ headSha: head, status: "reviewing", threadId: THREAD_ID });
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each(["spawn rejects", "provisioning fails after spawn"])("keeps the captured-head review unreviewed when %s, without falling back", async (failure) => {
+  stubGh();
+  const writes = stubCheckWrites();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.queue.list", () => []);
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  harness.inspection.sdk.stub("threads.spawn", () => {
+    if (failure === "spawn rejects") throw new Error("captured head is unavailable");
+    return makeThreadResponse({ id: THREAD_ID });
+  });
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "exact-review", repo: "acme/widgets", mode: "live",
+      request: { projectId: "project", providerId: "codex", model: "test", environment: { type: "project-default" } },
+    } }) as { rule: { id: string } };
+    const dispatched = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(dispatched).toMatchObject({
+      blockedReason: failure === "spawn rejects" ? expect.stringContaining("captured head is unavailable") : null,
+    });
+    if (failure === "provisioning fails after spawn") {
+      await harness.behavior.emitThreadEvent("thread.failed", {
+        thread: makeThreadResponse({ id: THREAD_ID, status: "error" }), error: "captured head is unavailable",
+      });
+    }
+    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", commentCount: 0, finishedAt: expect.any(Number) });
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]![0]).toMatchObject({ environment: { type: "provider", environmentProviderId: "git-worktree", inputs: { branch: { kind: "named", name: "sha-7" } } } });
+    expect(writes).toContainEqual(expect.objectContaining({ conclusion: "cancelled" }));
+    expect(writes.some(write => "body" in write)).toBe(false);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each([
+  { name: "missing base metadata", baseSha: null, environment: undefined },
+  { name: "malformed machine selection", baseSha: "base-7", environment: { type: "provider", environmentProviderId: "git-worktree", machine: { type: "existing", hostId: 7 } } },
+  { name: "unavailable reused environment", baseSha: "base-7", environment: { type: "reuse", environmentId: "env_missing" } },
+])("does not launch on fallback input after $name", async ({ baseSha, environment }) => {
+  stubGh({ baseSha });
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  harness.inspection.sdk.stub("environments.get", () => { throw new Error("environment is unavailable"); });
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "exact-review", repo: "acme/widgets",
+      request: { projectId: "project", providerId: "codex", model: "test", ...(environment === undefined ? {} : { environment }) },
+    } }) as { rule: { id: string } };
+    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", threadId: null, commentCount: 0, finishedAt: expect.any(Number) });
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each(["write_access", "anyone"] as const)("does not execute managed preparation for an untrusted fork with %s trust, even when forced", async (authorTrust) => {
+  stubGh({ association: "CONTRIBUTOR", fork: true });
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "exact-review", repo: "acme/widgets", authorTrust,
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } }) as { rule: { id: string } };
+    const dispatched = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7, force: true });
+    expect(dispatched).toMatchObject({ threadId: null, blockedReason: expect.stringContaining("write-access trusted") });
+    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", detail: expect.stringContaining("write-access trusted"), threadId: null });
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("does not start preparation after cancellation during reused-machine resolution", async () => {
+  stubGh();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  let resolveMachine!: (value: unknown) => void;
+  let machineRequested!: () => void;
+  const requested = new Promise<void>(resolve => { machineRequested = resolve; });
+  harness.inspection.sdk.stub("environments.get", () => new Promise(resolve => {
+    resolveMachine = resolve;
+    machineRequested();
+  }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "exact-review", repo: "acme/widgets",
+      request: { projectId: "project", providerId: "codex", model: "test", environment: { type: "reuse", environmentId: "env_owner" } },
+    } }) as { rule: { id: string } };
+    const dispatch = harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    await requested;
+    const runId = store.listRuns({ limit: 1 })[0]!.id;
+    await harness.behavior.runCli(["runs", "cancel", runId]);
+    resolveMachine({ projectId: "project", hostId: "host_air" });
+    await dispatch;
+    expect(store.getRun(runId)).toMatchObject({ status: "cancelled", threadId: null, finishedAt: expect.any(Number) });
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each([
+  { name: "missing default", sources: [{ hostId: "host_other", isDefault: false }] },
+  { name: "no project sources", sources: [] },
+  { name: "ambiguous defaults", sources: [{ hostId: "host_a", isDefault: true }, { hostId: "host_b", isDefault: true }] },
+  { name: "default without a host", sources: [{ hostId: "", isDefault: true }] },
+  { name: "unavailable project", sources: null },
+])("cancels preparation on $name instead of choosing a fallback host", async ({ sources }) => {
+  stubGh();
+  const writes = stubCheckWrites();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("projects.get", () => {
+    if (sources === null) throw new Error("configured project is unavailable");
+    return { sources };
+  });
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "default-machine-review", repo: "acme/widgets", mode: "live",
+      request: { projectId: "configured-project", providerId: "codex", model: "test" },
+    } }) as { rule: { id: string } };
+    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(harness.inspection.sdk.callsTo("projects.get")).toEqual([[{ projectId: "configured-project" }]]);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
+    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({
+      status: "cancelled", threadId: null, commentCount: 0, finishedAt: expect.any(Number),
+      detail: expect.stringContaining(sources === null ? "unavailable" : "default project source"),
+    });
+    expect(writes).toContainEqual(expect.objectContaining({ conclusion: "cancelled" }));
+    expect(writes.some(write => "body" in write)).toBe(false);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
 });

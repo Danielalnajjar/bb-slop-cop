@@ -16,10 +16,9 @@ leave them alone unless the user explicitly asks:
 
 - **`--trust write_access`** (default) — only reviews PRs from `OWNER`,
   `MEMBER`, `COLLABORATOR`. Note that GitHub's `CONTRIBUTOR` means only "has
-  had a commit merged before", **not** write access; `--trust past_contributors`
-  includes those drive-by authors, and `--trust anyone` reviews strangers'
-  forks. Reviewing an untrusted PR means the agent runs `gh pr checkout` on
-  unvetted code and reads an attacker-controlled diff into its own prompt.
+  had a commit merged before", **not** write access. Wider matching thresholds
+  do not authorize managed repository setup: input preparation requires one
+  of those write-access associations, including when dispatch is forced.
 - **shadow mode** (default for new rules) — the rule runs the full review and
   stores the body, but posts nothing. Promote with `--live` only when the user
   has seen a shadow result and asked for it.
@@ -79,6 +78,19 @@ bb slopcop rules edit|enable|disable|rm <rule>
 the single decisive reason (draft, trust gate, a specific condition).
 
 ## Run statuses
+
+Each review requests a fresh `git-worktree` environment at the captured PR head,
+retaining the selected machine rather than reusing its checkout. GitHub's captured
+base SHA is included in the review prompt. The agent checks HEAD, tracked-file
+cleanliness, and captured base/history before reading the pinned diff and files.
+Missing head objects cause provider failure, not fallback to the project checkout.
+
+Managed setup hooks and include copying still run. This is not a hermetic input
+receipt: the agent must carry out the checks. On an input-check failure it returns
+plain `Review incomplete: <reason>`, without posting, a header, or a marker.
+SlopCop records that result as `cancelled`, never as a clean review, including
+when recovering a finished thread after reload. `--head` waits for that live PR
+head to be observed; it does not select a historical PR version.
 
 `shadowed` (shadow review produced, nothing posted) · `commented` (verified on
 GitHub by marker) · `commented_partial` / `commented_unmarked` /

@@ -62,6 +62,7 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     title: "Rotate webhook signing secrets",
     isDraft: false,
     headRefOid: "a1b2c3d",
+    baseRefOid: "base-sha",
     baseRefName: "main",
     author: { login: "dana" },
     authorAssociation: "MEMBER",
@@ -121,6 +122,25 @@ describe("home-relative paths", () => {
     expect(expandHome("~other/.slopcop/gh", home)).toBe("~other/.slopcop/gh");
     expect(expandHome("/opt/~/gh", home)).toBe("/opt/~/gh");
     expect(expandHome("~", home)).toBe(home);
+  });
+});
+
+describe("the pull request block", () => {
+  const prompt = (files: { path: string }[]) =>
+    buildPrompt({
+      rule: makeRule({ mode: "live" as const }),
+      pullRequest: makePr({ files }),
+      runId: "run_1",
+    });
+
+  it("lists fetched files", () => {
+    expect(prompt([{ path: "src/auth/session.go" }])).toContain(
+      "- Changed files (1):\n  - src/auth/session.go",
+    );
+  });
+
+  it("omits the list when no rule fetched it, rather than reporting zero files", () => {
+    expect(prompt([])).not.toContain("Changed files");
   });
 });
 
@@ -792,6 +812,10 @@ describe("the summary SlopCop posts", () => {
 
   it("refuses a body with no marker at all", () => {
     expect(post("🚨 **SLOP COP** 🚨 · `r`\n\nclean, but no marker")).toBeNull();
+  });
+
+  it("refuses an incomplete input check even when a summary marker follows", () => {
+    expect(post(`Review incomplete: HEAD differs from the captured SHA.\n${marked("summary")}`)).toBeNull();
   });
 
   it("refuses an empty turn", () => {

@@ -144,11 +144,16 @@ function formatPullRequest(pullRequest: PullRequest, repo: string): string {
 - Title: ${pullRequest.title}
 - Author: @${pullRequest.author?.login ?? "unknown"} (${pullRequest.authorAssociation})
 - Base branch: ${pullRequest.baseRefName}
+- Base SHA: ${pullRequest.baseRefOid}
 - Head SHA: ${pullRequest.headRefOid}
 - From a fork: ${pullRequest.isCrossRepository ? "yes" : "no"}
-- Labels: ${labels.length > 0 ? labels : "none"}
-- Changed files (${pullRequest.files.length}):
-${files.map((path) => `  - ${path}`).join("\n")}${overflow}`;
+- Labels: ${labels.length > 0 ? labels : "none"}${
+    // Files are fetched only for rules that filter on them, so an empty list
+    // means unlisted, not unchanged.
+    files.length > 0
+      ? `\n- Changed files (${pullRequest.files.length}):\n${files.map((path) => `  - ${path}`).join("\n")}${overflow}`
+      : ""
+  }`;
 }
 
 export function buildPrompt(context: DispatchContext): string {
@@ -167,6 +172,32 @@ in \`${rule.repo}\`.
 ${untrustedWarning}
 ${formatPullRequest(pullRequest, rule.repo)}
 ${priorBlock}
+## REVIEW INPUT CHECK
+
+BB was asked to create a fresh worktree at ${pullRequest.headRefOid}. Before
+reviewing files or posting findings, verify its inputs:
+
+- \`git rev-parse HEAD\` must equal \`${pullRequest.headRefOid}\`.
+- \`git status --porcelain --untracked-files=no\` must produce no output;
+  tracked files must match the commit after setup and include copying.
+- \`git cat-file -e "${pullRequest.baseRefOid}^{commit}"\` must resolve the
+  captured base. If it is absent, use
+  \`git fetch --no-tags git@github.com:${rule.repo}.git ${pullRequest.baseRefOid}\`
+  without changing HEAD or tracked files. Obtain
+  \`git merge-base ${pullRequest.baseRefOid} ${pullRequest.headRefOid}\`;
+  missing history or an unavailable merge-base means the inputs are incomplete.
+
+Inspect \`git diff ${pullRequest.baseRefOid}...${pullRequest.headRefOid}\` and full
+files at the captured head. Use this verified worktree or SHA-qualified
+\`git show ${pullRequest.headRefOid}:PATH\` for source reads. Do not use moving
+\`gh pr diff\` or switch to another checkout: those can mix different revisions.
+Do not repair a mismatched or dirty worktree to make these checks pass.
+
+If any check fails, stop without reviewing or posting to GitHub. End with
+\`Review incomplete: <input check failure>\` as plain text, without a SlopCop
+header or marker. This is not a no-findings result. Recheck HEAD and tracked
+cleanliness before posting findings or returning a clean review.
+
 ## YOUR REVIEW INSTRUCTIONS
 
 ${rule.prompt.trim()}
@@ -177,6 +208,7 @@ ${formatBodyContract(context)}
 
 ## FINISHING
 
+These review-body instructions apply only after the input checks pass.
 ${
   shadow
     ? `End your turn with the full review text you would have posted, formatted

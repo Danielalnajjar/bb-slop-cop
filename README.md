@@ -68,15 +68,22 @@ Three decisions do most of the work.
 
 ### The trust gate stops it running strangers' code
 
-Reviewing a PR means the agent runs `gh pr checkout` on that branch and reads the diff
-into its own prompt. For an untrusted PR that is arbitrary code execution plus a prompt
-injection surface, so rules default to **write access only**.
+Each review requests a fresh BB `git-worktree` at the captured PR head. Managed
+repository setup runs there, so input preparation requires **write access**.
+The agent checks HEAD, tracked-file cleanliness, captured base SHA, and merge-base
+before reading the pinned diff and full head files. A failed check returns plain
+`Review incomplete: <reason>` and records a cancelled, unreviewed run, not a clean
+summary. Missing head objects fail provisioning rather than falling back to the
+owner's checkout. Setup hooks, include copying, and agent compliance remain limits;
+this is not a hermetic input-integrity receipt.
 
 GitHub's `authorAssociation` is the signal, and its naming is a trap: **`CONTRIBUTOR`
 means "has had a commit merged before", not write access.** A literal "contributors
 only" filter still runs on a drive-by who landed one typo fix a year ago. Only
 `OWNER` / `MEMBER` / `COLLABORATOR` imply write access, so only those are trusted by
-default. `--trust past_contributors` and `--trust anyone` exist and are named honestly.
+default. `--trust past_contributors` and `--trust anyone` change matching, but do not
+authorize managed setup for other associations; forced dispatch does not bypass
+this preparation boundary either.
 
 Note that BB's permission modes are `full`, `auto`, and `accept-edits` — **none is
 read-only**. There is no "run the agent sandboxed" option, so the trust gate is the

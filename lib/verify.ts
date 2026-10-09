@@ -197,6 +197,12 @@ export async function verifyLive(options: {
   };
 }
 
+/** An explicit input-check failure is no verdict, not a clean review body. */
+export function incompleteReviewReason(finalMessage: string | null): string | null {
+  const match = /^Review incomplete:\s*([\s\S]*)$/u.exec((finalMessage ?? "").trim());
+  return match === null ? null : `review inputs incomplete: ${match[1].trim() || "input check failed"}`;
+}
+
 /**
  * The no-findings summary, which SlopCop posts rather than the agent.
  *
@@ -212,6 +218,7 @@ export function summaryToPost(options: {
   sha: string;
   finalMessage: string | null;
 }): string | null {
+  if (incompleteReviewReason(options.finalMessage) !== null) return null;
   const body = (options.finalMessage ?? "").trim();
   const marker = parseMarker(body);
   if (marker === null) return null;

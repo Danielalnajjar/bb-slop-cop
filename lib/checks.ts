@@ -105,7 +105,7 @@ export function outputFor(input: CompleteCheckInput): {
     case "cancelled":
       return {
         title: "Review cancelled",
-        summary: `SlopCop's review thread for \`${ruleName}\` ended before it reached a verdict on PR #${prNumber}; no findings recorded.${extra}`,
+        summary: `SlopCop's review thread for \`${ruleName}\` ended before it reached a verdict on PR #${prNumber}; ${commentCount > 0 ? `${commentCount} comment(s) recorded, review incomplete.` : "no findings recorded."}${extra}`,
       };
     default:
       return {

@@ -182,6 +182,7 @@ export function toPullRequest(raw: unknown): PullRequest {
     title: typeof row.title === "string" ? row.title : "",
     isDraft: row.draft === true,
     headRefOid: typeof head.sha === "string" ? head.sha : "",
+    baseRefOid: typeof base.sha === "string" ? base.sha : "",
     baseRefName: typeof base.ref === "string" ? base.ref : "",
     author: { login: String(asRecord(row.user).login ?? "") },
     authorAssociation:
