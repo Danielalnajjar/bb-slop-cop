@@ -147,9 +147,13 @@ function formatPullRequest(pullRequest: PullRequest, repo: string): string {
 - Base SHA: ${pullRequest.baseRefOid}
 - Head SHA: ${pullRequest.headRefOid}
 - From a fork: ${pullRequest.isCrossRepository ? "yes" : "no"}
-- Labels: ${labels.length > 0 ? labels : "none"}
-- Changed files (${pullRequest.files.length}):
-${files.map((path) => `  - ${path}`).join("\n")}${overflow}`;
+- Labels: ${labels.length > 0 ? labels : "none"}${
+    // Files are fetched only for rules that filter on them, so an empty list
+    // means unlisted, not unchanged.
+    files.length > 0
+      ? `\n- Changed files (${pullRequest.files.length}):\n${files.map((path) => `  - ${path}`).join("\n")}${overflow}`
+      : ""
+  }`;
 }
 
 export function buildPrompt(context: DispatchContext): string {

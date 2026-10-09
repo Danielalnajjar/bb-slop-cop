@@ -125,6 +125,25 @@ describe("home-relative paths", () => {
   });
 });
 
+describe("the pull request block", () => {
+  const prompt = (files: { path: string }[]) =>
+    buildPrompt({
+      rule: makeRule({ mode: "live" as const }),
+      pullRequest: makePr({ files }),
+      runId: "run_1",
+    });
+
+  it("lists fetched files", () => {
+    expect(prompt([{ path: "src/auth/session.go" }])).toContain(
+      "- Changed files (1):\n  - src/auth/session.go",
+    );
+  });
+
+  it("omits the list when no rule fetched it, rather than reporting zero files", () => {
+    expect(prompt([])).not.toContain("Changed files");
+  });
+});
+
 describe("bot posting command", () => {
   const context = (ghCommand?: string) => ({
     rule: makeRule({ mode: "live" as const }),
