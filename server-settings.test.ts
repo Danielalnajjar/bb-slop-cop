@@ -82,6 +82,7 @@ it.each([
     return undefined as never;
   }) as unknown as typeof execFile);
   const { bb, harness } = createFakePluginHost({ settings: pollSeconds === undefined || maxConcurrentReviews === undefined ? {} : { pollSeconds, maxConcurrentReviews } });
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
   let spawned = 0;
   harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: `thr_${++spawned}` }));
   try {
@@ -133,6 +134,7 @@ it.each([
     return undefined as never;
   }) as unknown as typeof execFile);
   const { bb, harness } = createFakePluginHost({ settings });
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
   harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: "thr_retry" }));
   try {
     await plugin(bb);

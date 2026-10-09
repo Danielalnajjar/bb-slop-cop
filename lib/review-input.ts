@@ -65,10 +65,18 @@ export async function buildReviewEnvironment(
     }
     machine = { type: "existing", hostId: existing.hostId };
   }
+  if (machine === undefined) {
+    const project = await sdk.projects.get({ projectId: request.projectId });
+    const defaults = project.sources.filter(source => source.isDefault);
+    if (defaults.length !== 1 || !defaults[0].hostId) {
+      throw new Error("review input preparation requires one resolvable default project source");
+    }
+    machine = { type: "existing", hostId: defaults[0].hostId };
+  }
   return {
     type: "provider",
     environmentProviderId: "git-worktree",
     inputs: { branch: { kind: "named", name: pullRequest.headRefOid } },
-    ...(machine === undefined ? {} : { machine }),
+    machine,
   };
 }
