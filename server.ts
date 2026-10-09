@@ -825,8 +825,31 @@ export default async function plugin(bb: BbPluginApi) {
     }
     inFlight = Math.max(0, inFlight - 1);
 
+    const runVerify = () =>
+      verifyLive({
+        gh,
+        repo: run.repo,
+        prNumber: run.prNumber,
+        ruleName: run.ruleName,
+        otherRuleNames: otherRuleNames(run),
+        isRecordedRun: (id) => store.getRun(id) !== null,
+        runId: run.id,
+        startedAt: run.startedAt,
+        authenticatedLogin: ghLogin,
+      });
+    const incompleteComments = async () => {
+      try {
+        const verified = await waitForWork(runVerify);
+        return verified.comments.filter(comment => comment.attribution === "marker");
+      } catch (error) {
+        watcherSignal?.throwIfAborted();
+        bb.log.warn(`could not record incomplete run ${run.id} comments: ${error instanceof Error ? error.message : String(error)}`);
+        return store.listComments(run.id);
+      }
+    };
     try {
-      noVerdict ??= incompleteReviewReason(finalMessage);
+      const incomplete = incompleteReviewReason(finalMessage);
+      noVerdict ??= incomplete;
       // The thread ended, errored, was retired, or was cancelled before
       // producing anything to verify. That is `cancelled`, however it happened
       // and whenever SlopCop learned of it: `failed` belongs to a review that
@@ -838,21 +861,14 @@ export default async function plugin(bb: BbPluginApi) {
           finishedAt: null,
         });
         announce();
+        if (incomplete !== null && run.mode === "live") {
+          const comments = await incompleteComments();
+          store.replaceComments(run.id, comments);
+          store.updateRun(run.id, { commentCount: comments.length });
+          announce();
+        }
         return;
       }
-
-      const runVerify = () =>
-        verifyLive({
-          gh,
-          repo: run.repo,
-          prNumber: run.prNumber,
-          ruleName: run.ruleName,
-          otherRuleNames: otherRuleNames(run),
-          isRecordedRun: (id) => store.getRun(id) !== null,
-          runId: run.id,
-          startedAt: run.startedAt,
-          authenticatedLogin: ghLogin,
-        });
 
       const result =
         run.mode === "shadow"
@@ -861,6 +877,20 @@ export default async function plugin(bb: BbPluginApi) {
               // GitHub's list endpoints can lag a just-submitted review, so a
               // bare no_comment gets one retry before it is believed.
               const first = await waitForWork(() => runVerify());
+              if (recoverLiveOutput && !first.comments.some(comment => comment.kind === "summary" && comment.attribution === "marker")) {
+                try {
+                  finalMessage = (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output;
+                } catch (error) {
+                  watcherSignal?.throwIfAborted();
+                  bb.log.warn(`could not read recovered run ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                const incomplete = incompleteReviewReason(finalMessage);
+                if (incomplete !== null) {
+                  store.updateRun(run.id, { status: "cancelled", detail: incomplete, finishedAt: null });
+                  announce();
+                  return { status: "cancelled" as const, detail: incomplete, comments: await incompleteComments() };
+                }
+              }
               if (first.status !== "no_comment") return first;
               await sleep(4_000, watcherSignal);
               const second = await waitForWork(() => runVerify());
@@ -871,18 +901,6 @@ export default async function plugin(bb: BbPluginApi) {
               // marker, not the agent's transcription of it — and re-verify,
               // because GitHub stays the source of truth for what landed.
               if (second.comments.length > 0) return second;
-              if (recoverLiveOutput) {
-                try {
-                  finalMessage = (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output;
-                } catch (error) {
-                  watcherSignal?.throwIfAborted();
-                  bb.log.warn(`could not read recovered run ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
-                }
-              }
-              const incomplete = incompleteReviewReason(finalMessage);
-              if (incomplete !== null) {
-                return { status: "cancelled" as const, detail: incomplete, comments: [] };
-              }
               const body = summaryToPost({
                 rule: run.ruleName,
                 runId: run.id,
@@ -1318,7 +1336,13 @@ export default async function plugin(bb: BbPluginApi) {
       const dispatched = await dispatch(rule, pullRequest, {
         forcedReason: result.matched ? null : result.reason,
       });
-      return { ...dispatched, blockedReason: null };
+      const run = store.getRun(dispatched.runId);
+      const rejected = dispatched.threadId === null && run !== null &&
+        (run.status === "cancelled" || run.status === "failed");
+      return {
+        ...dispatched,
+        blockedReason: rejected ? run.detail ?? "review preparation was rejected" : null,
+      };
     },
 
     status: async () => {

@@ -914,7 +914,8 @@ it.each([
       name: "exact-review", repo: "acme/widgets", visibility: "hidden",
       request: { projectId: "project", providerId: "codex", model: "test", reasoningLevel: "high", permissionMode: "full", input: [{ type: "text", text: "old draft" }], ...(environment === undefined ? {} : { environment }) },
     } }) as { rule: { id: string } };
-    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    const dispatched = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(dispatched).toMatchObject({ threadId: THREAD_ID, blockedReason: null });
     const spawns = harness.inspection.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(1);
     const request = spawns[0]![0] as Record<string, unknown>;
@@ -957,7 +958,10 @@ it.each(["spawn rejects", "provisioning fails after spawn"])("keeps the captured
       name: "exact-review", repo: "acme/widgets", mode: "live",
       request: { projectId: "project", providerId: "codex", model: "test", environment: { type: "project-default" } },
     } }) as { rule: { id: string } };
-    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    const dispatched = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(dispatched).toMatchObject({
+      blockedReason: failure === "spawn rejects" ? expect.stringContaining("captured head is unavailable") : null,
+    });
     if (failure === "provisioning fails after spawn") {
       await harness.behavior.emitThreadEvent("thread.failed", {
         thread: makeThreadResponse({ id: THREAD_ID, status: "error" }), error: "captured head is unavailable",
@@ -1009,7 +1013,8 @@ it.each(["write_access", "anyone"] as const)("does not execute managed preparati
       name: "exact-review", repo: "acme/widgets", authorTrust,
       request: { projectId: "project", providerId: "codex", model: "test" },
     } }) as { rule: { id: string } };
-    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7, force: true });
+    const dispatched = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7, force: true });
+    expect(dispatched).toMatchObject({ threadId: null, blockedReason: expect.stringContaining("write-access trusted") });
     expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", detail: expect.stringContaining("write-access trusted"), threadId: null });
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
   } finally {

@@ -52,11 +52,19 @@ let writes: { endpoint: string; body: unknown }[];
 let issueComments: unknown[];
 /** Inline review comments GitHub currently returns — the agent's findings. */
 let reviewComments: unknown[];
+let openPullRequests: unknown[];
+let commentReadError: Error | undefined;
+let deferCommentRead: boolean;
+let releaseCommentRead: (() => void) | undefined;
 
 beforeEach(() => {
   writes = [];
   issueComments = [];
   reviewComments = [];
+  openPullRequests = [];
+  commentReadError = undefined;
+  deferCommentRead = false;
+  releaseCommentRead = undefined;
 
   vi.mocked(execFile).mockImplementation(((
     _file: string,
@@ -67,6 +75,18 @@ beforeEach(() => {
     const endpoint = args[args.length - 1] ?? "";
     if (args.includes("user")) {
       callback(null, "slopcop-bot\n", "");
+      return undefined as never;
+    }
+    if (endpoint.includes("pulls?")) {
+      callback(null, JSON.stringify(openPullRequests), "");
+      return undefined as never;
+    }
+    if (endpoint.includes("/pulls/42/comments") && commentReadError !== undefined) {
+      callback(commentReadError, "", commentReadError.message);
+      return undefined as never;
+    }
+    if (endpoint.includes("/pulls/42/comments") && deferCommentRead) {
+      releaseCommentRead = () => callback(null, JSON.stringify(reviewComments), "");
       return undefined as never;
     }
     const rows = endpoint.includes("/issues/42/comments")
@@ -188,6 +208,119 @@ it("does not publish a recovered incomplete input check as a clean summary", asy
   } finally {
     service.controller.abort();
     await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each(["live event", "reload"])("retains posted findings and re-review eligibility after an incomplete %s", async (delivery) => {
+  vi.useFakeTimers();
+  reviewComments.push({
+    id: 91, body: decorateBody("**Already-published issue.** This finding remains actionable.", "inline", {
+      rule: "restraint-review", run: RUN_ID, sha: "abc123", kind: "inline",
+    }),
+    path: "lib/retry.ts", line: 12,
+    html_url: "https://github.com/acme/widgets/pull/42#discussion_r91",
+    user: { login: "slopcop-bot" }, created_at: new Date(2_000).toISOString(),
+  });
+  const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+  harness.inspection.sdk.stub("threads.queue.list", () => []);
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "idle" }));
+  harness.inspection.sdk.stub("threads.output", () => ({ output: `Review incomplete: supporting files were unavailable.\n${summaryBody()}` }));
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: "thr_retry", status: "starting" }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+    name: "restraint-review", repo: "acme/widgets", mode: "live", dedupe: "once_per_head_sha",
+    request: { projectId: "project", providerId: "codex", model: "test" },
+  } }) as { rule: { id: string } };
+  store.insertRun({ ...liveRun(), ruleId: rule.id });
+  let service: ReturnType<typeof harness.behavior.runService> | undefined;
+  try {
+    if (delivery === "reload") {
+      service = harness.behavior.runService("watcher");
+    } else {
+      await harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({ id: THREAD_ID, status: "idle" }),
+        lastAssistantText: `Review incomplete: supporting files were unavailable.\n${summaryBody()}`,
+      });
+    }
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await harness.behavior.callRpc("listRuns", {})).toMatchObject({ runs: [
+      { id: RUN_ID, status: "cancelled", commentCount: 1, finishedAt: expect.any(Number) },
+    ] });
+    expect(await harness.behavior.callRpc("getRunComments", { runId: RUN_ID })).toMatchObject({ comments: [
+      { githubId: "91", path: "lib/retry.ts", line: 12, attribution: "marker" },
+    ] });
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([]);
+    expect(writes.find(write => write.endpoint.includes("check-runs"))?.body).toMatchObject({
+      conclusion: "cancelled", output: { summary: expect.stringContaining("1 comment(s) recorded, review incomplete") },
+    });
+    store.markBootstrapped("acme/widgets", 1);
+    store.markSeen("acme/widgets", 42, "abc123", true, 1);
+    openPullRequests = [{
+      number: 42, title: "Ready again", draft: false,
+      head: { sha: "abc123" }, base: { ref: "main", sha: "base-sha" },
+      user: { login: "dana" }, author_association: "MEMBER", labels: [],
+    }];
+    if (service === undefined) service = harness.behavior.runService("watcher");
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    const retry = harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
+    expect(retry.prompt).toContain("Already-published issue");
+    expect(await harness.behavior.callRpc("listRuns", {})).toMatchObject({ runs: [
+      { status: "reviewing", threadId: "thr_retry" },
+      { id: RUN_ID, status: "cancelled", commentCount: 1 },
+    ] });
+  } finally {
+    service?.controller.abort();
+    if (service !== undefined) await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("keeps an explicit incomplete result cancelled when posted-comment verification is unavailable", async () => {
+  commentReadError = new Error("comment verification unavailable");
+  const { store, harness } = await finishThreadWith("Review incomplete: missing base history.");
+  try {
+    expect(store.findRunByThread(THREAD_ID)).toMatchObject({ status: "cancelled", commentCount: 0, finishedAt: expect.any(Number) });
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([]);
+    expect(writes.find(write => write.endpoint.includes("check-runs"))?.body).toMatchObject({ conclusion: "cancelled" });
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("records cancellation before waiting for incomplete-review comment bookkeeping", async () => {
+  vi.useFakeTimers();
+  deferCommentRead = true;
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("threads.queue.list", () => []);
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  store.insertRun(liveRun());
+  try {
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD_ID, status: "idle" }),
+      lastAssistantText: "Review incomplete: supporting files were unavailable.",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(releaseCommentRead).toBeTypeOf("function");
+    expect(await harness.behavior.callRpc("listRuns", {})).toMatchObject({ runs: [
+      { id: RUN_ID, status: "cancelled", finishedAt: null },
+    ] });
+    releaseCommentRead!();
+    releaseCommentRead = undefined;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await harness.behavior.callRpc("listRuns", {})).toMatchObject({ runs: [
+      { id: RUN_ID, status: "cancelled", finishedAt: expect.any(Number) },
+    ] });
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([]);
+  } finally {
+    releaseCommentRead?.();
+    await vi.advanceTimersByTimeAsync(0);
     await harness.lifecycle.dispose();
   }
 });
