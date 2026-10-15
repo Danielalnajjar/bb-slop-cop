@@ -203,22 +203,38 @@ export function toPullRequest(raw: unknown): PullRequest {
 }
 
 export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
-  const apiRows = async (endpoint: string): Promise<unknown[]> => {
-    const stdout = await run(
-      ghPath,
-      ["api", "--paginate", endpoint],
-      timeoutMs,
-    );
-    const parsed: unknown = JSON.parse(stdout);
-    return Array.isArray(parsed) ? parsed : [];
+  // Project in gh, before execFile buffers stdout: a page of diff_hunk or
+  // file patch fields can itself exceed the output guard.
+  const commentProjection = "map({id, body, html_url, user: {login: .user.login}, path, line, original_line, submitted_at, created_at})";
+  const pullRequestProjection = `map({
+    number, title, draft, user: {login: .user.login}, author_association,
+    head: {sha: .head.sha, repo: {full_name: .head.repo.full_name}},
+    base: {sha: .base.sha, ref: .base.ref, repo: {full_name: .base.repo.full_name}},
+    labels: [.labels[]? | {name}], updated_at
+  })`;
+  const apiRows = async (endpoint: string, projection: string): Promise<unknown[]> => {
+    const rows: unknown[] = [];
+    const separator = endpoint.includes("?") ? "&" : "?";
+    for (let page = 1; ; page++) {
+      const stdout = await run(
+        ghPath,
+        ["api", `${endpoint}${separator}per_page=100&page=${page}`, "--jq", projection],
+        timeoutMs,
+      );
+      const parsed: unknown = JSON.parse(stdout);
+      if (!Array.isArray(parsed)) return rows;
+      rows.push(...parsed);
+      if (parsed.length < 100) return rows;
+    }
   };
   const api = async (endpoint: string): Promise<GhComment[]> =>
-    (await apiRows(endpoint)).map(toComment);
+    (await apiRows(endpoint, commentProjection)).map(toComment);
 
   return {
     async listOpenPullRequests(repo) {
       const rows = await apiRows(
-        `repos/${repo}/pulls?state=open&per_page=100`,
+        `repos/${repo}/pulls?state=open`,
+        pullRequestProjection,
       );
       return rows.map(toPullRequest);
     },
@@ -234,7 +250,8 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
 
     async listFiles(repo, number) {
       const rows = await apiRows(
-        `repos/${repo}/pulls/${number}/files?per_page=100`,
+        `repos/${repo}/pulls/${number}/files`,
+        "map({filename})",
       );
       return rows.map((row) => ({
         path: String(asRecord(row).filename ?? ""),
