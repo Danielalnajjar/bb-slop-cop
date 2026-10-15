@@ -72,7 +72,7 @@ beforeEach(() => {
     _options: unknown,
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => {
-    const endpoint = args[args.length - 1] ?? "";
+    const endpoint = args.find((arg) => arg.startsWith("repos/")) ?? "";
     if (args.includes("user")) {
       callback(null, "slopcop-bot\n", "");
       return undefined as never;
