@@ -62,6 +62,7 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     title: "Rotate webhook signing secrets",
     isDraft: false,
     headRefOid: "a1b2c3d",
+    headRefName: "rotate-secrets",
     baseRefOid: "base-sha",
     baseRefName: "main",
     author: { login: "dana" },

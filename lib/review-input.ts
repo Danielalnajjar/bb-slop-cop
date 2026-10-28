@@ -73,10 +73,17 @@ export async function buildReviewEnvironment(
     }
     machine = { type: "existing", hostId: defaults[0].hostId };
   }
+  // The provider fetches a named `<remote>/<branch>` before `worktree add`,
+  // but not a bare SHA, so a head pushed from another machine was an invalid
+  // reference until something else fetched it. The prompt's input check still
+  // requires HEAD to equal the captured SHA. A fork's branch is not on origin.
+  const name = pullRequest.isCrossRepository || pullRequest.headRefName === ""
+    ? pullRequest.headRefOid
+    : `origin/${pullRequest.headRefName}`;
   return {
     type: "provider",
     environmentProviderId: "git-worktree",
-    inputs: { branch: { kind: "named", name: pullRequest.headRefOid } },
+    inputs: { branch: { kind: "named", name } },
     machine,
   };
 }

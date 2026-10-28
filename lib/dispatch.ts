@@ -174,7 +174,7 @@ ${formatPullRequest(pullRequest, rule.repo)}
 ${priorBlock}
 ## REVIEW INPUT CHECK
 
-BB was asked to create a fresh worktree at ${pullRequest.headRefOid}. Before
+BB was asked to create a fresh worktree at the PR head, ${pullRequest.headRefOid}. Before
 reviewing files or posting findings, verify its inputs:
 
 - \`git rev-parse HEAD\` must equal \`${pullRequest.headRefOid}\`.

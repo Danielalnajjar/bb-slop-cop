@@ -67,7 +67,7 @@ function stubGh(options: {
     number: 7,
     title: "A PR nobody is reviewing yet",
     draft: false,
-    head: { sha: "sha-7", repo: { full_name: options.fork ? "dana/widgets" : "acme/widgets" } },
+    head: { sha: "sha-7", ref: "feature-7", repo: { full_name: options.fork ? "dana/widgets" : "acme/widgets" } },
     base: { ref: "main", sha: options.baseSha === null ? undefined : options.baseSha ?? "base-7", repo: { full_name: "acme/widgets" } },
     user: { login: "dana" },
     author_association: options.association ?? "MEMBER",
@@ -970,7 +970,8 @@ it.each(["spawn rejects", "provisioning fails after spawn"])("keeps the captured
     expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", commentCount: 0, finishedAt: expect.any(Number) });
     const spawns = harness.inspection.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(1);
-    expect(spawns[0]![0]).toMatchObject({ environment: { type: "provider", environmentProviderId: "git-worktree", inputs: { branch: { kind: "named", name: "sha-7" } } } });
+    // A same-repo head is named by its origin branch so the provider fetches it.
+    expect(spawns[0]![0]).toMatchObject({ environment: { type: "provider", environmentProviderId: "git-worktree", inputs: { branch: { kind: "named", name: "origin/feature-7" } } } });
     expect(writes).toContainEqual(expect.objectContaining({ conclusion: "cancelled" }));
     expect(writes.some(write => "body" in write)).toBe(false);
   } finally {
