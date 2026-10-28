@@ -182,6 +182,7 @@ export function toPullRequest(raw: unknown): PullRequest {
     title: typeof row.title === "string" ? row.title : "",
     isDraft: row.draft === true,
     headRefOid: typeof head.sha === "string" ? head.sha : "",
+    headRefName: typeof head.ref === "string" ? head.ref : "",
     baseRefOid: typeof base.sha === "string" ? base.sha : "",
     baseRefName: typeof base.ref === "string" ? base.ref : "",
     author: { login: String(asRecord(row.user).login ?? "") },
@@ -208,7 +209,7 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const commentProjection = "map({id, body, html_url, user: {login: .user.login}, path, line, original_line, submitted_at, created_at})";
   const pullRequestProjection = `map({
     number, title, draft, user: {login: .user.login}, author_association,
-    head: {sha: .head.sha, repo: {full_name: .head.repo.full_name}},
+    head: {sha: .head.sha, ref: .head.ref, repo: {full_name: .head.repo.full_name}},
     base: {sha: .base.sha, ref: .base.ref, repo: {full_name: .base.repo.full_name}},
     labels: [.labels[]? | {name}], updated_at
   })`;
