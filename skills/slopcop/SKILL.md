@@ -78,6 +78,9 @@ bb slopcop rules edit|enable|disable|rm <rule>
 the single decisive reason (draft, trust gate, a specific condition). Polling
 never reviews a draft; `--include-draft` on `check` or `dispatch` lifts only that
 gate, so trust and conditions still decide, while `--force` lifts all of them.
+A draft-time run counts for dedupe: under `once_per_pr` it is the PR's one
+review, and under `once_per_head_sha` marking the PR ready on the same head does
+not review it again.
 
 ## Run statuses
 

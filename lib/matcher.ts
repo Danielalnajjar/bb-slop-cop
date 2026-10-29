@@ -146,7 +146,7 @@ function evaluateCondition(
  * untrusted PR is always the trust gate rather than an incidental path miss.
  * `includeDraft` lifts only the draft gate, for a caller that wants a draft
  * reviewed (`--include-draft`); trust and conditions still decide. Polling
- * never passes it, so drafts stay unreviewed until they are marked ready.
+ * never passes it. A run it starts counts for dedupe like any other run.
  */
 export function evaluateRule(
   rule: Rule,
