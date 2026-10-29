@@ -144,11 +144,15 @@ function evaluateCondition(
  * Evaluates a rule against a PR. Checks run cheapest-and-most-decisive first,
  * with the trust gate ahead of the conditions so the reason reported for an
  * untrusted PR is always the trust gate rather than an incidental path miss.
+ * `includeDraft` lifts only the draft gate, for a caller that wants a draft
+ * reviewed (`--include-draft`); trust and conditions still decide. Polling
+ * never passes it. A run it starts counts for dedupe like any other run.
  */
 export function evaluateRule(
   rule: Rule,
   pullRequest: PullRequest,
   trigger: Trigger,
+  options: { includeDraft?: boolean } = {},
 ): MatchResult {
   if (!rule.enabled) {
     return { matched: false, reason: "rule is disabled" };
@@ -156,7 +160,7 @@ export function evaluateRule(
   if (trigger !== "manual" && !rule.triggers.includes(trigger)) {
     return { matched: false, reason: `rule does not listen for ${trigger}` };
   }
-  if (pullRequest.isDraft) {
+  if (pullRequest.isDraft && options.includeDraft !== true) {
     return { matched: false, reason: "pull request is a draft" };
   }
   if (!isTrustedAuthor(pullRequest.authorAssociation, rule.authorTrust)) {
