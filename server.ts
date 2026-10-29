@@ -1213,7 +1213,12 @@ export default async function plugin(bb: BbPluginApi) {
     return rule;
   }
 
-  async function checkPr(rule: Rule, prNumber: number, expectedHead?: string) {
+  async function checkPr(
+    rule: Rule,
+    prNumber: number,
+    expectedHead?: string,
+    options: { includeDraft?: boolean } = {},
+  ) {
     let pullRequest: PullRequest;
     if (expectedHead === undefined) {
       pullRequest = await gh.getPullRequest(rule.repo, prNumber);
@@ -1238,7 +1243,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     await hydrateFiles([rule], rule.repo, pullRequest);
-    const result = evaluateRule(rule, pullRequest, "manual");
+    const result = evaluateRule(rule, pullRequest, "manual", options);
     return { pullRequest, result };
   }
 
@@ -1404,12 +1409,12 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "check",
         summary: "Dry-run a rule against a PR and explain the outcome",
-        usage: "bb slopcop check <id|name> <pr-number>",
+        usage: "bb slopcop check <id|name> <pr-number> [--include-draft]",
       },
       {
         name: "dispatch",
         summary: "Run a rule against a PR now",
-        usage: "bb slopcop dispatch <id|name> <pr-number> [--force] [--head <sha>]",
+        usage: "bb slopcop dispatch <id|name> <pr-number> [--force] [--include-draft] [--head <sha>]",
       },
       {
         name: "verify",
@@ -1744,9 +1749,10 @@ export default async function plugin(bb: BbPluginApi) {
           const rule = resolveRule(argv[1] ?? "");
           const prNumber = Number.parseInt(argv[2] ?? "", 10);
           if (!Number.isFinite(prNumber)) return fail("expected a PR number");
+          const includeDraft = has("include-draft");
 
           if (command === "check") {
-            const { pullRequest, result } = await checkPr(rule, prNumber);
+            const { pullRequest, result } = await checkPr(rule, prNumber, undefined, { includeDraft });
             const payload = {
               matched: result.matched,
               reason: result.matched ? null : result.reason,
@@ -1770,7 +1776,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (has("head") && (!expectedHead || expectedHead.startsWith("--"))) {
             return fail("--head requires the exact pushed commit SHA");
           }
-          const { pullRequest, result } = await checkPr(rule, prNumber, expectedHead);
+          const { pullRequest, result } = await checkPr(rule, prNumber, expectedHead, { includeDraft });
           if (!result.matched && !has("force")) {
             return fail(
               `'${rule.name}' does not match PR #${prNumber}: ${result.reason}\nRe-run with --force to dispatch anyway.`,

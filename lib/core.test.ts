@@ -519,6 +519,22 @@ describe("conditions", () => {
     ).toBe(false);
   });
 
+  it("reviews a draft only when asked, and still applies trust and conditions", () => {
+    const draft = makePr({ isDraft: true });
+    expect(evaluateRule(makeRule(), draft, "manual")).toEqual({
+      matched: false,
+      reason: "pull request is a draft",
+    });
+    expect(evaluateRule(makeRule(), draft, "manual", { includeDraft: true }).matched).toBe(true);
+    const elsewhere = makeRule({ conditions: [{ kind: "paths", globs: ["nothing/**"] }] });
+    expect(evaluateRule(elsewhere, draft, "manual", { includeDraft: true }).matched).toBe(false);
+    const stranger = makePr({ isDraft: true, authorAssociation: "NONE" });
+    expect(evaluateRule(makeRule(), stranger, "manual", { includeDraft: true })).toMatchObject({
+      matched: false,
+      blockedByTrust: true,
+    });
+  });
+
   it("honours the trigger the rule listens for, but manual always runs", () => {
     const rule = makeRule({ triggers: ["ready_for_review"] });
     expect(evaluateRule(rule, makePr(), "new_commits").matched).toBe(false);

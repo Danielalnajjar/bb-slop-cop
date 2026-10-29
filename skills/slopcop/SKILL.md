@@ -70,12 +70,14 @@ bb slopcop runs [--rule <r>] [--json]  # recent runs and their status
 bb slopcop show [run-id]               # the review body a run produced
 bb slopcop runs cancel <run-id>        # fail an unfinished run and stop its thread
 bb slopcop verify [run-id]             # re-check GitHub and complete the merge-box check
-bb slopcop dispatch <rule> <pr> [--force]
+bb slopcop dispatch <rule> <pr> [--force] [--include-draft]
 bb slopcop rules edit|enable|disable|rm <rule>
 ```
 
 `check` is the right tool for "why didn't SlopCop review my PR?" — it reports
-the single decisive reason (draft, trust gate, a specific condition).
+the single decisive reason (draft, trust gate, a specific condition). Polling
+never reviews a draft; `--include-draft` on `check` or `dispatch` lifts only that
+gate, so trust and conditions still decide, while `--force` lifts all of them.
 
 ## Run statuses
 

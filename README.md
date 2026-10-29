@@ -202,8 +202,8 @@ Two consequences worth knowing:
 | `bb slopcop rules` | List rules |
 | `bb slopcop rules add\|edit <rule>` | Create or update (see flags below) |
 | `bb slopcop rules enable\|disable\|rm <rule>` | Toggle or delete |
-| `bb slopcop check <rule> <pr>` | Dry run — match, or the exact reason it did not |
-| `bb slopcop dispatch <rule> <pr> [--force] [--head <sha>]` | Run now; with `--head`, wait up to 60 seconds for GitHub to report that exact commit or refuse without creating a run |
+| `bb slopcop check <rule> <pr> [--include-draft]` | Dry run — match, or the exact reason it did not |
+| `bb slopcop dispatch <rule> <pr> [--force] [--include-draft] [--head <sha>]` | Run now; with `--head`, wait up to 60 seconds for GitHub to report that exact commit or refuse without creating a run. `--include-draft` lifts only the draft gate (trust and conditions still apply), where `--force` lifts every gate |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
 | `bb slopcop runs cancel <run-id>` | Fail an unfinished run and stop its review thread |
 | `bb slopcop show [run-id]` | A run and the review body it produced |

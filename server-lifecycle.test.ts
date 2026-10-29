@@ -60,13 +60,14 @@ function stubGh(options: {
   baseSha?: string | null;
   association?: string;
   fork?: boolean;
+  draft?: boolean;
 } = {}): void {
   let polls = 0;
   let reads = 0;
   const pullRequest = {
     number: 7,
     title: "A PR nobody is reviewing yet",
-    draft: false,
+    draft: options.draft ?? false,
     head: { sha: "sha-7", ref: "feature-7", repo: { full_name: options.fork ? "dana/widgets" : "acme/widgets" } },
     base: { ref: "main", sha: options.baseSha === null ? undefined : options.baseSha ?? "base-7", repo: { full_name: "acme/widgets" } },
     user: { login: "dana" },
@@ -880,6 +881,33 @@ describe("manual dispatch head selection", () => {
       await harness.lifecycle.dispose();
     }
   });
+});
+
+it("reviews a draft by hand only with --include-draft", async () => {
+  stubGh({ draft: true });
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "draft-review", repo: "acme/widgets",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } });
+    expect((await harness.behavior.runCli(["check", "draft-review", "7"])).stdout)
+      .toBe("NO MATCH — pull request is a draft");
+    expect((await harness.behavior.runCli(["check", "draft-review", "7", "--include-draft"])).stdout)
+      .toContain("MATCH — 'draft-review' would review #7");
+    const refused = await harness.behavior.runCli(["dispatch", "draft-review", "7"]);
+    expect(refused.exitCode).toBe(1);
+    expect(store.listRuns({ limit: 10 })).toEqual([]);
+    const dispatched = await harness.behavior.runCli(["dispatch", "draft-review", "7", "--include-draft"]);
+    expect(dispatched.exitCode).toBe(0);
+    expect(store.listRuns({ limit: 10 })).toMatchObject([{ headSha: "sha-7", detail: null }]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
 });
 
 it.each([
