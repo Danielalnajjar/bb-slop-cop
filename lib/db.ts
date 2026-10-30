@@ -262,6 +262,40 @@ export function createStore(db: Database) {
       );
     },
 
+    /** Atomically reserve a review or record a skip naming the winning run. */
+    admitRun(run: Run, dedupe: Rule["dedupe"], force = false): Run {
+      // One write statement, not a read followed by a write: SQLite serializes
+      // this decision even for separate connections. Materialize the winner
+      // before inserting so every derived field uses the same prior run.
+      const headSha = dedupe === "once_per_head_sha" ? run.headSha : null;
+      const row = db.prepare(
+        `WITH winner AS MATERIALIZED (
+           SELECT id FROM runs
+           WHERE ? = 0 AND rule_id = ? AND repo = ? AND pr_number = ?
+             AND (? IS NULL OR head_sha = ?)
+             AND status NOT IN ('skipped', 'cancelled', 'failed')
+           ORDER BY started_at, id LIMIT 1
+         )
+         INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
+           pr_author, head_sha, status, mode, detail, thread_id, comment_count,
+           started_at, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+           CASE WHEN EXISTS (SELECT 1 FROM winner) THEN 'skipped' ELSE ? END,
+           ?,
+           CASE WHEN EXISTS (SELECT 1 FROM winner)
+             THEN 'already admitted by run ' || (SELECT id FROM winner) ELSE ? END,
+           ?, ?, ?,
+           CASE WHEN EXISTS (SELECT 1 FROM winner) THEN ? ELSE ? END)
+         RETURNING *`,
+      ).get(
+        force ? 1 : 0, run.ruleId, run.repo, run.prNumber, headSha, headSha,
+        run.id, run.ruleId, run.ruleName, run.repo, run.prNumber, run.prTitle,
+        run.prAuthor, run.headSha, run.status, run.mode, run.detail,
+        run.threadId, run.commentCount, run.startedAt, run.startedAt, run.finishedAt,
+      ) as Row;
+      return rowToRun(row);
+    },
+
     updateRun(
       id: string,
       patch: Partial<

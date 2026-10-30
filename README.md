@@ -248,6 +248,12 @@ reached no verdict, whether SlopCop saw the event live or reconciled it on
 start, so it completes its check as `cancelled` — and a cancelled run never
 dedupes away a later re-review of the same PR.
 
+Review admission is atomic in SQLite for polling, panel dispatch, and CLI
+dispatch. A duplicate attempt records a `skipped` run naming the run that
+already reserved or reviewed the tuple; it never starts a second thread.
+`--force` (or panel dispatch with `force`) bypasses dedupe as well as the rule
+matcher. Cancelled and failed runs do not prevent a later attempt.
+
 Thread lifecycle events are process-local, so a review thread that ended while
 the plugin was not loaded has no event left to fire. The watcher reconciles
 against BB once on start: a thread that errored, or was archived or deleted
