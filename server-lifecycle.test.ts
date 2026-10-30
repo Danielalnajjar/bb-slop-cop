@@ -883,6 +883,129 @@ describe("manual dispatch head selection", () => {
   });
 });
 
+it.each([["cli", "cli"], ["rpc", "rpc"], ["rpc", "cli"]] as const)("admits only one concurrent %s/%s dispatch for the same rule/PR/head", async (firstSurface, secondSurface) => {
+  stubGh();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "dedupe-review", repo: "acme/widgets", dedupe: "once_per_head_sha",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } }) as { rule: { id: string } };
+    const [first, second] = await Promise.all([
+      firstSurface === "rpc"
+        ? harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 })
+        : harness.behavior.runCli(["dispatch", "dedupe-review", "7"]),
+      secondSurface === "rpc"
+        ? harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 })
+        : harness.behavior.runCli(["dispatch", "dedupe-review", "7"]),
+    ]);
+    const runs = store.listRuns();
+    expect(runs.filter(run => run.status === "reviewing")).toHaveLength(1);
+    expect(runs.filter(run => run.status === "skipped")).toHaveLength(1);
+    const winner = runs.find(run => run.status === "reviewing")!;
+    const loser = runs.find(run => run.status === "skipped")!;
+    expect(loser).toMatchObject({ threadId: null, finishedAt: expect.any(Number), detail: expect.stringContaining(winner.id) });
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    // The losing caller can distinguish a recorded skip from a dispatched review.
+    const responses = JSON.stringify([first, second]);
+    expect(responses).toContain(loser.id);
+    expect(responses).toContain(loser.detail!);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("records a poller's duplicate skip while a manual review is still preparing", async () => {
+  vi.useFakeTimers();
+  stubGh({ readyPullRequest: true });
+  const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+  let releasePreparation!: (value: unknown) => void;
+  harness.inspection.sdk.stub("projects.get", () => new Promise(resolve => { releasePreparation = resolve; }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "dedupe-review", repo: "acme/widgets", dedupe: "once_per_head_sha",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } });
+    await vi.advanceTimersByTimeAsync(0); // Bootstrap with the draft PR.
+    const manual = harness.behavior.runCli(["dispatch", "dedupe-review", "7"]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.listRuns()).toMatchObject([{ status: "dispatched" }]);
+    const winner = store.listRuns()[0]!;
+    await vi.advanceTimersByTimeAsync(15_000); // PR becomes ready during preparation.
+    expect(store.listRuns().filter(run => run.status === "skipped")).toMatchObject([
+      { detail: expect.stringContaining(winner.id), threadId: null },
+    ]);
+    releasePreparation({ sources: [{ hostId: "host_default", isDefault: true }] });
+    await manual;
+    expect(store.getRun(winner.id)?.status).toBe("reviewing");
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("admits a re-review after cancelling the previous run on the same head", async () => {
+  stubGh();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+  harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "dedupe-review", repo: "acme/widgets", dedupe: "once_per_head_sha",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } }) as { rule: { id: string } };
+    const first = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 }) as { runId: string };
+    expect((await harness.behavior.runCli(["runs", "cancel", first.runId])).exitCode).toBe(0);
+    expect(store.getRun(first.runId)?.status).toBe("cancelled");
+    const second = await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 }) as { runId: string };
+    expect(store.getRun(second.runId)?.status).toBe("reviewing");
+    expect(store.listRuns().filter(run => run.status === "skipped")).toEqual([]);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each(["cli", "rpc"] as const)("allows an explicit forced %s re-review of an already admitted head", async (surface) => {
+  stubGh();
+  const { bb, harness } = createFakePluginHost();
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "dedupe-review", repo: "acme/widgets", dedupe: "once_per_head_sha",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } }) as { rule: { id: string } };
+    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    if (surface === "cli") {
+      expect((await harness.behavior.runCli(["dispatch", "dedupe-review", "7", "--force"])).exitCode).toBe(0);
+    } else {
+      expect(await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7, force: true })).toMatchObject({ threadId: THREAD_ID, blockedReason: null });
+    }
+    expect(store.listRuns()).toHaveLength(2);
+    expect(store.listRuns().every(run => run.status === "reviewing")).toBe(true);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
 it("reviews a draft by hand only with --include-draft", async () => {
   stubGh({ draft: true });
   const { bb, harness } = createFakePluginHost();

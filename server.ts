@@ -350,7 +350,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function dispatch(
     rule: Rule,
     pullRequest: PullRequest,
-    options: { forcedReason?: string | null } = {},
+    options: { forcedReason?: string | null; force?: boolean } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
     const { botGhPath, defaultThreadSection } = await readSettings();
     const runId = newId("run");
@@ -359,7 +359,7 @@ export default async function plugin(bb: BbPluginApi) {
     // record why on the run itself — otherwise the activity feed shows a
     // perfectly ordinary review and the override is invisible in hindsight.
     const forcedReason = options.forcedReason ?? null;
-    store.insertRun({
+    const reservation = store.admitRun({
       id: runId,
       ruleId: rule.id,
       ruleName: rule.name,
@@ -376,8 +376,9 @@ export default async function plugin(bb: BbPluginApi) {
       commentCount: 0,
       startedAt: now,
       finishedAt: null,
-    });
+    }, rule.dedupe, options.force);
     announce();
+    if (reservation.status === "skipped") return { runId, threadId: null };
 
     const throwIfDispatchAborted = () => {
       if (!watcherSignal?.aborted) return;
@@ -622,15 +623,6 @@ export default async function plugin(bb: BbPluginApi) {
               }
               continue;
             }
-            const alreadyRan = store.hasRunFor(
-              rule.id,
-              repo,
-              pullRequest.number,
-              rule.dedupe === "once_per_head_sha"
-                ? pullRequest.headRefOid
-                : null,
-            );
-            if (alreadyRan) continue;
             if (inFlight >= maxConcurrent) {
               bb.log.info(
                 `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
@@ -1340,10 +1332,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const dispatched = await dispatch(rule, pullRequest, {
         forcedReason: result.matched ? null : result.reason,
+        force,
       });
       const run = store.getRun(dispatched.runId);
       const rejected = dispatched.threadId === null && run !== null &&
-        (run.status === "cancelled" || run.status === "failed");
+        (run.status === "cancelled" || run.status === "failed" || run.status === "skipped");
       return {
         ...dispatched,
         blockedReason: rejected ? run.detail ?? "review preparation was rejected" : null,
@@ -1784,11 +1777,16 @@ export default async function plugin(bb: BbPluginApi) {
           }
           const dispatched = await dispatch(rule, pullRequest, {
             forcedReason: result.matched ? null : result.reason,
+            force: has("force"),
           });
+          const run = store.getRun(dispatched.runId);
+          const skippedReason = run?.status === "skipped" ? run.detail : null;
           return ok(
             json
-              ? JSON.stringify({ ...dispatched, headSha: pullRequest.headRefOid }, null, 2)
-              : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
+              ? JSON.stringify({ ...dispatched, headSha: pullRequest.headRefOid, skippedReason }, null, 2)
+              : skippedReason !== null
+                ? `Skipped ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${skippedReason}`
+                : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }
 
