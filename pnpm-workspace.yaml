@@ -9,6 +9,9 @@ enableGlobalVirtualStore: false
 minimumReleaseAgeExclude:
   - "@get-bb/plugin-sdk@0.5.9"
 
+overrides:
+  "@pierre/diffs": 1.2.11
+
 strictDepBuilds: true
 
 trustPolicy: no-downgrade
