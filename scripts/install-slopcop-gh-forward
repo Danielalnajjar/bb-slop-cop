@@ -1,0 +1,11 @@
+#!/bin/sh
+# Install only the credential-free forwarding command, never the Pro's key/config.
+set -eu
+if [ "$(uname -s)" != Linux ]; then
+  echo 'Install the forwarding wrapper only on the Linux review machine.' >&2
+  exit 1
+fi
+source_file=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/slopcop-gh-forward
+# This is the existing botGhPath in saved SlopCop prompts. Keep it unchanged.
+install -d -m 755 /Users/danielalnajjar/.slopcop
+install -m 755 "$source_file" /Users/danielalnajjar/.slopcop/slopcop-gh

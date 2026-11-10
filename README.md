@@ -284,6 +284,53 @@ Two things worth knowing before changing storage or GitHub reads:
 - **`gh pr list --json` has no `authorAssociation` field.** It only exists in the REST
   API, which is why all PR reads go through `gh api`.
 
+### Review workers on WSL
+
+The bot key and `app.json` remain on the Pro. For a WSL review machine,
+`scripts/slopcop-gh-forward` is a credential-free replacement command: it sends
+argv as a JSON array, stdin, and local `gh api -F/--field`, `--input`, or
+`--body-file` file contents through the existing BB terminal route to
+`host_dmmpcn4wuu`. The Pro invokes its existing wrapper; encoded result pipes
+preserve stdout, stderr and its exit code despite the terminal's PTY.
+
+The plugin does not install its bot wrapper automatically; the Pro setup above
+copies it manually. Install the forwarding script from this checkout on WSL
+with the host's approved root-job mechanism:
+
+```sh
+scripts/install-slopcop-gh-forward
+```
+
+It installs `/Users/danielalnajjar/.slopcop/slopcop-gh` on WSL deliberately: that
+is the existing absolute `botGhPath` named by review prompts. This is only the
+forwarding executable, not a copied Pro home or credential directory. The
+root-owned parent requires the root installer. Do not run this installer on the
+Pro, and never copy `app.json`, the private key or the token cache to WSL.
+The installed command uses WSL's Node and BB CLI. It accepts the review command
+families `api`, `pr`, `issue`, and `slopcop-login`; credential, alias and extension
+commands are rejected rather than exposing the Pro's credential through commands
+such as `gh auth token`. No plugin reload is needed.
+
+Check the actual route on WSL:
+
+```sh
+/Users/danielalnajjar/.slopcop/slopcop-gh slopcop-login
+```
+
+For shadow proof without posting, set `SLOPCOP_FORWARD_DRY_RUN=1` for a single
+invocation with the shadow's body file and intended posting arguments. The Pro
+reconstructs the files and returns their encoded contents but does not invoke
+the bot wrapper. Remove the variable for ordinary use. Do not put dry-run mode
+in the installed environment or count it as live posting proof.
+
+A transport error, a truncated or malformed reply, or an incomplete remote
+command exits nonzero. Do not automatically retry an ambiguous post: inspect
+the terminal ID reported by BB and verify GitHub first. This forwards only
+noninteractive commands; BB's argv transport is subject to OS argument-size
+limits. Credentials never travel to WSL. The BB terminal route is general
+machine command access, not a per-PR authorization boundary.
+
+
 ## License
 
 MIT
