@@ -295,26 +295,30 @@ preserve stdout, stderr and its exit code despite the terminal's PTY.
 
 The plugin does not install its bot wrapper automatically; the Pro setup above
 copies it manually. Install the forwarding script from this checkout on WSL
-with the host's approved root-job mechanism:
+as the WSL user, without sudo:
 
 ```sh
 scripts/install-slopcop-gh-forward
 ```
 
-It installs `/Users/danielalnajjar/.slopcop/slopcop-gh` on WSL deliberately: that
-is the existing absolute `botGhPath` named by review prompts. This is only the
-forwarding executable, not a copied Pro home or credential directory. The
-root-owned parent requires the root installer. Do not run this installer on the
-Pro, and never copy `app.json`, the private key or the token cache to WSL.
-The installed command uses WSL's Node and BB CLI. It accepts the review command
-families `api`, `pr`, `issue`, and `slopcop-login`; credential, alias and extension
-commands are rejected rather than exposing the Pro's credential through commands
-such as `gh auth token`. No plugin reload is needed.
+It installs only `$HOME/.slopcop/slopcop-gh`, owned by the WSL user. The Pro
+keeps its existing wrapper at the same home-relative path. The plugin renders a
+configured path under its own home as `~/.slopcop/slopcop-gh` in reviewer
+instructions while retaining the expanded Pro path for backend calls. Other
+absolute command paths remain unchanged. Rule prompts and review criteria are
+not rewritten. Deploying this plugin change requires the operator's reload;
+installing the WSL script does not.
+
+Do not run this installer on the Pro, and never copy `app.json`, the private key
+or the token cache to WSL. The installed command uses WSL's Node and BB CLI. It
+accepts the review command families `api`, `pr`, `issue`, and `slopcop-login`;
+credential, alias and extension commands are rejected rather than exposing the
+Pro's credential through commands such as `gh auth token`.
 
 Check the actual route on WSL:
 
 ```sh
-/Users/danielalnajjar/.slopcop/slopcop-gh slopcop-login
+~/.slopcop/slopcop-gh slopcop-login
 ```
 
 For shadow proof without posting, set `SLOPCOP_FORWARD_DRY_RUN=1` for a single

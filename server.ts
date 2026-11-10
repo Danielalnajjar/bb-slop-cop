@@ -24,7 +24,7 @@ import {
 import { markerRuleName } from "./lib/marker";
 import { collectPriorComments } from "./lib/prior";
 import { resolveThreadSectionId } from "./lib/sections";
-import { expandHome } from "./lib/paths";
+import { expandHome, homeRelative } from "./lib/paths";
 import {
   computeTriggers,
   describeTrust,
@@ -255,9 +255,10 @@ export default async function plugin(bb: BbPluginApi) {
       //
       // `execFile` does not expand `~`, but the agent's shell does — and the
       // two often run on different hosts with different home directories, so
-      // an absolute path cannot serve both. Store the tilde, expand it here.
+      // an absolute path cannot serve both. Render the own-home prefix as ~/
+      // for the worker and keep the expanded path for backend execution.
       ghPath: expandHome(botGhPath) || values.ghPath.trim() || "gh",
-      botGhPath,
+      botGhPath: homeRelative(botGhPath),
       defaultThreadSection: values.defaultThreadSection.trim(),
     };
   };

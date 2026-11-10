@@ -125,3 +125,14 @@ test("body envelopes larger than one BB argument retain their bytes across chunk
   const received = JSON.parse(forward(request, f.bb).stdout);
   assert.deepEqual(received.files, [body.toString("base64")]);
 });
+
+
+test("stdin-bearing flags require input even when the caller has a TTY", () => {
+  const body = Buffer.from("{\"body\":\"stdin remains data\"}\n");
+  for (const argv of [["api", "x", "--input", "-"], ["api", "x", "--input=-"], ["api", "x", "-F", "body=@-"], ["pr", "comment", "1", "--body-file", "-"]]) {
+    const request = makeRequest(argv, needsStdin => needsStdin ? body : Buffer.alloc(0));
+    assert.deepEqual(Buffer.from(request.stdin, "base64"), body);
+  }
+  const request = makeRequest(["api", "x", "-f", "literal=@-"], needsStdin => needsStdin ? body : Buffer.alloc(0));
+  assert.equal(request.stdin, "");
+});

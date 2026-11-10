@@ -6,6 +6,6 @@ if [ "$(uname -s)" != Linux ]; then
   exit 1
 fi
 source_file=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/slopcop-gh-forward
-# This is the existing botGhPath in saved SlopCop prompts. Keep it unchanged.
-install -d -m 755 /Users/danielalnajjar/.slopcop
-install -m 755 "$source_file" /Users/danielalnajjar/.slopcop/slopcop-gh
+# Match the Pro wrapper by home-relative name, without root or copied custody.
+install -d -m 700 "$HOME/.slopcop"
+install -m 755 "$source_file" "$HOME/.slopcop/slopcop-gh"

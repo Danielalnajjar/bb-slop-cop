@@ -33,7 +33,7 @@ import type { GhClient, GhComment } from "./gh";
 import type { RunStatus } from "./types";
 import type { PullRequest, Rule } from "./types";
 import { resolveThreadSectionId } from "./sections";
-import { expandHome } from "./paths";
+import { expandHome, homeRelative } from "./paths";
 
 function makeRule(overrides: Partial<Rule> = {}): Rule {
   return {
@@ -111,6 +111,12 @@ describe("home-relative paths", () => {
     );
   });
 
+  it("renders only the backend's own home prefix for the worker", () => {
+    expect(homeRelative("/Users/daniel/.slopcop/slopcop-gh", "/Users/daniel")).toBe("~/.slopcop/slopcop-gh");
+    expect(homeRelative("/Users/daniel-other/gh", "/Users/daniel")).toBe("/Users/daniel-other/gh");
+    expect(homeRelative("/usr/local/bin/gh", "/Users/daniel")).toBe("/usr/local/bin/gh");
+  });
+
   it("leaves absolute and bare commands alone", () => {
     expect(expandHome("/usr/local/bin/slopcop-gh", home)).toBe(
       "/usr/local/bin/slopcop-gh",
@@ -166,6 +172,13 @@ describe("bot posting command", () => {
     );
     expect(prompt).toContain("Plain `gh` is fine for reads.");
     expect(prompt).not.toContain("Post with `gh`.");
+  });
+
+  it("changes only the wrapper path in the generated review instructions", () => {
+    const path = "/Users/daniel/.slopcop/slopcop-gh";
+    expect(buildPrompt(context(homeRelative(path, "/Users/daniel")))).toBe(
+      buildPrompt(context(path)).replaceAll(path, "~/.slopcop/slopcop-gh"),
+    );
   });
 
   it("treats a blank wrapper setting as unset", () => {

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const PROTOCOL = "slopcop-forward-v1";
 const MACHINE = "host_dmmpcn4wuu";
-const WRAPPER = "/Users/danielalnajjar/.slopcop/slopcop-gh";
+const WRAPPER = "~/.slopcop/slopcop-gh";
 
 // This fixed program receives only a base64 JSON envelope as its argument.
 // Capturing the wrapper's pipes before encoding prevents PTY redraw/CR handling
@@ -14,7 +14,7 @@ const WRAPPER = "/Users/danielalnajjar/.slopcop/slopcop-gh";
 export const receiver = String.raw`
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 let directory;
 let reply;
@@ -33,7 +33,7 @@ try {
   const input = Buffer.from(request.stdin, "base64");
   const result = request.dryRun
     ? { status: 0, stdout: Buffer.from(JSON.stringify({ argv: request.argv, stdin: request.stdin, files })), stderr: Buffer.alloc(0) }
-    : spawnSync(request.wrapper, argv, { input, maxBuffer: 4 * 1024 * 1024, timeout: 60000 });
+    : spawnSync(request.wrapper.startsWith("~/") ? join(homedir(), request.wrapper.slice(2)) : request.wrapper, argv, { input, maxBuffer: 4 * 1024 * 1024, timeout: 60000 });
   reply = {
     protocol: "slopcop-forward-v1",
     exitCode: result.error || result.status === null ? 125 : result.status,
@@ -53,8 +53,10 @@ export function makeRequest(argv, stdin, read = readFileSync) {
     throw new Error("only api, slopcop-login, pr and issue commands are forwarded; credential and extension commands stay on the Pro");
   }
   const files = [];
+  let needsStdin = false;
   function file(index, prefix, path) {
-    if (path !== "-") files.push({ index, prefix, base64: read(path).toString("base64") });
+    if (path === "-") needsStdin = true;
+    else files.push({ index, prefix, base64: read(path).toString("base64") });
   }
   for (let i = 0; i < argv.length; i++) {
     const argument = argv[i];
@@ -78,7 +80,8 @@ export function makeRequest(argv, stdin, read = readFileSync) {
       if (flag) file(i, flag, argument.slice(flag.length));
     }
   }
-  return { argv, stdin: stdin.toString("base64"), files, wrapper: WRAPPER, dryRun: process.env.SLOPCOP_FORWARD_DRY_RUN === "1" };
+  const input = typeof stdin === "function" ? stdin(needsStdin) : stdin;
+  return { argv, stdin: input.toString("base64"), files, wrapper: WRAPPER, dryRun: process.env.SLOPCOP_FORWARD_DRY_RUN === "1" };
 }
 
 function bytes(value) {
@@ -114,7 +117,8 @@ export function forward(request, bb = process.env.BB_CLI || "bb") {
 
 function main() {
   try {
-    const request = makeRequest(process.argv.slice(2), process.stdin.isTTY ? Buffer.alloc(0) : readFileSync(0));
+    const request = makeRequest(process.argv.slice(2), (needsStdin) =>
+      process.stdin.isTTY && !needsStdin ? Buffer.alloc(0) : readFileSync(0));
     const result = forward(request);
     process.stdout.write(result.stdout);
     process.stderr.write(result.stderr);
