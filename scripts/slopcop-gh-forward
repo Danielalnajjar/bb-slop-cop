@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+// Forward the gh argv and local input files as data; bot custody stays on the Pro.
+import { spawnSync } from "node:child_process";
+import { readFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const PROTOCOL = "slopcop-forward-v1";
+const MACHINE = "host_dmmpcn4wuu";
+const WRAPPER = "~/.slopcop/slopcop-gh";
+
+// This fixed program receives only a base64 JSON envelope as its argument.
+// Capturing the wrapper's pipes before encoding prevents PTY redraw/CR handling
+// from changing its stdout, stderr, or a comment body.
+export const receiver = String.raw`
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
+let directory;
+let reply;
+try {
+  const request = JSON.parse(Buffer.from(process.argv.slice(1).join(""), "base64").toString("utf8"));
+  const argv = request.argv.slice();
+  const files = [];
+  if (request.files.length) directory = mkdtempSync(join(tmpdir(), "slopcop-forward-"));
+  for (const [number, file] of request.files.entries()) {
+    const path = join(directory, String(number));
+    const content = Buffer.from(file.base64, "base64");
+    writeFileSync(path, content, { mode: 0o600 });
+    argv[file.index] = file.prefix + path;
+    files.push({ index: file.index, base64: content.toString("base64") });
+  }
+  const input = Buffer.from(request.stdin, "base64");
+  const result = request.dryRun
+    ? { status: 0, stdout: Buffer.from(JSON.stringify({ argv: request.argv, stdin: request.stdin, files })), stderr: Buffer.alloc(0) }
+    : spawnSync(request.wrapper.startsWith("~/") ? join(homedir(), request.wrapper.slice(2)) : request.wrapper, argv, { input, maxBuffer: 4 * 1024 * 1024, timeout: 60000 });
+  reply = {
+    protocol: "slopcop-forward-v1",
+    exitCode: result.error || result.status === null ? 125 : result.status,
+    stdout: (result.stdout || Buffer.alloc(0)).toString("base64"),
+    stderr: (result.error ? Buffer.from("slopcop-gh: remote wrapper failed: " + result.error.message + "\n") : result.stderr || Buffer.alloc(0)).toString("base64"),
+  };
+} catch (error) {
+  reply = { protocol: "slopcop-forward-v1", exitCode: 125, stdout: "", stderr: Buffer.from("slopcop-gh: remote transport failed: " + error.message + "\n").toString("base64") };
+} finally {
+  if (directory) rmSync(directory, { recursive: true, force: true });
+}
+process.stdout.write(JSON.stringify(reply) + "\n");
+`;
+
+export function makeRequest(argv, stdin, read = readFileSync) {
+  if (!["api", "slopcop-login", "pr", "issue"].includes(argv[0])) {
+    throw new Error("only api, slopcop-login, pr and issue commands are forwarded; credential and extension commands stay on the Pro");
+  }
+  const files = [];
+  let needsStdin = false;
+  function file(index, prefix, path) {
+    if (path === "-") needsStdin = true;
+    else files.push({ index, prefix, base64: read(path).toString("base64") });
+  }
+  for (let i = 0; i < argv.length; i++) {
+    const argument = argv[i];
+    if (argv[0] !== "api" && argument === "-F") {
+      const path = argv[++i];
+      if (path !== undefined) file(i, "", path);
+    } else if (argv[0] !== "api" && argument.startsWith("-F")) {
+      file(i, "-F", argument.slice(2));
+    } else if (["-F", "--field"].includes(argument)) {
+      const value = argv[++i];
+      const at = value?.indexOf("=@") ?? -1;
+      if (at >= 0) file(i, value.slice(0, at + 2), value.slice(at + 2));
+    } else if (argument.startsWith("--field=") || argument.startsWith("-F")) {
+      const at = argument.indexOf("=@");
+      if (at >= 0) file(i, argument.slice(0, at + 2), argument.slice(at + 2));
+    } else if (["--input", "--body-file"].includes(argument)) {
+      const path = argv[++i];
+      if (path !== undefined) file(i, "", path);
+    } else {
+      const flag = ["--input=", "--body-file="].find((prefix) => argument.startsWith(prefix));
+      if (flag) file(i, flag, argument.slice(flag.length));
+    }
+  }
+  const input = typeof stdin === "function" ? stdin(needsStdin) : stdin;
+  return { argv, stdin: input.toString("base64"), files, wrapper: WRAPPER, dryRun: process.env.SLOPCOP_FORWARD_DRY_RUN === "1" };
+}
+
+function bytes(value) {
+  if (typeof value !== "string" || Buffer.from(value, "base64").toString("base64") !== value) {
+    throw new Error("invalid encoded output");
+  }
+  return Buffer.from(value, "base64");
+}
+
+export function decodeReply(text) {
+  const terminal = JSON.parse(text);
+  if (terminal.observation !== "exited" || terminal.exitCode !== 0 || terminal.truncated !== false || terminal.hostId !== MACHINE || typeof terminal.output !== "string") {
+    throw new Error(`remote command incomplete or truncated (terminal ${terminal.terminalId ?? "unknown"}); inspect it before retrying`);
+  }
+  const result = JSON.parse(terminal.output.trim());
+  if (result.protocol !== PROTOCOL || !Number.isInteger(result.exitCode) || result.exitCode < 0 || result.exitCode > 255) {
+    throw new Error("invalid remote reply");
+  }
+  return { exitCode: result.exitCode, stdout: bytes(result.stdout), stderr: bytes(result.stderr) };
+}
+
+export function forward(request, bb = process.env.BB_CLI || "bb") {
+  const result = spawnSync(bb, [
+    "terminal", "run", "--machine", MACHINE, "--json", "--timeout", "90s",
+    "--max-output-bytes", "4194304", "--", "node", "--input-type=module", "-e", receiver,
+    ...Buffer.from(JSON.stringify(request)).toString("base64").match(/.{1,8000}/g),
+  ], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 100000 });
+  if (result.error) throw new Error("BB transport failed; inspect the remote terminal before retrying");
+  const reply = decodeReply(result.stdout);
+  if (result.status !== 0) throw new Error("BB transport failed; inspect the remote terminal before retrying");
+  return reply;
+}
+
+function main() {
+  try {
+    const request = makeRequest(process.argv.slice(2), (needsStdin) =>
+      process.stdin.isTTY && !needsStdin ? Buffer.alloc(0) : readFileSync(0));
+    const result = forward(request);
+    process.stdout.write(result.stdout);
+    process.stderr.write(result.stderr);
+    process.exitCode = result.exitCode;
+  } catch (error) {
+    process.stderr.write(`slopcop-gh: ${error.message}\n`);
+    process.exitCode = 125;
+  }
+}
+
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

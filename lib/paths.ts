@@ -21,3 +21,10 @@ export function expandHome(path: string, home: string = homedir()): string {
   if (!path.startsWith("~/")) return path;
   return join(home, path.slice(2));
 }
+
+/** Render only this host's own home prefix portably for a review worker. */
+export function homeRelative(path: string, home: string = homedir()): string {
+  if (path === home) return "~";
+  if (!path.startsWith(`${home}/`)) return path;
+  return `~/${path.slice(home.length + 1)}`;
+}

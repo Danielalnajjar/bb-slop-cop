@@ -6,7 +6,7 @@
   "scripts": {
     "build": "bb plugin build .",
     "check": "pnpm typecheck && pnpm test && bb plugin types . --check && pnpm build",
-    "test": "vitest run",
+    "test": "node --test scripts/slopcop-gh-forward.check.mjs && vitest run",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

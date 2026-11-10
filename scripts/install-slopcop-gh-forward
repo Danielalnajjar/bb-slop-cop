@@ -1,0 +1,11 @@
+#!/bin/sh
+# Install only the credential-free forwarding command, never the Pro's key/config.
+set -eu
+if [ "$(uname -s)" != Linux ]; then
+  echo 'Install the forwarding wrapper only on the Linux review machine.' >&2
+  exit 1
+fi
+source_file=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/slopcop-gh-forward
+# Match the Pro wrapper by home-relative name, without root or copied custody.
+install -d -m 700 "$HOME/.slopcop"
+install -m 755 "$source_file" "$HOME/.slopcop/slopcop-gh"
