@@ -185,6 +185,7 @@ export interface PullRequest {
   isDraft: boolean;
   headRefOid: string;
   headRefName: string;
+  /** Merge base of the head and current base-branch tip; empty until review preparation. */
   baseRefOid: string;
   baseRefName: string;
   author: { login: string } | null;

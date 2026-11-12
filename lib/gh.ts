@@ -23,6 +23,7 @@ export class GhError extends Error {
 export interface GhClient {
   listOpenPullRequests(repo: string): Promise<PullRequest[]>;
   getPullRequest(repo: string, number: number): Promise<PullRequest>;
+  resolveMergeBase(repo: string, baseRef: string, headSha: string): Promise<string>;
   listFiles(repo: string, number: number): Promise<{ path: string }[]>;
   listIssueComments(repo: string, number: number): Promise<GhComment[]>;
   listReviewComments(repo: string, number: number): Promise<GhComment[]>;
@@ -183,7 +184,8 @@ export function toPullRequest(raw: unknown): PullRequest {
     isDraft: row.draft === true,
     headRefOid: typeof head.sha === "string" ? head.sha : "",
     headRefName: typeof head.ref === "string" ? head.ref : "",
-    baseRefOid: typeof base.sha === "string" ? base.sha : "",
+    // Captured only for an admitted review, never from stale REST base.sha.
+    baseRefOid: "",
     baseRefName: typeof base.ref === "string" ? base.ref : "",
     author: { login: String(asRecord(row.user).login ?? "") },
     authorAssociation:
@@ -210,7 +212,7 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const pullRequestProjection = `map({
     number, title, draft, user: {login: .user.login}, author_association,
     head: {sha: .head.sha, ref: .head.ref, repo: {full_name: .head.repo.full_name}},
-    base: {sha: .base.sha, ref: .base.ref, repo: {full_name: .base.repo.full_name}},
+    base: {ref: .base.ref, repo: {full_name: .base.repo.full_name}},
     labels: [.labels[]? | {name}], updated_at
   })`;
   const apiRows = async (endpoint: string, projection: string): Promise<unknown[]> => {
@@ -247,6 +249,23 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
         timeoutMs,
       );
       return toPullRequest(JSON.parse(stdout));
+    },
+
+    async resolveMergeBase(repo, baseRef, headSha) {
+      if (!baseRef || !headSha) {
+        throw new Error("review base capture requires a base branch and head SHA");
+      }
+      // Resolve the current base branch against the immutable captured PR head.
+      const baseRefOid = (await run(
+        ghPath,
+        ["api", `repos/${repo}/compare/${encodeURIComponent(baseRef)}...${encodeURIComponent(headSha)}`,
+          "--jq", ".merge_base_commit.sha // empty"],
+        timeoutMs,
+      )).trim();
+      if (!/^[a-f0-9]{40}$/i.test(baseRefOid)) {
+        throw new Error("GitHub compare did not return a valid review merge base SHA");
+      }
+      return baseRefOid;
     },
 
     async listFiles(repo, number) {

@@ -77,6 +77,10 @@ beforeEach(() => {
       callback(null, "slopcop-bot\n", "");
       return undefined as never;
     }
+    if (endpoint.includes("/compare/")) {
+      callback(null, "7777777777777777777777777777777777777777", "");
+      return undefined as never;
+    }
     if (endpoint.includes("pulls?")) {
       callback(null, JSON.stringify(openPullRequests), "");
       return undefined as never;

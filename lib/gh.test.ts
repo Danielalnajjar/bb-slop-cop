@@ -81,3 +81,54 @@ it("still rejects a single projected page larger than 16 MiB", async () => {
     await cleanup();
   }
 });
+
+it.each([
+  { read: "single", mergeBase: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+  { read: "list", mergeBase: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+  { read: "single", mergeBase: "" },
+  { read: "list", mergeBase: "" },
+  { read: "single", mergeBase: "not-a-sha" },
+])("captures the merge base without a stale fallback ($read, mergeBase=$mergeBase)", async ({ read, mergeBase }) => {
+  const dir = await mkdtemp(join(tmpdir(), "slopcop-gh-base-"));
+  try {
+    const executable = join(dir, "gh");
+    await writeFile(executable, `#!${process.execPath}
+const args = process.argv.slice(2);
+const endpoint = args[1];
+const pr = {number: 7, base: {ref: "release/current", sha: "stale-base"}, head: {sha: "pinned-head"}};
+if (endpoint === "repos/owner/repo/compare/release%2Fcurrent...pinned-head") {
+  const comparison = {
+    base_commit: {sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    merge_base_commit: {sha: ${JSON.stringify(mergeBase)}},
+  };
+  const projection = args[args.indexOf("--jq") + 1];
+  process.stdout.write(projection === ".merge_base_commit.sha // empty"
+    ? comparison.merge_base_commit.sha + "\\n"
+    : projection === ".base_commit.sha // empty"
+      ? comparison.base_commit.sha + "\\n"
+      : JSON.stringify(comparison));
+} else if (endpoint === "repos/owner/repo/pulls/7") {
+  process.stdout.write(JSON.stringify(pr));
+} else if (endpoint === "repos/owner/repo/pulls?state=open&per_page=100&page=1") {
+  process.stdout.write(JSON.stringify([pr]));
+} else {
+  process.stderr.write("Unexpected endpoint: " + endpoint);
+  process.exitCode = 1;
+}
+`, { mode: 0o755 });
+    const client = createGhClient(executable);
+    const pr = read === "single"
+      ? await client.getPullRequest("owner/repo", 7)
+      : (await client.listOpenPullRequests("owner/repo"))[0];
+    expect(pr.baseRefOid).toBe("");
+    const result = client.resolveMergeBase("owner/repo", pr.baseRefName, pr.headRefOid);
+    if (mergeBase !== "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
+      await expect(result).rejects.toThrow("GitHub compare did not return a valid review merge base SHA");
+      return;
+    }
+    expect(await result).toBe("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(pr.headRefOid).toBe("pinned-head");
+  } finally {
+    await rm(dir, { recursive: true });
+  }
+});

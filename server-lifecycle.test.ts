@@ -56,6 +56,7 @@ function stubGhLogin(): void {
  */
 function stubGh(options: {
   readyPullRequest?: boolean;
+  unrelatedDraft?: boolean;
   heads?: string[];
   baseSha?: string | null;
   association?: string;
@@ -64,12 +65,13 @@ function stubGh(options: {
 } = {}): void {
   let polls = 0;
   let reads = 0;
+  let capturedHead = options.heads?.[0] ?? "sha-7";
   const pullRequest = {
     number: 7,
     title: "A PR nobody is reviewing yet",
     draft: options.draft ?? false,
     head: { sha: "sha-7", ref: "feature-7", repo: { full_name: options.fork ? "dana/widgets" : "acme/widgets" } },
-    base: { ref: "main", sha: options.baseSha === null ? undefined : options.baseSha ?? "base-7", repo: { full_name: "acme/widgets" } },
+    base: { ref: "main", sha: "stale-base", repo: { full_name: "acme/widgets" } },
     user: { login: "dana" },
     author_association: options.association ?? "MEMBER",
     labels: [],
@@ -82,14 +84,23 @@ function stubGh(options: {
   ) => {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
-    else if (args.includes("repos/acme/widgets/pulls/7")) {
-      response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha:
-        options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7",
-      } });
+    else if (args.some((arg) => arg.includes("/compare/"))) {
+      if (!args.includes(`repos/acme/widgets/compare/main...${capturedHead}`)) {
+        callback(new Error("wrong captured comparison"), "", "");
+        return undefined as never;
+      }
+      response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
+    } else if (args.includes("repos/acme/widgets/pulls/7")) {
+      capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7";
+      response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       response =
         options.readyPullRequest === true
-          ? JSON.stringify([{ ...pullRequest, draft: ++polls === 1 }])
+          ? JSON.stringify([
+            { ...pullRequest, draft: ++polls === 1 },
+            ...(options.unrelatedDraft ? [{ ...pullRequest, number: 8, draft: true,
+              base: { ref: "deleted-stack" }, head: { sha: "unrelated-head" } }] : []),
+          ])
           : "[]";
     }
     callback(null, response, "");
@@ -743,7 +754,7 @@ describe("watcher shutdown", () => {
     }
   });
 
-  it.each(["login", "poll", "prior-comments", "spawn", "reconcile", "reconcile-output", "verify-retry", "poll-sleep"] as const)(
+  it.each(["login", "poll", "prior-comments", "merge-base", "spawn", "reconcile", "reconcile-output", "verify-retry", "poll-sleep"] as const)(
     "stops before the host deadline during %s and ignores late results",
     async (phase) => {
       vi.useFakeTimers();
@@ -754,7 +765,7 @@ describe("watcher shutdown", () => {
       let polls = 0;
       const pr = {
         number: 7, title: "Ready PR", draft: false,
-        head: { sha: "sha-7" }, base: { ref: "main", sha: "base-7" },
+        head: { sha: "sha-7" }, base: { ref: "main", sha: "7777777777777777777777777777777777777777" },
         user: { login: "dana" }, author_association: "MEMBER", labels: [],
       };
       vi.mocked(execFile).mockImplementation(((
@@ -763,10 +774,11 @@ describe("watcher shutdown", () => {
       ) => {
         const login = args.includes("user");
         const poll = args.some((arg) => arg.includes("pulls?"));
-        const response = login ? "test-user" : poll
+        const response = login ? "test-user" : args.some((arg) => arg.includes("/compare/")) ? "7777777777777777777777777777777777777777" : poll
           ? JSON.stringify([{ ...pr, draft: ++polls === 1 }]) : "[]";
         if ((phase === "login" && login) || (phase === "poll" && poll) ||
-          (phase === "prior-comments" && args.some((arg) => arg.includes("issues/7/comments")))) {
+          (phase === "prior-comments" && args.some((arg) => arg.includes("issues/7/comments"))) ||
+          (phase === "merge-base" && args.some((arg) => arg.includes("/compare/")))) {
           reached = true;
           release = () => callback(null, response, "");
         } else {
@@ -811,7 +823,7 @@ describe("watcher shutdown", () => {
       let stopped = false;
       void service.done.then(() => { stopped = true; });
       try {
-        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" ? 15_000 : phase === "reconcile-output" ? 4_000 : 0);
+        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" || phase === "merge-base" ? 15_000 : phase === "reconcile-output" ? 4_000 : 0);
         expect(reached).toBe(true);
         service.controller.abort();
         // BB's service stop deadline is 5,000 ms. No I/O is released here.
@@ -819,7 +831,7 @@ describe("watcher shutdown", () => {
         expect(stopped).toBe(true);
         await service.done;
         const runsAtStop = store.listRuns({});
-        if (phase === "spawn" || phase === "prior-comments") {
+        if (phase === "spawn" || phase === "prior-comments" || phase === "merge-base") {
           expect(runsAtStop).toHaveLength(1);
           expect(runsAtStop[0]).toMatchObject({
             status: "cancelled", threadId: null, finishedAt: null,
@@ -1081,7 +1093,7 @@ it.each([
     });
     expect(harness.inspection.sdk.callsTo("projects.get")).toEqual(usesDefault ? [[{ projectId: "project" }]] : []);
     expect(request).not.toHaveProperty("input");
-    // These values came from the captured API metadata, not main or a later head.
+    // Prompt and diff use the captured merge base and head, not PR base.sha or a later head.
     expect(request.prompt).toContain(`- Base SHA: ${base}`);
     expect(request.prompt).toContain(`git diff ${base}...${head}`);
     expect(request.prompt).toContain("- From a fork: yes");
@@ -1131,9 +1143,9 @@ it.each(["spawn rejects", "provisioning fails after spawn"])("keeps the captured
 });
 
 it.each([
-  { name: "missing base metadata", baseSha: null, environment: undefined },
-  { name: "malformed machine selection", baseSha: "base-7", environment: { type: "provider", environmentProviderId: "git-worktree", machine: { type: "existing", hostId: 7 } } },
-  { name: "unavailable reused environment", baseSha: "base-7", environment: { type: "reuse", environmentId: "env_missing" } },
+  { name: "missing merge base", baseSha: null, environment: undefined },
+  { name: "malformed machine selection", baseSha: "7777777777777777777777777777777777777777", environment: { type: "provider", environmentProviderId: "git-worktree", machine: { type: "existing", hostId: 7 } } },
+  { name: "unavailable reused environment", baseSha: "7777777777777777777777777777777777777777", environment: { type: "reuse", environmentId: "env_missing" } },
 ])("does not launch on fallback input after $name", async ({ baseSha, environment }) => {
   stubGh({ baseSha });
   const { bb, harness } = createFakePluginHost();
@@ -1236,6 +1248,39 @@ it.each([
     });
     expect(writes).toContainEqual(expect.objectContaining({ conclusion: "cancelled" }));
     expect(writes.some(write => "body" in write)).toBe(false);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("reviews a ready PR without comparing an unrelated draft or idle poll", async () => {
+  vi.useFakeTimers();
+  stubGh({ readyPullRequest: true, unrelatedDraft: true });
+  const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "matched-only", repo: "acme/widgets",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } });
+    expect(await harness.behavior.callRpc("checkPr", { ruleId: store.listRules()[0]!.id, prNumber: 7 }))
+      .toMatchObject({ matched: true });
+    const service = harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store.listRuns({})).toEqual([]);
+      expect(vi.mocked(execFile).mock.calls.some(call => call[1].some(arg => arg.includes("/compare/")))).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(store.listRuns({})).toMatchObject([{ prNumber: 7, status: "reviewing", threadId: THREAD_ID }]);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(vi.mocked(execFile).mock.calls.filter(call => call[1].some(arg => arg.includes("/compare/")))).toHaveLength(1);
+    } finally {
+      service.controller.abort();
+      await service.done;
+    }
   } finally {
     await harness.lifecycle.dispose();
   }

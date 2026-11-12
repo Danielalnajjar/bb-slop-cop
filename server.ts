@@ -433,13 +433,6 @@ export default async function plugin(bb: BbPluginApi) {
         }`,
       );
     }
-    const context = {
-      rule,
-      pullRequest,
-      runId,
-      ghCommand: botGhPath,
-      priorComments,
-    };
     let preparingInputs = false;
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
@@ -477,9 +470,22 @@ export default async function plugin(bb: BbPluginApi) {
       // thread.idle / thread.failed already run finishRun concurrently.
       await reportCheck("start", checkRun);
       preparingInputs = true;
+      const reviewPullRequest = {
+        ...pullRequest,
+        baseRefOid: await waitForWork(() =>
+          gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, pullRequest.headRefOid),
+        ),
+      };
       const environment = await waitForWork(() =>
-        buildReviewEnvironment(bb.sdk, rule.request!, pullRequest),
+        buildReviewEnvironment(bb.sdk, rule.request!, reviewPullRequest),
       );
+      const context = {
+        rule,
+        pullRequest: reviewPullRequest,
+        runId,
+        ghCommand: botGhPath,
+        priorComments,
+      };
       const prepared = store.getRun(runId);
       if (prepared !== null && !isReviewInProgress(prepared)) {
         return { runId, threadId: null };
