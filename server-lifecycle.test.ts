@@ -62,6 +62,8 @@ function stubGh(options: {
   association?: string;
   fork?: boolean;
   draft?: boolean;
+  pollHead?: () => string;
+  pollOpen?: () => boolean;
 } = {}): void {
   let polls = 0;
   let reads = 0;
@@ -94,10 +96,11 @@ function stubGh(options: {
       capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7";
       response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
+      capturedHead = options.pollHead?.() ?? "sha-7";
       response =
-        options.readyPullRequest === true
+        options.readyPullRequest === true && options.pollOpen?.() !== false
           ? JSON.stringify([
-            { ...pullRequest, draft: ++polls === 1 },
+            { ...pullRequest, head: { ...pullRequest.head, sha: capturedHead }, draft: ++polls === 1 },
             ...(options.unrelatedDraft ? [{ ...pullRequest, number: 8, draft: true,
               base: { ref: "deleted-stack" }, head: { sha: "unrelated-head" } }] : []),
           ])
@@ -299,42 +302,301 @@ describe("reconciling runs a restart stranded", () => {
     }
   });
 
-  it("counts a recovered running review against the concurrency cap", async () => {
+  it.each(["once_per_pr", "once_per_head_sha"] as const)("retries capacity-skipped rules without duplicate reviews (%s)", async (dedupe) => {
     vi.useFakeTimers();
-    stubGh({ readyPullRequest: true });
+    let headSha = "sha-7";
+    stubGh({ readyPullRequest: true, pollHead: () => headSha });
     const { bb, harness } = createFakePluginHost({
       settings: { pollSeconds: 15, maxConcurrentReviews: 1 },
     });
     harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     harness.inspection.sdk.stub("threads.get", () =>
       makeThreadResponse({ id: THREAD_ID, status: "active" }),
     );
+    let spawned = 0;
     harness.inspection.sdk.stub("threads.spawn", () =>
-      makeThreadResponse({ id: "thr_new" }),
+      makeThreadResponse({ id: `thr_new_${++spawned}` }),
     );
 
     try {
       await plugin(bb);
-      createStore(bb.storage.database() as never).insertRun(makeReviewRun());
-      await harness.behavior.callRpc("saveRule", {
-        id: null,
-        rule: {
-          name: "restraint-review",
-          repo: "acme/widgets",
-          request: { projectId: "project", providerId: "codex", model: "test" },
-        },
-      });
+      const store = createStore(bb.storage.database() as never);
+      store.insertRun(makeReviewRun());
+      for (const name of ["first-review", "second-review"]) {
+        await harness.behavior.callRpc("saveRule", {
+          id: null,
+          rule: {
+            name,
+            repo: "acme/widgets",
+            dedupe,
+            triggers: ["ready_for_review", "new_commits"],
+            request: { projectId: "project", providerId: "codex", model: "test" },
+          },
+        });
+      }
 
       const service = harness.behavior.runService("watcher");
-      await vi.advanceTimersByTimeAsync(0);
-      // The second poll sees PR #7 become ready for review.
-      await vi.advanceTimersByTimeAsync(15_000);
-      service.controller.abort();
-      await service.done;
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        // Bootstrap is a draft. The ready transition hits a full cap twice.
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        expect((await harness.behavior.runCli(["runs", "cancel", "run_1"])).exitCode).toBe(0);
 
-      // The recovered review still occupies the only slot, so the poll that
-      // sees PR #7 go ready has nothing to give it.
-      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        // Unchanged PR/head: one rule at a time gets the newly available slot.
+        for (const name of ["first-review", "second-review"]) {
+          await vi.advanceTimersByTimeAsync(15_000);
+          const run = store.listRuns({}).find(run => run.ruleName === name && run.status === "reviewing");
+          expect(run).toMatchObject({ prNumber: 7, headSha: "sha-7", threadId: expect.any(String) });
+          await harness.behavior.emitThreadEvent("thread.idle", {
+            thread: makeThreadResponse({ id: run!.threadId!, status: "idle" }),
+            lastAssistantText: `🚨 \`slopcop/${name}\` — No issues found.\n\n<!-- slopcop:rule=${name} run=${run!.id} sha=sha-7 kind=summary -->`,
+          });
+          await vi.advanceTimersByTimeAsync(0);
+          expect(store.getRun(run!.id)).toMatchObject({ status: "shadowed", finishedAt: expect.any(Number) });
+        }
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+        expect(store.listRuns({}).filter(run => run.prNumber === 7).map(run => run.status)).toEqual(["shadowed", "shadowed"]);
+
+        headSha = "sha-8";
+        for (const name of ["first-review", "second-review"]) {
+          await vi.advanceTimersByTimeAsync(15_000);
+          if (dedupe === "once_per_head_sha") {
+            const run = store.listRuns({}).find(run => run.ruleName === name && run.status === "reviewing")!;
+            expect(run).toMatchObject({ headSha: "sha-8" });
+            await harness.behavior.emitThreadEvent("thread.idle", {
+              thread: makeThreadResponse({ id: run.threadId!, status: "idle" }),
+              lastAssistantText: `🚨 \`slopcop/${name}\` — No issues found.\n\n<!-- slopcop:rule=${name} run=${run.id} sha=sha-8 kind=summary -->`,
+            });
+            await vi.advanceTimersByTimeAsync(0);
+          }
+        }
+        await vi.advanceTimersByTimeAsync(30_000);
+        const runs = store.listRuns({}).filter(run => run.prNumber === 7);
+        expect(runs).toHaveLength(4);
+        expect(runs.filter(run => run.status === "shadowed")).toHaveLength(dedupe === "once_per_pr" ? 2 : 4);
+        expect(runs.filter(run => run.status === "skipped")).toHaveLength(dedupe === "once_per_pr" ? 2 : 0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(dedupe === "once_per_pr" ? 2 : 4);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("does not respawn a cancelled rule while a sibling waits for capacity", async () => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true });
+    const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15, maxConcurrentReviews: 1 } });
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    let spawned = 0;
+    harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: `thr_new_${++spawned}` }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    try {
+      for (const name of ["first-review", "second-review"]) {
+        await harness.behavior.callRpc("saveRule", { id: null, rule: {
+          name, repo: "acme/widgets",
+          request: { projectId: "project", providerId: "codex", model: "test" },
+        } });
+      }
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(15_000);
+        const first = store.listRuns({})[0]!;
+        expect(first).toMatchObject({ ruleName: "first-review", status: "reviewing" });
+        expect((await harness.behavior.runCli(["runs", "cancel", first.id])).exitCode).toBe(0);
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(store.listRuns({})).toMatchObject([
+          { ruleName: "second-review", status: "reviewing" },
+          { ruleName: "first-review", status: "cancelled" },
+        ]);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("retains a fresh commit trigger while a ready rule is capacity-deferred across reload", async () => {
+    vi.useFakeTimers();
+    let headSha = "sha-7";
+    stubGh({ readyPullRequest: true, pollHead: () => headSha });
+    let host = createFakePluginHost({ settings: { pollSeconds: 15, maxConcurrentReviews: 1 } });
+    let spawned = 0;
+    const configure = () => {
+      host.harness.inspection.sdk.stub("threads.queue.list", () => []);
+      host.harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "active" }));
+      host.harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+      host.harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+      host.harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+      host.harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: `thr_reload_${++spawned}` }));
+    };
+    configure();
+    await plugin(host.bb);
+    try {
+      createStore(host.bb.storage.database() as never).insertRun(makeReviewRun());
+      for (const [name, trigger] of [["a-ready", "ready_for_review"], ["b-commits", "new_commits"]]) {
+        await host.harness.behavior.callRpc("saveRule", { id: null, rule: {
+          name, repo: "acme/widgets", triggers: [trigger],
+          request: { projectId: "project", providerId: "codex", model: "test" },
+        } });
+      }
+      const service = host.harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+      host = await host.harness.lifecycle.reload(plugin);
+      configure();
+      headSha = "sha-8";
+      const restarted = host.harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        expect((await host.harness.behavior.runCli(["runs", "cancel", "run_1"])).exitCode).toBe(0);
+        const store = createStore(host.bb.storage.database() as never);
+        for (const name of ["a-ready", "b-commits"]) {
+          await vi.advanceTimersByTimeAsync(15_000);
+          const run = store.listRuns({}).find(run => run.ruleName === name)!;
+          expect(run).toMatchObject({ status: "reviewing", headSha: "sha-8" });
+          expect((await host.harness.behavior.runCli(["runs", "cancel", run.id])).exitCode).toBe(0);
+        }
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(store.listRuns({}).filter(run => run.prNumber === 7)).toHaveLength(2);
+        expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+      } finally {
+        restarted.controller.abort();
+        await restarted.done;
+      }
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  });
+
+  it.each(["closed", "disabled", "trigger-removed"] as const)("discards capacity deferrals when %s before a slot frees", async (change) => {
+    vi.useFakeTimers();
+    let open = true;
+    stubGh({ readyPullRequest: true, pollOpen: () => open });
+    const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15, maxConcurrentReviews: 1 } });
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "active" }));
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+    harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: "thr_unwanted" }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    try {
+      store.insertRun(makeReviewRun());
+      const rule = {
+        name: "ready-review", repo: "acme/widgets",
+        request: { projectId: "project", providerId: "codex", model: "test" },
+      };
+      await harness.behavior.callRpc("saveRule", { id: null, rule });
+      const id = store.listRules()[0]!.id;
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(15_000);
+        if (change === "closed") open = false;
+        else if (change === "disabled") await harness.behavior.callRpc("setRuleEnabled", { id, enabled: false });
+        else await harness.behavior.callRpc("saveRule", { id, rule: { ...rule, triggers: ["new_commits"] } });
+        await vi.advanceTimersByTimeAsync(15_000);
+        open = true;
+        if (change === "disabled") await harness.behavior.callRpc("setRuleEnabled", { id, enabled: true });
+        expect((await harness.behavior.runCli(["runs", "cancel", "run_1"])).exitCode).toBe(0);
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        expect(store.listRuns({}).filter(run => run.prNumber === 7)).toEqual([]);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it.each(["rpc", "cli", "during-hydration"] as const)("consumes a capacity deferral on manual dispatch before cancellation (%s)", async (entry) => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true });
+    const ghReply = vi.mocked(execFile).getMockImplementation()!;
+    let blockHydration = false;
+    let releaseHydration: (() => void) | undefined;
+    vi.mocked(execFile).mockImplementation(((
+      file: string, args: string[], options: unknown,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      if (args.some(arg => arg.includes("/pulls/7/files"))) {
+        const respond = () => callback(null, '[{"filename":"src/index.ts"}]', "");
+        if (blockHydration) {
+          blockHydration = false;
+          releaseHydration = respond;
+        } else respond();
+        return undefined as never;
+      }
+      return Reflect.apply(ghReply, undefined, [file, args, options, callback]);
+    }) as unknown as typeof execFile);
+    const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15, maxConcurrentReviews: 1 } });
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "active" }));
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+    harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: "thr_manual" }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    try {
+      store.insertRun(makeReviewRun());
+      await harness.behavior.callRpc("saveRule", { id: null, rule: {
+        name: "ready-review", repo: "acme/widgets",
+        conditions: [{ kind: "paths", globs: ["src/**"] }],
+        request: { projectId: "project", providerId: "codex", model: "test" },
+      } });
+      const ruleId = store.listRules()[0]!.id;
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        if (entry === "during-hydration") {
+          blockHydration = true;
+          await vi.advanceTimersByTimeAsync(15_000);
+          expect(releaseHydration).toBeDefined();
+        }
+        if (entry === "cli") {
+          expect((await harness.behavior.runCli(["dispatch", ruleId, "7"])).exitCode).toBe(0);
+        } else {
+          expect(await harness.behavior.callRpc("dispatchNow", { ruleId, prNumber: 7 }))
+            .toMatchObject({ threadId: "thr_manual", blockedReason: null });
+        }
+        const manual = store.listRuns({}).find(run => run.prNumber === 7)!;
+        expect((await harness.behavior.runCli(["runs", "cancel", manual.id])).exitCode).toBe(0);
+        expect((await harness.behavior.runCli(["runs", "cancel", "run_1"])).exitCode).toBe(0);
+        releaseHydration?.();
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(store.listRuns({}).filter(run => run.prNumber === 7)).toMatchObject([
+          { id: manual.id, status: "cancelled" },
+        ]);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      } finally {
+        service.controller.abort();
+        releaseHydration?.();
+        await service.done;
+      }
     } finally {
       await harness.lifecycle.dispose();
     }

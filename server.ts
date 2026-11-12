@@ -353,6 +353,9 @@ export default async function plugin(bb: BbPluginApi) {
     pullRequest: PullRequest,
     options: { forcedReason?: string | null; force?: boolean } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
+    // Watcher, RPC and CLI attempts all consume this rule's capacity deferral,
+    // even when the attempted review later fails or is cancelled.
+    store.clearDeferredReview(rule.id, rule.repo, pullRequest.number);
     const { botGhPath, defaultThreadSection } = await readSettings();
     const runId = newId("run");
     const now = Date.now();
@@ -601,6 +604,14 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
 
+      const repoRules = rules.filter((candidate) => candidate.repo === repo);
+      const deferred = store.listDeferredReviews(repo);
+      for (const pending of deferred) {
+        if (!pullRequests.some(pr => pr.number === pending.prNumber && !pr.isDraft)) {
+          store.clearDeferredReview(pending.ruleId, repo, pending.prNumber);
+        }
+      }
+
       for (const pullRequest of pullRequests) {
         const triggers: Trigger[] = computeTriggers({
           seen: store.getSeen(repo, pullRequest.number),
@@ -615,15 +626,26 @@ export default async function plugin(bb: BbPluginApi) {
           pullRequest.isDraft,
           Date.now(),
         );
-        if (triggers.length === 0) continue;
+        const pending = pullRequest.isDraft
+          ? []
+          : deferred.filter(item => item.prNumber === pullRequest.number);
+        if (triggers.length === 0 && pending.length === 0) continue;
 
-        const repoRules = rules.filter((candidate) => candidate.repo === repo);
         await hydrateFiles(repoRules, repo, pullRequest);
 
         for (const rule of repoRules) {
-          for (const trigger of triggers) {
+          // A manual dispatch may have consumed this deferral while files loaded.
+          const deferredTrigger = pullRequest.isDraft
+            ? null
+            : store.getDeferredTrigger(rule.id, repo, pullRequest.number);
+          const ruleTriggers = [...new Set([
+            ...triggers,
+            ...(deferredTrigger === null ? [] : [deferredTrigger]),
+          ])];
+          for (const trigger of ruleTriggers) {
             const result = evaluateRule(rule, pullRequest, trigger);
             if (!result.matched) {
+              store.clearDeferredReview(rule.id, repo, pullRequest.number);
               if (result.blockedByTrust) {
                 recordSkip(rule, pullRequest, result.reason);
                 announce();
@@ -631,10 +653,11 @@ export default async function plugin(bb: BbPluginApi) {
               continue;
             }
             if (inFlight >= maxConcurrent) {
+              store.deferReview(rule.id, repo, pullRequest.number, trigger);
               bb.log.info(
                 `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
               );
-              continue;
+              break;
             }
             await dispatch(rule, pullRequest);
             break;
