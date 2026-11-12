@@ -245,6 +245,13 @@ export function createStore(db: Database) {
       ).run(ruleId, repo, prNumber, trigger);
     },
 
+    getDeferredTrigger(ruleId: string, repo: string, prNumber: number): Trigger | null {
+      const row = db.prepare(
+        `SELECT trigger FROM deferred_reviews WHERE rule_id = ? AND repo = ? AND pr_number = ?`,
+      ).get(ruleId, repo, prNumber) as Row | undefined;
+      return row === undefined ? null : text(row, "trigger") as Trigger;
+    },
+
     clearDeferredReview(ruleId: string, repo: string, prNumber: number): void {
       db.prepare(
         `DELETE FROM deferred_reviews WHERE rule_id = ? AND repo = ? AND pr_number = ?`,

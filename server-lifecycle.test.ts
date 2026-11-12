@@ -531,6 +531,77 @@ describe("reconciling runs a restart stranded", () => {
     }
   });
 
+  it.each(["rpc", "cli", "during-hydration"] as const)("consumes a capacity deferral on manual dispatch before cancellation (%s)", async (entry) => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true });
+    const ghReply = vi.mocked(execFile).getMockImplementation()!;
+    let blockHydration = false;
+    let releaseHydration: (() => void) | undefined;
+    vi.mocked(execFile).mockImplementation(((
+      file: string, args: string[], options: unknown,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      if (args.some(arg => arg.includes("/pulls/7/files"))) {
+        const respond = () => callback(null, '[{"filename":"src/index.ts"}]', "");
+        if (blockHydration) {
+          blockHydration = false;
+          releaseHydration = respond;
+        } else respond();
+        return undefined as never;
+      }
+      return Reflect.apply(ghReply, undefined, [file, args, options, callback]);
+    }) as unknown as typeof execFile);
+    const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15, maxConcurrentReviews: 1 } });
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "active" }));
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+    harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: "thr_manual" }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    try {
+      store.insertRun(makeReviewRun());
+      await harness.behavior.callRpc("saveRule", { id: null, rule: {
+        name: "ready-review", repo: "acme/widgets",
+        conditions: [{ kind: "paths", globs: ["src/**"] }],
+        request: { projectId: "project", providerId: "codex", model: "test" },
+      } });
+      const ruleId = store.listRules()[0]!.id;
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        if (entry === "during-hydration") {
+          blockHydration = true;
+          await vi.advanceTimersByTimeAsync(15_000);
+          expect(releaseHydration).toBeDefined();
+        }
+        if (entry === "cli") {
+          expect((await harness.behavior.runCli(["dispatch", ruleId, "7"])).exitCode).toBe(0);
+        } else {
+          expect(await harness.behavior.callRpc("dispatchNow", { ruleId, prNumber: 7 }))
+            .toMatchObject({ threadId: "thr_manual", blockedReason: null });
+        }
+        const manual = store.listRuns({}).find(run => run.prNumber === 7)!;
+        expect((await harness.behavior.runCli(["runs", "cancel", manual.id])).exitCode).toBe(0);
+        expect((await harness.behavior.runCli(["runs", "cancel", "run_1"])).exitCode).toBe(0);
+        releaseHydration?.();
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(store.listRuns({}).filter(run => run.prNumber === 7)).toMatchObject([
+          { id: manual.id, status: "cancelled" },
+        ]);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      } finally {
+        service.controller.abort();
+        releaseHydration?.();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("keeps a run open when BB can no longer describe its thread", async () => {
     vi.useFakeTimers();
     stubGhLogin();
