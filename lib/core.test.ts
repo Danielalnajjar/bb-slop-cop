@@ -576,6 +576,7 @@ function fakeGh(parts: {
   return {
     listOpenPullRequests: async () => [],
     getPullRequest: async () => makePr(),
+    resolveMergeBase: async () => "base-sha",
     listFiles: async () => [],
     listIssueComments: async () => parts.issues ?? [],
     listReviewComments: async () => parts.review ?? [],

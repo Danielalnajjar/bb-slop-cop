@@ -433,13 +433,6 @@ export default async function plugin(bb: BbPluginApi) {
         }`,
       );
     }
-    const context = {
-      rule,
-      pullRequest,
-      runId,
-      ghCommand: botGhPath,
-      priorComments,
-    };
     let preparingInputs = false;
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
@@ -477,9 +470,22 @@ export default async function plugin(bb: BbPluginApi) {
       // thread.idle / thread.failed already run finishRun concurrently.
       await reportCheck("start", checkRun);
       preparingInputs = true;
+      const reviewPullRequest = {
+        ...pullRequest,
+        baseRefOid: await waitForWork(() =>
+          gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, pullRequest.headRefOid),
+        ),
+      };
       const environment = await waitForWork(() =>
-        buildReviewEnvironment(bb.sdk, rule.request!, pullRequest),
+        buildReviewEnvironment(bb.sdk, rule.request!, reviewPullRequest),
       );
+      const context = {
+        rule,
+        pullRequest: reviewPullRequest,
+        runId,
+        ghCommand: botGhPath,
+        priorComments,
+      };
       const prepared = store.getRun(runId);
       if (prepared !== null && !isReviewInProgress(prepared)) {
         return { runId, threadId: null };
@@ -577,7 +583,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const repo of repos) {
       let pullRequests: PullRequest[];
       try {
-        pullRequests = await waitForWork(() => gh.listOpenPullRequests(repo, watcherSignal ?? undefined));
+        pullRequests = await waitForWork(() => gh.listOpenPullRequests(repo));
       } catch (error) {
         watcherSignal?.throwIfAborted();
         bb.log.warn(
@@ -1226,7 +1232,7 @@ export default async function plugin(bb: BbPluginApi) {
         : AbortSignal.any([watcherSignal, timeout.signal]);
       try {
         while (true) {
-          pullRequest = await waitForAbort(() => gh.getPullRequest(rule.repo, prNumber, signal), signal);
+          pullRequest = await waitForAbort(() => gh.getPullRequest(rule.repo, prNumber), signal);
           observedHead = pullRequest.headRefOid;
           if (observedHead === expectedHead) break;
           await sleep(2_000, signal);

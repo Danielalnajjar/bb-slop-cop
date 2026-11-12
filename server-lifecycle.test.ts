@@ -56,6 +56,7 @@ function stubGhLogin(): void {
  */
 function stubGh(options: {
   readyPullRequest?: boolean;
+  unrelatedDraft?: boolean;
   heads?: string[];
   baseSha?: string | null;
   association?: string;
@@ -64,6 +65,7 @@ function stubGh(options: {
 } = {}): void {
   let polls = 0;
   let reads = 0;
+  let capturedHead = options.heads?.[0] ?? "sha-7";
   const pullRequest = {
     number: 7,
     title: "A PR nobody is reviewing yet",
@@ -83,15 +85,22 @@ function stubGh(options: {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
     else if (args.some((arg) => arg.includes("/compare/"))) {
+      if (!args.includes(`repos/acme/widgets/compare/main...${capturedHead}`)) {
+        callback(new Error("wrong captured comparison"), "", "");
+        return undefined as never;
+      }
       response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
     } else if (args.includes("repos/acme/widgets/pulls/7")) {
-      response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha:
-        options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7",
-      } });
+      capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7";
+      response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       response =
         options.readyPullRequest === true
-          ? JSON.stringify([{ ...pullRequest, draft: ++polls === 1 }])
+          ? JSON.stringify([
+            { ...pullRequest, draft: ++polls === 1 },
+            ...(options.unrelatedDraft ? [{ ...pullRequest, number: 8, draft: true,
+              base: { ref: "deleted-stack" }, head: { sha: "unrelated-head" } }] : []),
+          ])
           : "[]";
     }
     callback(null, response, "");
@@ -745,7 +754,7 @@ describe("watcher shutdown", () => {
     }
   });
 
-  it.each(["login", "poll", "prior-comments", "spawn", "reconcile", "reconcile-output", "verify-retry", "poll-sleep"] as const)(
+  it.each(["login", "poll", "prior-comments", "merge-base", "spawn", "reconcile", "reconcile-output", "verify-retry", "poll-sleep"] as const)(
     "stops before the host deadline during %s and ignores late results",
     async (phase) => {
       vi.useFakeTimers();
@@ -768,7 +777,8 @@ describe("watcher shutdown", () => {
         const response = login ? "test-user" : args.some((arg) => arg.includes("/compare/")) ? "7777777777777777777777777777777777777777" : poll
           ? JSON.stringify([{ ...pr, draft: ++polls === 1 }]) : "[]";
         if ((phase === "login" && login) || (phase === "poll" && poll) ||
-          (phase === "prior-comments" && args.some((arg) => arg.includes("issues/7/comments")))) {
+          (phase === "prior-comments" && args.some((arg) => arg.includes("issues/7/comments"))) ||
+          (phase === "merge-base" && args.some((arg) => arg.includes("/compare/")))) {
           reached = true;
           release = () => callback(null, response, "");
         } else {
@@ -813,7 +823,7 @@ describe("watcher shutdown", () => {
       let stopped = false;
       void service.done.then(() => { stopped = true; });
       try {
-        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" ? 15_000 : phase === "reconcile-output" ? 4_000 : 0);
+        await vi.advanceTimersByTimeAsync(phase === "spawn" || phase === "prior-comments" || phase === "merge-base" ? 15_000 : phase === "reconcile-output" ? 4_000 : 0);
         expect(reached).toBe(true);
         service.controller.abort();
         // BB's service stop deadline is 5,000 ms. No I/O is released here.
@@ -821,7 +831,7 @@ describe("watcher shutdown", () => {
         expect(stopped).toBe(true);
         await service.done;
         const runsAtStop = store.listRuns({});
-        if (phase === "spawn" || phase === "prior-comments") {
+        if (phase === "spawn" || phase === "prior-comments" || phase === "merge-base") {
           expect(runsAtStop).toHaveLength(1);
           expect(runsAtStop[0]).toMatchObject({
             status: "cancelled", threadId: null, finishedAt: null,
@@ -1148,14 +1158,8 @@ it.each([
       name: "exact-review", repo: "acme/widgets",
       request: { projectId: "project", providerId: "codex", model: "test", ...(environment === undefined ? {} : { environment }) },
     } }) as { rule: { id: string } };
-    const dispatch = harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
-    if (baseSha === null) {
-      await expect(dispatch).rejects.toThrow("valid review merge base SHA");
-      expect(store.listRuns({ limit: 1 })).toEqual([]);
-    } else {
-      await dispatch;
-      expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", threadId: null, commentCount: 0, finishedAt: expect.any(Number) });
-    }
+    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", threadId: null, commentCount: 0, finishedAt: expect.any(Number) });
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
   } finally {
     await harness.lifecycle.dispose();
@@ -1244,6 +1248,39 @@ it.each([
     });
     expect(writes).toContainEqual(expect.objectContaining({ conclusion: "cancelled" }));
     expect(writes.some(write => "body" in write)).toBe(false);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("reviews a ready PR without comparing an unrelated draft or idle poll", async () => {
+  vi.useFakeTimers();
+  stubGh({ readyPullRequest: true, unrelatedDraft: true });
+  const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
+  harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+  harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: THREAD_ID }));
+  await plugin(bb);
+  const store = createStore(bb.storage.database() as never);
+  try {
+    await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: "matched-only", repo: "acme/widgets",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+    } });
+    expect(await harness.behavior.callRpc("checkPr", { ruleId: store.listRules()[0]!.id, prNumber: 7 }))
+      .toMatchObject({ matched: true });
+    const service = harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store.listRuns({})).toEqual([]);
+      expect(vi.mocked(execFile).mock.calls.some(call => call[1].some(arg => arg.includes("/compare/")))).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(store.listRuns({})).toMatchObject([{ prNumber: 7, status: "reviewing", threadId: THREAD_ID }]);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(vi.mocked(execFile).mock.calls.filter(call => call[1].some(arg => arg.includes("/compare/")))).toHaveLength(1);
+    } finally {
+      service.controller.abort();
+      await service.done;
+    }
   } finally {
     await harness.lifecycle.dispose();
   }
