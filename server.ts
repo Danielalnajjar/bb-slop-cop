@@ -601,6 +601,14 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
 
+      const repoRules = rules.filter((candidate) => candidate.repo === repo);
+      const deferred = store.listDeferredReviews(repo);
+      for (const pending of deferred) {
+        if (!pullRequests.some(pr => pr.number === pending.prNumber && !pr.isDraft)) {
+          store.clearDeferredReview(pending.ruleId, repo, pending.prNumber);
+        }
+      }
+
       for (const pullRequest of pullRequests) {
         const triggers: Trigger[] = computeTriggers({
           seen: store.getSeen(repo, pullRequest.number),
@@ -608,45 +616,47 @@ export default async function plugin(bb: BbPluginApi) {
           headSha: pullRequest.headRefOid,
           repoBootstrapped,
         });
-        let capacitySkipped = false;
-        try {
-          if (triggers.length === 0) continue;
+        store.markSeen(
+          repo,
+          pullRequest.number,
+          pullRequest.headRefOid,
+          pullRequest.isDraft,
+          Date.now(),
+        );
+        const pending = pullRequest.isDraft
+          ? []
+          : deferred.filter(item => item.prNumber === pullRequest.number);
+        if (triggers.length === 0 && pending.length === 0) continue;
 
-          const repoRules = rules.filter((candidate) => candidate.repo === repo);
-          await hydrateFiles(repoRules, repo, pullRequest);
+        await hydrateFiles(repoRules, repo, pullRequest);
 
-          for (const rule of repoRules) {
-            for (const trigger of triggers) {
-              const result = evaluateRule(rule, pullRequest, trigger);
-              if (!result.matched) {
-                if (result.blockedByTrust) {
-                  recordSkip(rule, pullRequest, result.reason);
-                  announce();
-                }
-                continue;
+        for (const rule of repoRules) {
+          const deferredTrigger = pending.find(item => item.ruleId === rule.id)?.trigger;
+          const ruleTriggers = [...new Set([
+            ...triggers,
+            ...(deferredTrigger === undefined ? [] : [deferredTrigger]),
+          ])];
+          // A dispatch attempt consumes only this rule's event, even if it fails
+          // or is later cancelled. Sibling rules keep their own deferrals.
+          store.clearDeferredReview(rule.id, repo, pullRequest.number);
+          for (const trigger of ruleTriggers) {
+            const result = evaluateRule(rule, pullRequest, trigger);
+            if (!result.matched) {
+              if (result.blockedByTrust) {
+                recordSkip(rule, pullRequest, result.reason);
+                announce();
               }
-              if (inFlight >= maxConcurrent) {
-                capacitySkipped = true;
-                bb.log.info(
-                  `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
-                );
-                continue;
-              }
-              await dispatch(rule, pullRequest);
+              continue;
+            }
+            if (inFlight >= maxConcurrent) {
+              store.deferReview(rule.id, repo, pullRequest.number, trigger);
+              bb.log.info(
+                `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+              );
               break;
             }
-          }
-        } finally {
-          // Keep the transition eligible until every matching rule gets a slot.
-          // Already-admitted rules still go through dispatch's atomic dedupe.
-          if (!capacitySkipped) {
-            store.markSeen(
-              repo,
-              pullRequest.number,
-              pullRequest.headRefOid,
-              pullRequest.isDraft,
-              Date.now(),
-            );
+            await dispatch(rule, pullRequest);
+            break;
           }
         }
       }

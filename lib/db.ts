@@ -90,6 +90,14 @@ export const MIGRATIONS: string[] = [
      repo TEXT PRIMARY KEY,
      bootstrapped_at INTEGER NOT NULL
    )`,
+  // Capacity deferrals belong to a rule, not the shared PR observation cursor.
+  `CREATE TABLE IF NOT EXISTS deferred_reviews (
+     rule_id TEXT NOT NULL,
+     repo TEXT NOT NULL,
+     pr_number INTEGER NOT NULL,
+     trigger TEXT NOT NULL,
+     PRIMARY KEY (rule_id, repo, pr_number)
+   )`,
 ];
 
 type Row = Record<string, unknown>;
@@ -209,10 +217,38 @@ export function createStore(db: Database) {
         rule.createdAt,
         rule.updatedAt,
       );
+      db.prepare(
+        `DELETE FROM deferred_reviews WHERE rule_id = ? AND (repo != ? OR ? = 0)`,
+      ).run(rule.id, rule.repo, rule.enabled ? 1 : 0);
     },
 
     deleteRule(id: string): void {
+      db.prepare(`DELETE FROM deferred_reviews WHERE rule_id = ?`).run(id);
       db.prepare(`DELETE FROM rules WHERE id = ?`).run(id);
+    },
+
+    listDeferredReviews(repo: string): {
+      ruleId: string; prNumber: number; trigger: Trigger;
+    }[] {
+      const rows = db.prepare(`SELECT * FROM deferred_reviews WHERE repo = ?`).all(repo) as Row[];
+      return rows.map(row => ({
+        ruleId: text(row, "rule_id"),
+        prNumber: num(row, "pr_number"),
+        trigger: text(row, "trigger") as Trigger,
+      }));
+    },
+
+    deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger): void {
+      db.prepare(
+        `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger) VALUES (?, ?, ?, ?)
+         ON CONFLICT(rule_id, repo, pr_number) DO UPDATE SET trigger = excluded.trigger`,
+      ).run(ruleId, repo, prNumber, trigger);
+    },
+
+    clearDeferredReview(ruleId: string, repo: string, prNumber: number): void {
+      db.prepare(
+        `DELETE FROM deferred_reviews WHERE rule_id = ? AND repo = ? AND pr_number = ?`,
+      ).run(ruleId, repo, prNumber);
     },
 
     listRuns(options: { ruleId?: string; limit?: number } = {}): Run[] {
