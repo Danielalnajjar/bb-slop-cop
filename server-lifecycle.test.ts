@@ -69,7 +69,7 @@ function stubGh(options: {
     title: "A PR nobody is reviewing yet",
     draft: options.draft ?? false,
     head: { sha: "sha-7", ref: "feature-7", repo: { full_name: options.fork ? "dana/widgets" : "acme/widgets" } },
-    base: { ref: "main", sha: options.baseSha === null ? undefined : options.baseSha ?? "base-7", repo: { full_name: "acme/widgets" } },
+    base: { ref: "main", sha: "stale-base", repo: { full_name: "acme/widgets" } },
     user: { login: "dana" },
     author_association: options.association ?? "MEMBER",
     labels: [],
@@ -82,7 +82,9 @@ function stubGh(options: {
   ) => {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
-    else if (args.includes("repos/acme/widgets/pulls/7")) {
+    else if (args.some((arg) => arg.includes("/compare/"))) {
+      response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
+    } else if (args.includes("repos/acme/widgets/pulls/7")) {
       response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha:
         options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7",
       } });
@@ -754,7 +756,7 @@ describe("watcher shutdown", () => {
       let polls = 0;
       const pr = {
         number: 7, title: "Ready PR", draft: false,
-        head: { sha: "sha-7" }, base: { ref: "main", sha: "base-7" },
+        head: { sha: "sha-7" }, base: { ref: "main", sha: "7777777777777777777777777777777777777777" },
         user: { login: "dana" }, author_association: "MEMBER", labels: [],
       };
       vi.mocked(execFile).mockImplementation(((
@@ -763,7 +765,7 @@ describe("watcher shutdown", () => {
       ) => {
         const login = args.includes("user");
         const poll = args.some((arg) => arg.includes("pulls?"));
-        const response = login ? "test-user" : poll
+        const response = login ? "test-user" : args.some((arg) => arg.includes("/compare/")) ? "7777777777777777777777777777777777777777" : poll
           ? JSON.stringify([{ ...pr, draft: ++polls === 1 }]) : "[]";
         if ((phase === "login" && login) || (phase === "poll" && poll) ||
           (phase === "prior-comments" && args.some((arg) => arg.includes("issues/7/comments")))) {
@@ -1081,7 +1083,7 @@ it.each([
     });
     expect(harness.inspection.sdk.callsTo("projects.get")).toEqual(usesDefault ? [[{ projectId: "project" }]] : []);
     expect(request).not.toHaveProperty("input");
-    // These values came from the captured API metadata, not main or a later head.
+    // Prompt and diff use the captured merge base and head, not PR base.sha or a later head.
     expect(request.prompt).toContain(`- Base SHA: ${base}`);
     expect(request.prompt).toContain(`git diff ${base}...${head}`);
     expect(request.prompt).toContain("- From a fork: yes");
@@ -1131,9 +1133,9 @@ it.each(["spawn rejects", "provisioning fails after spawn"])("keeps the captured
 });
 
 it.each([
-  { name: "missing base metadata", baseSha: null, environment: undefined },
-  { name: "malformed machine selection", baseSha: "base-7", environment: { type: "provider", environmentProviderId: "git-worktree", machine: { type: "existing", hostId: 7 } } },
-  { name: "unavailable reused environment", baseSha: "base-7", environment: { type: "reuse", environmentId: "env_missing" } },
+  { name: "missing merge base", baseSha: null, environment: undefined },
+  { name: "malformed machine selection", baseSha: "7777777777777777777777777777777777777777", environment: { type: "provider", environmentProviderId: "git-worktree", machine: { type: "existing", hostId: 7 } } },
+  { name: "unavailable reused environment", baseSha: "7777777777777777777777777777777777777777", environment: { type: "reuse", environmentId: "env_missing" } },
 ])("does not launch on fallback input after $name", async ({ baseSha, environment }) => {
   stubGh({ baseSha });
   const { bb, harness } = createFakePluginHost();
@@ -1146,8 +1148,14 @@ it.each([
       name: "exact-review", repo: "acme/widgets",
       request: { projectId: "project", providerId: "codex", model: "test", ...(environment === undefined ? {} : { environment }) },
     } }) as { rule: { id: string } };
-    await harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
-    expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", threadId: null, commentCount: 0, finishedAt: expect.any(Number) });
+    const dispatch = harness.behavior.callRpc("dispatchNow", { ruleId: rule.id, prNumber: 7 });
+    if (baseSha === null) {
+      await expect(dispatch).rejects.toThrow("valid review merge base SHA");
+      expect(store.listRuns({ limit: 1 })).toEqual([]);
+    } else {
+      await dispatch;
+      expect(store.listRuns({ limit: 1 })[0]).toMatchObject({ status: "cancelled", threadId: null, commentCount: 0, finishedAt: expect.any(Number) });
+    }
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
   } finally {
     await harness.lifecycle.dispose();

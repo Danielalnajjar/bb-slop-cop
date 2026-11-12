@@ -70,6 +70,7 @@ it.each([
   vi.mocked(execFile).mockImplementation(((_file: string, args: string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
+    else if (args.some(arg => arg.includes("/compare/"))) response = "7777777777777777777777777777777777777777";
     else if (args.some((arg: string) => arg.includes("pulls?"))) {
       polls += 1;
       response = JSON.stringify(Array.from({ length: 5 }, (_, index) => ({
@@ -126,6 +127,7 @@ it.each([
   vi.mocked(execFile).mockImplementation(((_file: string, args: string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
+    else if (args.some(arg => arg.includes("/compare/"))) response = "7777777777777777777777777777777777777777";
     else if (args.includes("repos/acme/widgets/pulls/42")) response = JSON.stringify(pullRequest);
     else if (args.some(arg => arg.includes("pulls?"))) {
       response = JSON.stringify([{ ...pullRequest, draft: ++polls === 1 }]);

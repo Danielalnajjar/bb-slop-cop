@@ -577,7 +577,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const repo of repos) {
       let pullRequests: PullRequest[];
       try {
-        pullRequests = await waitForWork(() => gh.listOpenPullRequests(repo));
+        pullRequests = await waitForWork(() => gh.listOpenPullRequests(repo, watcherSignal ?? undefined));
       } catch (error) {
         watcherSignal?.throwIfAborted();
         bb.log.warn(
@@ -1226,7 +1226,7 @@ export default async function plugin(bb: BbPluginApi) {
         : AbortSignal.any([watcherSignal, timeout.signal]);
       try {
         while (true) {
-          pullRequest = await waitForAbort(() => gh.getPullRequest(rule.repo, prNumber), signal);
+          pullRequest = await waitForAbort(() => gh.getPullRequest(rule.repo, prNumber, signal), signal);
           observedHead = pullRequest.headRefOid;
           if (observedHead === expectedHead) break;
           await sleep(2_000, signal);

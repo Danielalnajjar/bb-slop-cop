@@ -21,8 +21,8 @@ export class GhError extends Error {
 // trust gate is built on. REST omits the changed-file list, so files are
 // fetched separately and only when a rule actually needs them.
 export interface GhClient {
-  listOpenPullRequests(repo: string): Promise<PullRequest[]>;
-  getPullRequest(repo: string, number: number): Promise<PullRequest>;
+  listOpenPullRequests(repo: string, signal?: AbortSignal): Promise<PullRequest[]>;
+  getPullRequest(repo: string, number: number, signal?: AbortSignal): Promise<PullRequest>;
   listFiles(repo: string, number: number): Promise<{ path: string }[]>;
   listIssueComments(repo: string, number: number): Promise<GhComment[]>;
   listReviewComments(repo: string, number: number): Promise<GhComment[]>;
@@ -170,7 +170,7 @@ function toComment(raw: unknown): GhComment {
 }
 
 /** Maps a REST pull-request object onto the fields SlopCop evaluates. */
-export function toPullRequest(raw: unknown): PullRequest {
+function toPullRequest(raw: unknown, baseRefOid: string): PullRequest {
   const row = asRecord(raw);
   const head = asRecord(row.head);
   const base = asRecord(row.base);
@@ -183,7 +183,7 @@ export function toPullRequest(raw: unknown): PullRequest {
     isDraft: row.draft === true,
     headRefOid: typeof head.sha === "string" ? head.sha : "",
     headRefName: typeof head.ref === "string" ? head.ref : "",
-    baseRefOid: typeof base.sha === "string" ? base.sha : "",
+    baseRefOid,
     baseRefName: typeof base.ref === "string" ? base.ref : "",
     author: { login: String(asRecord(row.user).login ?? "") },
     authorAssociation:
@@ -210,7 +210,7 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const pullRequestProjection = `map({
     number, title, draft, user: {login: .user.login}, author_association,
     head: {sha: .head.sha, ref: .head.ref, repo: {full_name: .head.repo.full_name}},
-    base: {sha: .base.sha, ref: .base.ref, repo: {full_name: .base.repo.full_name}},
+    base: {ref: .base.ref, repo: {full_name: .base.repo.full_name}},
     labels: [.labels[]? | {name}], updated_at
   })`;
   const apiRows = async (endpoint: string, projection: string): Promise<unknown[]> => {
@@ -231,22 +231,44 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const api = async (endpoint: string): Promise<GhComment[]> =>
     (await apiRows(endpoint, commentProjection)).map(toComment);
 
+  const readPullRequest = async (repo: string, raw: unknown, signal?: AbortSignal): Promise<PullRequest> => {
+    signal?.throwIfAborted();
+    const row = asRecord(raw);
+    const baseRef = asRecord(row.base).ref;
+    const headSha = asRecord(row.head).sha;
+    if (typeof baseRef !== "string" || !baseRef || typeof headSha !== "string" || !headSha) {
+      throw new Error("review base capture requires a base branch and head SHA");
+    }
+    // PR base.sha can predate a merge of the base branch into a long-lived PR.
+    // Resolve the current base ref against this immutable head, never base.sha.
+    const baseRefOid = (await run(
+      ghPath,
+      ["api", `repos/${repo}/compare/${encodeURIComponent(baseRef)}...${encodeURIComponent(headSha)}`,
+        "--jq", ".merge_base_commit.sha // empty"],
+      timeoutMs,
+    )).trim();
+    if (!/^[a-f0-9]{40}$/i.test(baseRefOid)) {
+      throw new Error("GitHub compare did not return a valid review merge base SHA");
+    }
+    return toPullRequest(raw, baseRefOid);
+  };
+
   return {
-    async listOpenPullRequests(repo) {
+    async listOpenPullRequests(repo, signal) {
       const rows = await apiRows(
         `repos/${repo}/pulls?state=open`,
         pullRequestProjection,
       );
-      return rows.map(toPullRequest);
+      return Promise.all(rows.map((row) => readPullRequest(repo, row, signal)));
     },
 
-    async getPullRequest(repo, number) {
+    async getPullRequest(repo, number, signal) {
       const stdout = await run(
         ghPath,
         ["api", `repos/${repo}/pulls/${number}`],
         timeoutMs,
       );
-      return toPullRequest(JSON.parse(stdout));
+      return readPullRequest(repo, JSON.parse(stdout), signal);
     },
 
     async listFiles(repo, number) {

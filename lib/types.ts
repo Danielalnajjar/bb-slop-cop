@@ -185,6 +185,7 @@ export interface PullRequest {
   isDraft: boolean;
   headRefOid: string;
   headRefName: string;
+  /** Merge base of the captured head and the current base-branch tip. */
   baseRefOid: string;
   baseRefName: string;
   author: { login: string } | null;
