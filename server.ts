@@ -608,36 +608,45 @@ export default async function plugin(bb: BbPluginApi) {
           headSha: pullRequest.headRefOid,
           repoBootstrapped,
         });
-        store.markSeen(
-          repo,
-          pullRequest.number,
-          pullRequest.headRefOid,
-          pullRequest.isDraft,
-          Date.now(),
-        );
-        if (triggers.length === 0) continue;
+        let capacitySkipped = false;
+        try {
+          if (triggers.length === 0) continue;
 
-        const repoRules = rules.filter((candidate) => candidate.repo === repo);
-        await hydrateFiles(repoRules, repo, pullRequest);
+          const repoRules = rules.filter((candidate) => candidate.repo === repo);
+          await hydrateFiles(repoRules, repo, pullRequest);
 
-        for (const rule of repoRules) {
-          for (const trigger of triggers) {
-            const result = evaluateRule(rule, pullRequest, trigger);
-            if (!result.matched) {
-              if (result.blockedByTrust) {
-                recordSkip(rule, pullRequest, result.reason);
-                announce();
+          for (const rule of repoRules) {
+            for (const trigger of triggers) {
+              const result = evaluateRule(rule, pullRequest, trigger);
+              if (!result.matched) {
+                if (result.blockedByTrust) {
+                  recordSkip(rule, pullRequest, result.reason);
+                  announce();
+                }
+                continue;
               }
-              continue;
+              if (inFlight >= maxConcurrent) {
+                capacitySkipped = true;
+                bb.log.info(
+                  `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+                );
+                continue;
+              }
+              await dispatch(rule, pullRequest);
+              break;
             }
-            if (inFlight >= maxConcurrent) {
-              bb.log.info(
-                `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
-              );
-              continue;
-            }
-            await dispatch(rule, pullRequest);
-            break;
+          }
+        } finally {
+          // Keep the transition eligible until every matching rule gets a slot.
+          // Already-admitted rules still go through dispatch's atomic dedupe.
+          if (!capacitySkipped) {
+            store.markSeen(
+              repo,
+              pullRequest.number,
+              pullRequest.headRefOid,
+              pullRequest.isDraft,
+              Date.now(),
+            );
           }
         }
       }

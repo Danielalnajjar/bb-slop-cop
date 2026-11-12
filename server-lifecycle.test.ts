@@ -299,42 +299,67 @@ describe("reconciling runs a restart stranded", () => {
     }
   });
 
-  it("counts a recovered running review against the concurrency cap", async () => {
+  it.each(["once_per_pr", "once_per_head_sha"] as const)("retries capacity-skipped rules without duplicate reviews (%s)", async (dedupe) => {
     vi.useFakeTimers();
     stubGh({ readyPullRequest: true });
     const { bb, harness } = createFakePluginHost({
       settings: { pollSeconds: 15, maxConcurrentReviews: 1 },
     });
     harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
     harness.inspection.sdk.stub("threads.get", () =>
       makeThreadResponse({ id: THREAD_ID, status: "active" }),
     );
+    let spawned = 0;
     harness.inspection.sdk.stub("threads.spawn", () =>
-      makeThreadResponse({ id: "thr_new" }),
+      makeThreadResponse({ id: `thr_new_${++spawned}` }),
     );
 
     try {
       await plugin(bb);
-      createStore(bb.storage.database() as never).insertRun(makeReviewRun());
-      await harness.behavior.callRpc("saveRule", {
-        id: null,
-        rule: {
-          name: "restraint-review",
-          repo: "acme/widgets",
-          request: { projectId: "project", providerId: "codex", model: "test" },
-        },
-      });
+      const store = createStore(bb.storage.database() as never);
+      store.insertRun(makeReviewRun());
+      for (const name of ["first-review", "second-review"]) {
+        await harness.behavior.callRpc("saveRule", {
+          id: null,
+          rule: {
+            name,
+            repo: "acme/widgets",
+            dedupe,
+            request: { projectId: "project", providerId: "codex", model: "test" },
+          },
+        });
+      }
 
       const service = harness.behavior.runService("watcher");
-      await vi.advanceTimersByTimeAsync(0);
-      // The second poll sees PR #7 become ready for review.
-      await vi.advanceTimersByTimeAsync(15_000);
-      service.controller.abort();
-      await service.done;
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        // Bootstrap is a draft. The ready transition hits a full cap twice.
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        expect((await harness.behavior.runCli(["runs", "cancel", "run_1"])).exitCode).toBe(0);
 
-      // The recovered review still occupies the only slot, so the poll that
-      // sees PR #7 go ready has nothing to give it.
-      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        // Unchanged PR/head: one rule at a time gets the newly available slot.
+        for (const name of ["first-review", "second-review"]) {
+          await vi.advanceTimersByTimeAsync(15_000);
+          const run = store.listRuns({}).find(run => run.ruleName === name && run.status === "reviewing");
+          expect(run).toMatchObject({ prNumber: 7, headSha: "sha-7", threadId: expect.any(String) });
+          await harness.behavior.emitThreadEvent("thread.idle", {
+            thread: makeThreadResponse({ id: run!.threadId!, status: "idle" }),
+            lastAssistantText: `🚨 \`slopcop/${name}\` — No issues found.\n\n<!-- slopcop:rule=${name} run=${run!.id} sha=sha-7 kind=summary -->`,
+          });
+          await vi.advanceTimersByTimeAsync(0);
+          expect(store.getRun(run!.id)).toMatchObject({ status: "shadowed", finishedAt: expect.any(Number) });
+        }
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+        expect(store.listRuns({}).filter(run => run.status === "shadowed")).toHaveLength(2);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
     } finally {
       await harness.lifecycle.dispose();
     }
