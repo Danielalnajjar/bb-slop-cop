@@ -265,12 +265,16 @@ operator" and stops the thread. Cancelling an already-finished run is refused.
 ## Development
 
 ```sh
-npm install
-npx vitest run     # matcher, markers, triggers, verification
-npx tsc --noEmit
+pnpm install --frozen-lockfile
+pnpm check        # types, tests, plugin contract, and bundle build
 bb plugin install .
 bb plugin dev      # rebuild + reload on save
 ```
+
+`dist/` is generated and ignored, not a source artifact. `pnpm build` writes
+it for local development; BB also builds path and Git-source plugins from source.
+Do not commit bundles: a consumer build can produce different bytes and leave a
+tracked change that prevents the consumer clone's fast-forward updater from running.
 
 The interesting logic is pure and unit-tested: `lib/matcher.ts` (globs, trust gate,
 trigger edges), `lib/marker.ts` (header/marker attribution), `lib/verify.ts` (the two
