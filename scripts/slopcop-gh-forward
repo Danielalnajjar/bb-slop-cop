@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// Forward the gh argv and local input files as data; bot custody stays on the Pro.
+// Forward the gh argv and local input files as data; bot custody stays on bb-vm.
 import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const PROTOCOL = "slopcop-forward-v1";
-const MACHINE = "host_dmmpcn4wuu";
+const MACHINE = "host_zux7fchqar";
 const WRAPPER = "~/.slopcop/slopcop-gh";
 
 // This fixed program receives only a base64 JSON envelope as its argument.
@@ -50,7 +50,7 @@ process.stdout.write(JSON.stringify(reply) + "\n");
 
 export function makeRequest(argv, stdin, read = readFileSync) {
   if (!["api", "slopcop-login", "pr", "issue"].includes(argv[0])) {
-    throw new Error("only api, slopcop-login, pr and issue commands are forwarded; credential and extension commands stay on the Pro");
+    throw new Error("only api, slopcop-login, pr and issue commands are forwarded; credential and extension commands stay on bb-vm");
   }
   const files = [];
   let needsStdin = false;

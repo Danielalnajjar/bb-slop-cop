@@ -23,7 +23,7 @@ process.exitCode = 7;
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 const result = spawnSync(args[args.indexOf("--") + 1], args.slice(args.indexOf("--") + 2), { maxBuffer: 8 * 1024 * 1024 });
-process.stdout.write(JSON.stringify({ hostId: "host_dmmpcn4wuu", observation: "exited", exitCode: result.status, truncated: false, output: result.stdout.toString("utf8") }));
+process.stdout.write(JSON.stringify({ hostId: "host_zux7fchqar", observation: "exited", exitCode: result.status, truncated: false, output: result.stdout.toString("utf8") }));
 `, { mode: 0o700 });
   return { directory, wrapper, bb };
 }
@@ -67,11 +67,12 @@ test("missing body file fails the CLI before a remote write can run", (t) => {
 
 test("incomplete, truncated and malformed replies are never a successful post", () => {
   const reply = { protocol: "slopcop-forward-v1", exitCode: 0, stdout: "", stderr: "" };
-  const result = { hostId: "host_dmmpcn4wuu", observation: "exited", exitCode: 0, truncated: false, output: JSON.stringify(reply) };
+  const result = { hostId: "host_zux7fchqar", observation: "exited", exitCode: 0, truncated: false, output: JSON.stringify(reply) };
   for (const value of [
     "not JSON", JSON.stringify({ ok: false, error: { code: "offline" } }),
     JSON.stringify({ ...result, observation: "timed-out", terminalId: "term_1234567890" }),
     JSON.stringify({ ...result, truncated: true }),
+    JSON.stringify({ ...result, hostId: "host_dmmpcn4wuu" }),
     JSON.stringify({ ...result, output: "not JSON" }),
     JSON.stringify({ ...result, output: JSON.stringify({ ...reply, stdout: "!bad" }) }),
   ]) assert.throws(() => decodeReply(value));
@@ -89,7 +90,7 @@ test("dry run reconstructs a would-post body without invoking the wrapper", (t) 
 });
 
 
-test("short body-file options on pr commands transfer the local file rather than a Pro path", () => {
+test("short body-file options on pr commands transfer the local file rather than a remote path", () => {
   for (const argv of [["pr", "comment", "1", "-F", "local.md"], ["pr", "comment", "1", "-Flocal.md"]]) {
     const request = makeRequest(argv, Buffer.alloc(0), () => Buffer.from("body"));
     assert.equal(request.files.length, 1);
@@ -135,4 +136,17 @@ test("stdin-bearing flags require input even when the caller has a TTY", () => {
   }
   const request = makeRequest(["api", "x", "-f", "literal=@-"], needsStdin => needsStdin ? body : Buffer.alloc(0));
   assert.equal(request.stdin, "");
+});
+
+// Replacing the VM signer with this forwarder would recurse on every bot post.
+test("installer refuses bb-vm without changing its signing wrapper", (t) => {
+  const f = fixture(t);
+  const bin = join(f.directory, "hostname");
+  writeFileSync(bin, "#!/bin/sh\necho bb-vm\n", { mode: 0o700 });
+  const result = spawnSync("sh", [resolve("scripts/install-slopcop-gh-forward")], {
+    encoding: "utf8", env: { ...process.env, HOME: f.directory, PATH: `${f.directory}:${process.env.PATH}` },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /retain its local signing wrapper/);
+  assert.ok(!existsSync(join(f.directory, ".slopcop")));
 });
