@@ -1,11 +1,16 @@
 #!/bin/sh
-# Install only the credential-free forwarding command, never the Pro's key/config.
+# Install only the credential-free forwarding command, never a key or config.
 set -eu
-if [ "$(uname -s)" != Linux ]; then
-  echo 'Install the forwarding wrapper only on the Linux review machine.' >&2
+case "$(uname -s)" in
+  Linux|Darwin) ;;
+  *) echo 'Install the forwarding wrapper on a Linux or Mac review machine.' >&2; exit 1 ;;
+esac
+# bb-vm owns the signing wrapper; replacing it would forward back to itself.
+if [ "$(hostname -s)" = bb-vm ]; then
+  echo 'bb-vm must retain its local signing wrapper.' >&2
   exit 1
 fi
 source_file=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/slopcop-gh-forward
-# Match the Pro wrapper by home-relative name, without root or copied custody.
+# Review threads use the same home-relative name on both machines.
 install -d -m 700 "$HOME/.slopcop"
 install -m 755 "$source_file" "$HOME/.slopcop/slopcop-gh"
