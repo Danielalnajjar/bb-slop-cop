@@ -4,9 +4,10 @@
 // concurrently. Complete prefers start's POST id: the check-run list can
 // lag, which would leave that in_progress row unpatched.
 import type { GhClient } from "./gh";
-import type { RunStatus } from "./types";
+import type { GateRunStatus, RunStatus } from "./types";
 
 export const CHECK_NAME = "SlopCop";
+const MAX_CHECK_SUMMARY_CHARS = 60_000;
 
 export type CheckConclusion =
   | "success"
@@ -122,11 +123,12 @@ function checkId(value: unknown): number | null {
 
 async function findCheckRunId(
   request: CheckRequest,
-  input: StartCheckInput,
+  input: Pick<StartCheckInput, "repo" | "sha" | "runId">,
+  checkName = CHECK_NAME,
 ): Promise<number | null> {
   const payload = await request(
     "GET",
-    `repos/${input.repo}/commits/${input.sha}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}&filter=all&per_page=100`,
+    `repos/${input.repo}/commits/${input.sha}/check-runs?check_name=${encodeURIComponent(checkName)}&filter=all&per_page=100`,
   );
   const rows = asRecord(payload).check_runs;
   if (!Array.isArray(rows)) return null;
@@ -186,6 +188,116 @@ export async function completeCheckRun(
       `repos/${input.repo}/check-runs/${existing}`,
       body,
     );
+    return;
+  }
+
+  await request("POST", `repos/${input.repo}/check-runs`, {
+    ...body,
+    head_sha: input.sha,
+    external_id: input.runId,
+    started_at: at,
+  });
+}
+
+export interface StartGateCheckInput {
+  checkName: string;
+  repo: string;
+  sha: string;
+  runId: string;
+  prNumber: number;
+}
+
+export interface CompleteGateCheckInput extends StartGateCheckInput {
+  status: GateRunStatus;
+  exitCode: number | null;
+  outputText: string;
+  checkRunId?: number | null;
+}
+
+export function gateConclusionFor(status: GateRunStatus): CheckConclusion | null {
+  switch (status) {
+    case "passed":
+      return "success";
+    case "failed":
+      return "failure";
+    case "error":
+      return "cancelled";
+    case "running":
+    case "skipped":
+      return null;
+  }
+}
+
+export function gateOutputFor(input: CompleteGateCheckInput): {
+  title: string;
+  summary: string;
+} {
+  const trimmed = input.outputText.trim();
+  const clipped =
+    trimmed.length > MAX_CHECK_SUMMARY_CHARS
+      ? `${trimmed.slice(0, MAX_CHECK_SUMMARY_CHARS)}\n… [truncated]`
+      : trimmed;
+  const block = clipped.length > 0 ? `\n\n\`\`\`text\n${clipped.replace(/```/g, "'''")}\n\`\`\`` : "";
+  switch (input.status) {
+    case "passed":
+      return {
+        title: "Check passed",
+        summary: `\`${input.checkName}\` passed on PR #${input.prNumber}.${block}`,
+      };
+    case "failed":
+      return {
+        title: `Check failed${input.exitCode === null ? "" : ` (exit ${input.exitCode})`}`,
+        summary: `\`${input.checkName}\` failed on PR #${input.prNumber}.${block}`,
+      };
+    default:
+      return {
+        title: "Check cancelled",
+        summary: `\`${input.checkName}\` could not complete on PR #${input.prNumber}.${block}`,
+      };
+  }
+}
+
+export async function startGateCheckRun(
+  request: CheckRequest,
+  input: StartGateCheckInput,
+): Promise<number | null> {
+  const created = await request("POST", `repos/${input.repo}/check-runs`, {
+    name: input.checkName,
+    head_sha: input.sha,
+    status: "in_progress",
+    external_id: input.runId,
+    details_url: prUrl(input.repo, input.prNumber),
+    started_at: new Date().toISOString(),
+    output: {
+      title: "Running check",
+      summary: `Running \`${input.checkName}\` on PR #${input.prNumber}.`,
+    },
+  });
+  return checkId(created);
+}
+
+export async function completeGateCheckRun(
+  request: CheckRequest,
+  input: CompleteGateCheckInput,
+): Promise<void> {
+  const conclusion = gateConclusionFor(input.status);
+  if (conclusion === null) return;
+
+  const at = new Date().toISOString();
+  const body = {
+    name: input.checkName,
+    status: "completed",
+    conclusion,
+    completed_at: at,
+    details_url: prUrl(input.repo, input.prNumber),
+    output: gateOutputFor(input),
+  };
+
+  const existing =
+    input.checkRunId ??
+    (await findCheckRunId(request, input, input.checkName));
+  if (existing !== null) {
+    await request("PATCH", `repos/${input.repo}/check-runs/${existing}`, body);
     return;
   }
 

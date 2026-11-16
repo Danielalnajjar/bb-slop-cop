@@ -195,3 +195,53 @@ export interface PullRequest {
   isCrossRepository: boolean;
   updatedAt: string;
 }
+
+export const gateNameSchema = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z0-9_.-]+$/, "expected check-run name without spaces")
+  .refine(
+    (name) => name.toLowerCase() !== "slopcop",
+    "check name 'SlopCop' is reserved for agent reviews",
+  );
+
+export const gateCheckSchema = z.object({
+  id: z.string(),
+  name: gateNameSchema,
+  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "expected owner/repo"),
+  enabled: z.boolean(),
+  mode: ruleModeSchema,
+  authorTrust: authorTrustSchema,
+  repoDir: z.string().min(1),
+  command: z.string().min(1),
+  timeoutSeconds: z.number().int().min(5).max(600),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+});
+export type GateCheck = z.infer<typeof gateCheckSchema>;
+
+export const gateRunStatusSchema = z.enum([
+  "running",
+  "passed",
+  "failed",
+  "skipped",
+  "error",
+]);
+export type GateRunStatus = z.infer<typeof gateRunStatusSchema>;
+
+export interface GateRun {
+  id: string;
+  gateId: string;
+  gateName: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  baseSha: string;
+  status: GateRunStatus;
+  mode: RuleMode;
+  exitCode: number | null;
+  output: string;
+  startedAt: number;
+  finishedAt: number | null;
+}
