@@ -126,6 +126,8 @@ export const MIGRATIONS: string[] = [
      mode TEXT NOT NULL DEFAULT 'shadow',
      exit_code INTEGER,
      output TEXT NOT NULL DEFAULT '',
+     check_run_id INTEGER,
+     attempts INTEGER NOT NULL DEFAULT 1,
      started_at INTEGER NOT NULL,
      finished_at INTEGER
    )`,
@@ -226,6 +228,8 @@ export function rowToGateRun(row: Row): GateRun {
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     exitCode: typeof row.exit_code === "number" ? row.exit_code : null,
     output: text(row, "output"),
+    checkRunId: typeof row.check_run_id === "number" ? row.check_run_id : null,
+    attempts: num(row, "attempts", 1),
     startedAt: num(row, "started_at"),
     finishedAt: typeof row.finished_at === "number" ? row.finished_at : null,
   };
@@ -636,24 +640,69 @@ export function createStore(db: Database) {
       run: GateRun,
       force = false,
     ): { run: GateRun; admitted: boolean } {
+      if (run.status === "running") {
+        const retried = db
+          .prepare(
+            `UPDATE gate_runs
+             SET pr_number = ?,
+                 base_sha = '',
+                 status = 'running',
+                 mode = ?,
+                 exit_code = NULL,
+                 output = '',
+                 attempts = CASE WHEN ? = 1 THEN 1 ELSE attempts + 1 END,
+                 started_at = ?,
+                 finished_at = NULL
+             WHERE id = (
+               SELECT id FROM gate_runs
+               WHERE gate_id = ? AND repo = ? AND head_sha = ?
+                 AND status = 'error'
+                 AND (
+                   ? = 1
+                   OR (
+                     attempts < 3
+                     AND NOT EXISTS (
+                       SELECT 1 FROM gate_runs AS settled
+                       WHERE settled.gate_id = ? AND settled.repo = ? AND settled.head_sha = ?
+                         AND settled.status IN ('running', 'passed', 'failed', 'skipped')
+                     )
+                   )
+                 )
+               ORDER BY started_at DESC, id DESC
+               LIMIT 1
+             )
+             RETURNING *`,
+          )
+          .get(
+            run.prNumber,
+            run.mode,
+            force ? 1 : 0,
+            run.startedAt,
+            run.gateId,
+            run.repo,
+            run.headSha,
+            force ? 1 : 0,
+            run.gateId,
+            run.repo,
+            run.headSha,
+          ) as Row | undefined;
+
+        if (retried !== undefined) {
+          return { run: rowToGateRun(retried), admitted: true };
+        }
+      }
+
       const inserted = db
         .prepare(
           `INSERT INTO gate_runs (
              id, gate_id, gate_name, repo, pr_number, head_sha, base_sha,
-             status, mode, exit_code, output, started_at, finished_at
+             status, mode, exit_code, output, check_run_id, attempts,
+             started_at, finished_at
            )
-           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-           WHERE ? = 1 OR (
-             NOT EXISTS (
-               SELECT 1 FROM gate_runs
-               WHERE gate_id = ? AND repo = ? AND head_sha = ?
-                 AND status IN ('running', 'passed', 'failed', 'skipped')
-             )
-             AND (
-               SELECT COUNT(*) FROM gate_runs
-               WHERE gate_id = ? AND repo = ? AND head_sha = ?
-                 AND status = 'error'
-             ) < 3
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE ? = 1 OR NOT EXISTS (
+             SELECT 1 FROM gate_runs
+             WHERE gate_id = ? AND repo = ? AND head_sha = ?
            )
            RETURNING *`,
         )
@@ -669,12 +718,11 @@ export function createStore(db: Database) {
           run.mode,
           run.exitCode,
           run.output,
+          run.checkRunId,
+          Math.max(1, run.attempts),
           run.startedAt,
           run.finishedAt,
           force ? 1 : 0,
-          run.gateId,
-          run.repo,
-          run.headSha,
           run.gateId,
           run.repo,
           run.headSha,
@@ -700,7 +748,10 @@ export function createStore(db: Database) {
     updateGateRun(
       id: string,
       patch: Partial<
-        Pick<GateRun, "baseSha" | "status" | "exitCode" | "output" | "finishedAt">
+        Pick<
+          GateRun,
+          "baseSha" | "status" | "exitCode" | "output" | "checkRunId" | "finishedAt"
+        >
       >,
     ): void {
       const sets: string[] = [];
@@ -720,6 +771,10 @@ export function createStore(db: Database) {
       if (patch.output !== undefined) {
         sets.push("output = ?");
         params.push(patch.output);
+      }
+      if (patch.checkRunId !== undefined) {
+        sets.push("check_run_id = ?");
+        params.push(patch.checkRunId);
       }
       if (patch.finishedAt !== undefined) {
         sets.push("finished_at = ?");

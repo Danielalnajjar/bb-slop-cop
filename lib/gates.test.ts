@@ -92,6 +92,8 @@ describe("gate schema, db admission, and check-run payloads", () => {
       mode: "live",
       exitCode: null,
       output: "",
+      checkRunId: null,
+      attempts: 1,
       startedAt: 10,
       finishedAt: null,
     });
@@ -122,7 +124,7 @@ describe("gate schema, db admission, and check-run payloads", () => {
     );
     expect(forced.admitted).toBe(true);
 
-    // Transient errors retry up to 3 attempts, then stop automatically.
+    // Transient errors reuse the SAME row id + checkRunId up to 3 attempts, then stop automatically.
     const headB = "2".repeat(40);
     for (let attempt = 1; attempt <= 3; attempt++) {
       const adm = store.admitGateRun({
@@ -132,7 +134,14 @@ describe("gate schema, db admission, and check-run payloads", () => {
         startedAt: 20 + attempt,
       });
       expect(adm.admitted).toBe(true);
-      store.updateGateRun(`err_${attempt}`, { status: "error", finishedAt: 30 + attempt });
+      expect(adm.run.id).toBe("err_1");
+      expect(adm.run.attempts).toBe(attempt);
+      if (attempt === 1) {
+        store.updateGateRun(adm.run.id, { checkRunId: 888 });
+      } else {
+        expect(adm.run.checkRunId).toBe(888);
+      }
+      store.updateGateRun(adm.run.id, { status: "error", finishedAt: 30 + attempt });
     }
     const fourth = store.admitGateRun({
       ...first.run,
@@ -141,6 +150,8 @@ describe("gate schema, db admission, and check-run payloads", () => {
       startedAt: 40,
     });
     expect(fourth.admitted).toBe(false);
+    expect(fourth.run.id).toBe("err_1");
+    expect(fourth.run.attempts).toBe(3);
   });
 
   it("maps gate conclusions and posts named GitHub check runs", async () => {
@@ -420,6 +431,8 @@ if (endpoint.includes("/check-runs")) {
       mode: "shadow",
       exitCode: null,
       output: "",
+      checkRunId: null,
+      attempts: 1,
       startedAt: 1,
       finishedAt: null,
     });
@@ -469,5 +482,129 @@ if (endpoint.includes("/check-runs")) {
 
     service.controller.abort();
     await service.done.catch(() => undefined);
+  });
+
+  it("terminates background descendants holding stdio open when a gate times out", async () => {
+    const { cloneDir, baseSha, passHeadSha } = setupOriginAndClone();
+    const startedAt = Date.now();
+    const timedOutRes = await executeGateCheck({
+      gate: makeGate({
+        repoDir: cloneDir,
+        timeoutSeconds: 1,
+        command: "echo before-timeout; sleep 30 & wait",
+      }),
+      pullRequest: makePr({ number: 1, headRefOid: passHeadSha }),
+      runId: "gr_timeout_tree",
+      resolveMergeBase: async () => baseSha,
+    });
+    const elapsedMs = Date.now() - startedAt;
+    expect(timedOutRes.status).toBe("error");
+    expect(timedOutRes.output).toContain("command timed out after 1s");
+    expect(timedOutRes.output).toContain("before-timeout");
+    expect(elapsedMs).toBeLessThan(3_000);
+  });
+
+  it("reuses the original check_run_id on retry when completion reporting fails transiently", async () => {
+    const { cloneDir, baseSha, passHeadSha } = setupOriginAndClone();
+    const ghWrapper = join(makeTempDir("slopcop-gh-retry-"), "gh-retry.mjs");
+    const stateFile = join(makeTempDir("slopcop-gh-retry-state-"), "state.json");
+    writeFileSync(stateFile, JSON.stringify({ patchAttempts: 0, calls: [] }));
+    writeFileSync(
+      ghWrapper,
+      `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const statePath = ${JSON.stringify(stateFile)};
+const args = process.argv.slice(2);
+if (args[0] === "api" && args[1] === "user") {
+  process.stdout.write("bot\\n");
+  process.exit(0);
+}
+const endpoint = args.find((a) => a.startsWith("repos/")) ?? "";
+if (endpoint.includes("/pulls/1")) {
+  process.stdout.write(JSON.stringify({
+    number: 1, title: "Pass PR", draft: false,
+    user: { login: "dana" }, author_association: "OWNER",
+    head: { sha: "${passHeadSha}", ref: "pr-pass", repo: { full_name: "acme/skills" } },
+    base: { ref: "main", repo: { full_name: "acme/skills" } },
+    labels: [], updated_at: "2026-11-15T12:00:00Z"
+  }));
+  process.exit(0);
+}
+if (endpoint.includes("/compare/")) {
+  process.stdout.write("${baseSha}\\n");
+  process.exit(0);
+}
+if (endpoint.includes("/check-runs")) {
+  const methodIdx = args.indexOf("--method");
+  const method = methodIdx >= 0 ? args[methodIdx + 1] : "GET";
+  let body = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (c) => { body += c; });
+  process.stdin.on("end", () => {
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    state.calls.push({ method, endpoint, body: body ? JSON.parse(body) : null });
+    if (method === "PATCH") {
+      state.patchAttempts += 1;
+      writeFileSync(statePath, JSON.stringify(state));
+      if (state.patchAttempts === 1) {
+        process.stderr.write("HTTP 502 Bad Gateway\\n");
+        process.exit(1);
+      }
+      process.stdout.write(JSON.stringify({ id: 901 }));
+      process.exit(0);
+    }
+    writeFileSync(statePath, JSON.stringify(state));
+    process.stdout.write(JSON.stringify({ id: 901 }));
+    process.exit(0);
+  });
+} else {
+  process.stdout.write("[]");
+}
+`,
+      { mode: 0o755 },
+    );
+
+    const host = createFakePluginHost({
+      settings: { ghPath: ghWrapper, pollSeconds: 60, maxConcurrentReviews: 3, botGhPath: "", defaultThreadSection: "" },
+    });
+    await plugin(host.bb);
+    await host.harness.behavior.runCli([
+      "gates",
+      "add",
+      "--name",
+      "startup-load",
+      "--repo",
+      "acme/skills",
+      "--repo-dir",
+      cloneDir,
+      "--command",
+      "exit 0",
+      "--live",
+    ]);
+
+    const first = await host.harness.behavior.runCli(["gates", "run", "startup-load", "1", "--json"]);
+    expect(first.exitCode).toBe(0);
+    const firstPayload = JSON.parse(first.stdout);
+    expect(firstPayload.run.status).toBe("error");
+    expect(firstPayload.run.checkRunId).toBe(901);
+
+    const second = await host.harness.behavior.runCli(["gates", "run", "startup-load", "1", "--json"]);
+    expect(second.exitCode).toBe(0);
+    const secondPayload = JSON.parse(second.stdout);
+    expect(secondPayload.run.id).toBe(firstPayload.run.id);
+    expect(secondPayload.run.status).toBe("passed");
+    expect(secondPayload.run.attempts).toBe(2);
+
+    const recorded = JSON.parse(
+      execFileSync("node", ["-e", `console.log(require("fs").readFileSync(${JSON.stringify(stateFile)}, "utf8"))`], {
+        encoding: "utf8",
+      }),
+    ) as { calls: { method: string; endpoint: string; body: { status?: string; conclusion?: string } | null }[] };
+    const posts = recorded.calls.filter((c) => c.method === "POST");
+    const patches = recorded.calls.filter((c) => c.method === "PATCH");
+    expect(posts).toHaveLength(1);
+    expect(patches).toHaveLength(2);
+    expect(patches[1]?.endpoint).toBe("repos/acme/skills/check-runs/901");
+    expect(patches[1]?.body).toMatchObject({ status: "completed", conclusion: "success" });
   });
 });

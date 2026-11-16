@@ -205,6 +205,7 @@ export interface StartGateCheckInput {
   sha: string;
   runId: string;
   prNumber: number;
+  reuseExisting?: boolean;
 }
 
 export interface CompleteGateCheckInput extends StartGateCheckInput {
@@ -261,6 +262,10 @@ export async function startGateCheckRun(
   request: CheckRequest,
   input: StartGateCheckInput,
 ): Promise<number | null> {
+  if (input.reuseExisting === true) {
+    const prior = await findCheckRunId(request, input, input.checkName);
+    if (prior !== null) return prior;
+  }
   const created = await request("POST", `repos/${input.repo}/check-runs`, {
     name: input.checkName,
     head_sha: input.sha,

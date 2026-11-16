@@ -619,6 +619,8 @@ export default async function plugin(bb: BbPluginApi) {
             mode: gate.mode,
             exitCode: null,
             output: match.reason ?? "blocked by author trust",
+            checkRunId: null,
+            attempts: 1,
             startedAt: now,
             finishedAt: now,
           },
@@ -634,11 +636,11 @@ export default async function plugin(bb: BbPluginApi) {
       return { run: null, executed: false, blockedReason: match.reason };
     }
 
-    const runId = newId("grun");
+    const candidateId = newId("grun");
     const startedAt = Date.now();
     const admission = store.admitGateRun(
       {
-        id: runId,
+        id: candidateId,
         gateId: gate.id,
         gateName: gate.name,
         repo: gate.repo,
@@ -649,6 +651,8 @@ export default async function plugin(bb: BbPluginApi) {
         mode: gate.mode,
         exitCode: null,
         output: "",
+        checkRunId: null,
+        attempts: 1,
         startedAt,
         finishedAt: null,
       },
@@ -657,12 +661,17 @@ export default async function plugin(bb: BbPluginApi) {
     if (!admission.admitted) {
       return { run: admission.run, executed: false, blockedReason: null };
     }
+    const runId = admission.run.id;
     announce();
 
     const request: GhClient["request"] = (...args) =>
       waitForWork(() => gh.request(...args));
-    let checkRunId: number | null = null;
-    if (gate.mode === "live" && pullRequest.headRefOid.length > 0) {
+    let checkRunId: number | null = admission.run.checkRunId;
+    if (
+      gate.mode === "live" &&
+      pullRequest.headRefOid.length > 0 &&
+      checkRunId === null
+    ) {
       try {
         checkRunId = await waitForWork(() =>
           startGateCheckRun(request, {
@@ -671,8 +680,12 @@ export default async function plugin(bb: BbPluginApi) {
             sha: pullRequest.headRefOid,
             runId,
             prNumber: pullRequest.number,
+            reuseExisting: admission.run.attempts > 1,
           }),
         );
+        if (checkRunId !== null) {
+          store.updateGateRun(runId, { checkRunId });
+        }
       } catch (error) {
         watcherSignal?.throwIfAborted();
         bb.log.warn(
@@ -1331,6 +1344,7 @@ export default async function plugin(bb: BbPluginApi) {
               status: "error",
               exitCode: null,
               outputText: detail,
+              checkRunId: gateRun.checkRunId,
             }),
           );
         } catch (error) {
@@ -2249,6 +2263,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           const includeDraft = has("include-draft");
           const force = has("force");
+          gh = createGhClient((await readSettings()).ghPath);
           const pullRequest = await waitForPullRequestHead(
             gate.repo,
             prNumber,

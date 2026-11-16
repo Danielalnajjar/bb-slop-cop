@@ -242,6 +242,8 @@ export interface GateRun {
   mode: RuleMode;
   exitCode: number | null;
   output: string;
+  checkRunId: number | null;
+  attempts: number;
   startedAt: number;
   finishedAt: number | null;
 }

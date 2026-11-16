@@ -57,6 +57,22 @@ function runGit(repoDir: string, args: string[]): Promise<string> {
   });
 }
 
+function killProcessTree(child: ReturnType<typeof spawn>): void {
+  if (child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // Process group already exited; fall back to direct child kill.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Already exited.
+  }
+}
+
 function runShellCommand(input: {
   command: string;
   cwd: string;
@@ -65,31 +81,22 @@ function runShellCommand(input: {
   signal?: AbortSignal;
 }): Promise<{ exitCode: number | null; timedOut: boolean; output: string }> {
   return new Promise((resolve, reject) => {
+    if (input.signal?.aborted) {
+      reject(input.signal.reason ?? new Error("aborted"));
+      return;
+    }
+
     const child = spawn("/bin/sh", ["-c", input.command], {
       cwd: input.cwd,
       env: input.env,
+      detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let combined = "";
     let bytes = 0;
     let timedOut = false;
     let settled = false;
-
-    const onAbort = () => {
-      child.kill("SIGKILL");
-      finish(new Error("aborted"));
-    };
-    if (input.signal?.aborted) {
-      child.kill("SIGKILL");
-      reject(input.signal.reason ?? new Error("aborted"));
-      return;
-    }
-    input.signal?.addEventListener("abort", onAbort, { once: true });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, input.timeoutMs);
+    let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (
       error: Error | null,
@@ -98,6 +105,7 @@ function runShellCommand(input: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (forceSettleTimer !== undefined) clearTimeout(forceSettleTimer);
       input.signal?.removeEventListener("abort", onAbort);
       if (error !== null) {
         reject(error);
@@ -105,6 +113,25 @@ function runShellCommand(input: {
       }
       resolve(result!);
     };
+
+    const onAbort = () => {
+      killProcessTree(child);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish(new Error("aborted"));
+    };
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      forceSettleTimer = setTimeout(() => {
+        finish(null, { exitCode: null, timedOut: true, output: combined });
+      }, 250);
+      forceSettleTimer.unref?.();
+    }, input.timeoutMs);
 
     const append = (chunk: Buffer) => {
       if (bytes >= MAX_OUTPUT_BYTES) return;
@@ -120,6 +147,7 @@ function runShellCommand(input: {
     child.stderr.on("data", append);
     child.on("error", (error) => finish(error));
     child.on("close", (code) => {
+      killProcessTree(child);
       finish(null, { exitCode: code, timedOut, output: combined });
     });
   });
