@@ -40,14 +40,18 @@ import {
 } from "./lib/verify";
 import {
   completeCheckRun,
+  completeGateCheckRun,
   startCheckRun,
+  startGateCheckRun,
   type CompleteCheckInput,
 } from "./lib/checks";
-import type { Run } from "./lib/types";
+import { evaluateGate, executeGateCheck } from "./lib/gates";
+import type { GateCheck, GateRun, Run } from "./lib/types";
 import {
   authorTrustSchema,
   conditionSchema,
   dedupeSchema,
+  gateNameSchema,
   reviewStrategySchema,
   ruleModeSchema,
   threadRequestSchema,
@@ -76,6 +80,17 @@ const ruleInputSchema = z.object({
   dedupe: dedupeSchema.default("once_per_pr"),
   reviewStrategy: reviewStrategySchema.default("update"),
   visibility: visibilitySchema.default("visible"),
+});
+
+const gateInputSchema = z.object({
+  name: gateNameSchema,
+  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+  enabled: z.boolean().default(true),
+  mode: ruleModeSchema.default("shadow"),
+  authorTrust: authorTrustSchema.default("write_access"),
+  repoDir: z.string().min(1),
+  command: z.string().min(1),
+  timeoutSeconds: z.number().int().min(5).max(600).default(60),
 });
 
 const ruleOutputSchema = z.object({
@@ -576,12 +591,201 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
+   * Deterministic command gate execution. Admits at most one settled run per
+   * `(gateId, repo, headSha)` unless `force` is set, and records `"error"` if
+   * reporting the completed check run to GitHub fails so the next poll retries.
+   */
+  async function dispatchGate(
+    gate: GateCheck,
+    pullRequest: PullRequest,
+    options: { force?: boolean; includeDraft?: boolean } = {},
+  ): Promise<{ run: GateRun | null; executed: boolean; blockedReason: string | null }> {
+    const match = evaluateGate(gate, pullRequest, {
+      includeDraft: options.includeDraft,
+    });
+    if (!match.matched) {
+      if (match.blockedByTrust) {
+        const now = Date.now();
+        const skipped = store.admitGateRun(
+          {
+            id: newId("grun"),
+            gateId: gate.id,
+            gateName: gate.name,
+            repo: gate.repo,
+            prNumber: pullRequest.number,
+            headSha: pullRequest.headRefOid,
+            baseSha: "",
+            status: "skipped",
+            mode: gate.mode,
+            exitCode: null,
+            output: match.reason ?? "blocked by author trust",
+            checkRunId: null,
+            attempts: 1,
+            startedAt: now,
+            finishedAt: now,
+          },
+          options.force,
+        );
+        announce();
+        return {
+          run: skipped.run,
+          executed: false,
+          blockedReason: match.reason,
+        };
+      }
+      return { run: null, executed: false, blockedReason: match.reason };
+    }
+
+    const candidateId = newId("grun");
+    const startedAt = Date.now();
+    const admission = store.admitGateRun(
+      {
+        id: candidateId,
+        gateId: gate.id,
+        gateName: gate.name,
+        repo: gate.repo,
+        prNumber: pullRequest.number,
+        headSha: pullRequest.headRefOid,
+        baseSha: "",
+        status: "running",
+        mode: gate.mode,
+        exitCode: null,
+        output: "",
+        checkRunId: null,
+        attempts: 1,
+        startedAt,
+        finishedAt: null,
+      },
+      options.force,
+    );
+    if (!admission.admitted) {
+      return { run: admission.run, executed: false, blockedReason: null };
+    }
+    const runId = admission.run.id;
+    announce();
+
+    const request: GhClient["request"] = (...args) =>
+      waitForWork(() => gh.request(...args));
+    let checkRunId: number | null = admission.run.checkRunId;
+    if (
+      gate.mode === "live" &&
+      pullRequest.headRefOid.length > 0 &&
+      checkRunId === null
+    ) {
+      try {
+        checkRunId = await waitForWork(() =>
+          startGateCheckRun(request, {
+            checkName: gate.name,
+            repo: gate.repo,
+            sha: pullRequest.headRefOid,
+            runId,
+            prNumber: pullRequest.number,
+            reuseExisting: admission.run.attempts > 1,
+          }),
+        );
+        if (checkRunId !== null) {
+          store.updateGateRun(runId, { checkRunId });
+        }
+      } catch (error) {
+        watcherSignal?.throwIfAborted();
+        bb.log.warn(
+          `gate check start failed for ${gate.repo}#${pullRequest.number} (${gate.name}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    let execution: Awaited<ReturnType<typeof executeGateCheck>>;
+    try {
+      execution = await executeGateCheck({
+        gate,
+        pullRequest,
+        runId,
+        resolveMergeBase: (repo, baseRef, headSha) =>
+          waitForWork(() => gh.resolveMergeBase(repo, baseRef, headSha)),
+        signal: watcherSignal,
+      });
+    } catch (error) {
+      if (watcherSignal?.aborted) {
+        store.updateGateRun(runId, {
+          status: "error",
+          output: "plugin stopped while gate was running",
+          finishedAt: Date.now(),
+        });
+        announce();
+      }
+      throw error;
+    }
+
+    if (gate.mode === "live" && pullRequest.headRefOid.length > 0) {
+      try {
+        await waitForWork(() =>
+          completeGateCheckRun(request, {
+            checkName: gate.name,
+            repo: gate.repo,
+            sha: pullRequest.headRefOid,
+            runId,
+            prNumber: pullRequest.number,
+            status: execution.status,
+            exitCode: execution.exitCode,
+            outputText: execution.output,
+            checkRunId,
+          }),
+        );
+      } catch (error) {
+        watcherSignal?.throwIfAborted();
+        const message = error instanceof Error ? error.message : String(error);
+        bb.log.warn(
+          `gate check completion failed for ${gate.repo}#${pullRequest.number} (${gate.name}): ${message}`,
+        );
+        store.updateGateRun(runId, {
+          baseSha: execution.baseSha,
+          status: "error",
+          exitCode: execution.exitCode,
+          output: `failed to post GitHub check run: ${message}\n${execution.output}`.trim(),
+          finishedAt: Date.now(),
+        });
+        announce();
+        return {
+          run: store.getGateRun(runId),
+          executed: true,
+          blockedReason: null,
+        };
+      }
+    }
+
+    store.updateGateRun(runId, {
+      baseSha: execution.baseSha,
+      status: execution.status,
+      exitCode: execution.exitCode,
+      output: execution.output,
+      finishedAt: Date.now(),
+    });
+    announce();
+    bb.log.info(
+      `gate ${gate.name} finished for ${gate.repo}#${pullRequest.number} (${gate.mode}): ${execution.status}`,
+    );
+    return {
+      run: store.getGateRun(runId),
+      executed: true,
+      blockedReason: null,
+    };
+  }
+
+  /**
    * One polling pass. Detects the ready-for-review edge per PR, then evaluates
    * every rule watching that repo.
    */
   async function poll(maxConcurrent: number): Promise<void> {
     const rules = store.listRules().filter((rule) => rule.enabled);
-    const repos = [...new Set(rules.map((rule) => rule.repo))];
+    const gates = store.listGates().filter((gate) => gate.enabled);
+    const repos = [
+      ...new Set([
+        ...rules.map((rule) => rule.repo),
+        ...gates.map((gate) => gate.repo),
+      ]),
+    ];
 
     for (const repo of repos) {
       let pullRequests: PullRequest[];
@@ -598,13 +802,14 @@ export default async function plugin(bb: BbPluginApi) {
       // First pass over a repo only records what is already open, so enabling a
       // rule never reviews the backlog. Every later unseen PR is genuinely new.
       const repoBootstrapped = store.isBootstrapped(repo);
-      if (!repoBootstrapped) {
+      if (!repoBootstrapped && rules.some((candidate) => candidate.repo === repo)) {
         bb.log.info(
           `bootstrapping ${repo}: recording ${pullRequests.length} open PR(s) as backlog`,
         );
       }
 
       const repoRules = rules.filter((candidate) => candidate.repo === repo);
+      const repoGates = gates.filter((candidate) => candidate.repo === repo);
       const deferred = store.listDeferredReviews(repo);
       for (const pending of deferred) {
         if (!pullRequests.some(pr => pr.number === pending.prNumber && !pr.isDraft)) {
@@ -626,6 +831,11 @@ export default async function plugin(bb: BbPluginApi) {
           pullRequest.isDraft,
           Date.now(),
         );
+        if (!pullRequest.isDraft) {
+          for (const gate of repoGates) {
+            await dispatchGate(gate, pullRequest);
+          }
+        }
         const pending = pullRequest.isDraft
           ? []
           : deferred.filter(item => item.prNumber === pullRequest.number);
@@ -1113,6 +1323,40 @@ export default async function plugin(bb: BbPluginApi) {
    * exactly the code an announced one is.
    */
   async function reconcileUnfinishedRuns(): Promise<void> {
+    for (const gateRun of store.listRunningGateRuns()) {
+      const detail = "plugin reloaded before gate finished";
+      store.updateGateRun(gateRun.id, {
+        status: "error",
+        output: gateRun.output ? `${gateRun.output}\n${detail}` : detail,
+        finishedAt: Date.now(),
+      });
+      if (gateRun.mode === "live" && gateRun.headSha.length > 0) {
+        try {
+          const request: GhClient["request"] = (...args) =>
+            waitForWork(() => gh.request(...args));
+          await waitForWork(() =>
+            completeGateCheckRun(request, {
+              checkName: gateRun.gateName,
+              repo: gateRun.repo,
+              sha: gateRun.headSha,
+              runId: gateRun.id,
+              prNumber: gateRun.prNumber,
+              status: "error",
+              exitCode: null,
+              outputText: detail,
+              checkRunId: gateRun.checkRunId,
+            }),
+          );
+        } catch (error) {
+          watcherSignal?.throwIfAborted();
+          bb.log.warn(
+            `could not cancel stranded gate check ${gateRun.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    }
     for (let run of store.listUnfinishedRuns()) {
       let threadId = run.threadId;
       try {
@@ -1233,6 +1477,69 @@ export default async function plugin(bb: BbPluginApi) {
     const rule = store.getRule(idOrName) ?? store.findRuleByName(idOrName);
     if (rule === null) throw new Error(`no rule named '${idOrName}'`);
     return rule;
+  }
+
+  function resolveGate(idOrName: string): GateCheck {
+    const gate = store.getGate(idOrName) ?? store.findGateByName(idOrName);
+    if (gate === null) throw new Error(`no gate named '${idOrName}'`);
+    return gate;
+  }
+
+  function saveGate(
+    id: string | null,
+    input: z.infer<typeof gateInputSchema>,
+  ): GateCheck {
+    const now = Date.now();
+    const existing = id === null ? null : store.getGate(id);
+    const clash = store
+      .listGates()
+      .find(
+        (gate) =>
+          gate.id !== existing?.id &&
+          gate.name.toLowerCase() === input.name.toLowerCase(),
+      );
+    if (clash !== undefined) {
+      throw new Error(`gate '${clash.name}' already uses the name '${input.name}'`);
+    }
+    const gate: GateCheck = {
+      id: existing?.id ?? newId("gate"),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      ...input,
+    };
+    store.upsertGate(gate);
+    return gate;
+  }
+
+  async function waitForPullRequestHead(
+    repo: string,
+    prNumber: number,
+    expectedHead?: string,
+  ): Promise<PullRequest> {
+    if (expectedHead === undefined) {
+      return gh.getPullRequest(repo, prNumber);
+    }
+    const timeout = new AbortController();
+    let observedHead = "not observed";
+    const timer = setTimeout(() => timeout.abort(new Error(
+      `PR #${prNumber} head did not match within 60 seconds: expected ${expectedHead}, observed ${observedHead}. No run created.`,
+    )), 60_000);
+    const signal = watcherSignal === undefined
+      ? timeout.signal
+      : AbortSignal.any([watcherSignal, timeout.signal]);
+    try {
+      while (true) {
+        const pullRequest = await waitForAbort(
+          () => gh.getPullRequest(repo, prNumber),
+          signal,
+        );
+        observedHead = pullRequest.headRefOid;
+        if (observedHead === expectedHead) return pullRequest;
+        await sleep(2_000, signal);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function checkPr(
@@ -1379,12 +1686,16 @@ export default async function plugin(bb: BbPluginApi) {
         ghAvailable: ghLogin !== null,
         ghLogin,
         watchedRepos: [
-          ...new Set(
-            store
+          ...new Set([
+            ...store
               .listRules()
               .filter((rule) => rule.enabled)
               .map((rule) => rule.repo),
-          ),
+            ...store
+              .listGates()
+              .filter((gate) => gate.enabled)
+              .map((gate) => gate.repo),
+          ]),
         ],
         pollSeconds: values.pollSeconds,
         defaultThreadSection: values.defaultThreadSection,
@@ -1418,6 +1729,28 @@ export default async function plugin(bb: BbPluginApi) {
         name: "rules-toggle",
         summary: "Toggle or delete a rule",
         usage: "bb slopcop rules enable <id|name>",
+      },
+      {
+        name: "gates",
+        summary: "List deterministic command check gates",
+        usage: "bb slopcop gates [--json]",
+      },
+      {
+        name: "gates-add",
+        summary: "Create or update a deterministic command check gate",
+        usage:
+          "bb slopcop gates add --name <check-name> --repo <owner/repo> --repo-dir <path> --command <cmd> [--timeout <sec>] [--trust write_access|past_contributors|anyone] [--live|--shadow]",
+      },
+      {
+        name: "gates-run",
+        summary: "Run a command check gate against a PR now",
+        usage:
+          "bb slopcop gates run <id|name> <pr-number> [--force] [--include-draft] [--head <sha>] [--json]",
+      },
+      {
+        name: "gates-runs",
+        summary: "Recent command check gate runs",
+        usage: "bb slopcop gates runs [--gate <id|name>] [--limit N] [--json]",
       },
       {
         name: "runs",
@@ -1476,12 +1809,16 @@ export default async function plugin(bb: BbPluginApi) {
         if (command === "status") {
           const values = await readSettings();
           const repos = [
-            ...new Set(
-              store
+            ...new Set([
+              ...store
                 .listRules()
                 .filter((rule) => rule.enabled)
                 .map((rule) => rule.repo),
-            ),
+              ...store
+                .listGates()
+                .filter((gate) => gate.enabled)
+                .map((gate) => gate.repo),
+            ]),
           ];
           const payload = {
             ghLogin,
@@ -1490,15 +1827,16 @@ export default async function plugin(bb: BbPluginApi) {
             pollSeconds: values.pollSeconds,
             defaultThreadSection: values.defaultThreadSection,
             rules: store.listRules().length,
+            gates: store.listGates().length,
           };
           return ok(
             json
               ? JSON.stringify(payload, null, 2)
               : `gh: ${ghLogin ?? "NOT AUTHENTICATED"}\nwatching: ${
-                  repos.join(", ") || "(no enabled rules)"
+                  repos.join(", ") || "(no enabled rules or gates)"
                 }\npolling every ${values.pollSeconds}s\ndefault section: ${
                   values.defaultThreadSection || "(unsectioned)"
-                }\n${payload.rules} rule(s)`,
+                }\n${payload.rules} rule(s), ${payload.gates} gate(s)`,
           );
         }
 
@@ -1820,8 +2158,151 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
 
+        if (command === "gates" && (sub === undefined || sub === "list")) {
+          const gates = store.listGates();
+          if (json) return ok(JSON.stringify(gates, null, 2));
+          if (gates.length === 0) return ok("No gates yet.");
+          return ok(
+            gates
+              .map((gate) => {
+                const flags = [
+                  gate.enabled ? "enabled" : "disabled",
+                  gate.mode,
+                  describeTrust(gate.authorTrust),
+                  `${gate.timeoutSeconds}s`,
+                ];
+                return `${gate.name}  ${gate.repo}  [${flags.join(" · ")}]  ${gate.id}\n  dir: ${gate.repoDir}\n  cmd: ${gate.command}`;
+              })
+              .join("\n"),
+          );
+        }
+
+        if (command === "gates" && (sub === "add" || sub === "edit")) {
+          const existing = sub === "edit" ? resolveGate(argv[2] ?? "") : null;
+          const timeoutRaw = flag("timeout");
+          const timeoutParsed =
+            timeoutRaw === undefined
+              ? (existing?.timeoutSeconds ?? 60)
+              : Number.parseInt(timeoutRaw, 10);
+          const parsed = gateInputSchema.parse({
+            name: flag("name") ?? existing?.name,
+            repo: flag("repo") ?? existing?.repo,
+            enabled: has("disabled") ? false : (existing?.enabled ?? true),
+            mode: has("live")
+              ? "live"
+              : has("shadow")
+                ? "shadow"
+                : (existing?.mode ?? "shadow"),
+            authorTrust:
+              flag("trust") ?? existing?.authorTrust ?? "write_access",
+            repoDir: flag("repo-dir") ?? existing?.repoDir,
+            command: flag("command") ?? existing?.command,
+            timeoutSeconds: timeoutParsed,
+          });
+          const gate = saveGate(existing?.id ?? null, parsed);
+          announce();
+          return ok(
+            json
+              ? JSON.stringify(gate, null, 2)
+              : `${sub === "add" ? "Created" : "Updated"} gate '${gate.name}' (${gate.id}) in ${gate.mode} mode.`,
+          );
+        }
+
+        if (
+          command === "gates" &&
+          (sub === "enable" || sub === "disable" || sub === "rm")
+        ) {
+          const gate = resolveGate(argv[2] ?? "");
+          if (sub === "rm") {
+            store.deleteGate(gate.id);
+            announce();
+            return ok(`Deleted gate '${gate.name}'.`);
+          }
+          store.upsertGate({
+            ...gate,
+            enabled: sub === "enable",
+            updatedAt: Date.now(),
+          });
+          announce();
+          return ok(
+            `${sub === "enable" ? "Enabled" : "Disabled"} gate '${gate.name}'.`,
+          );
+        }
+
+        if (command === "gates" && sub === "runs") {
+          const gateFlag = flag("gate");
+          const gate = gateFlag === undefined ? null : resolveGate(gateFlag);
+          const limitFlag = Number.parseInt(flag("limit") ?? "20", 10);
+          const runs = store.listGateRuns({
+            gateId: gate?.id,
+            limit: Number.isFinite(limitFlag) ? limitFlag : 20,
+          });
+          if (json) return ok(JSON.stringify(runs, null, 2));
+          if (runs.length === 0) return ok("No gate runs yet.");
+          return ok(
+            runs
+              .map(
+                (run) =>
+                  `${run.status.padEnd(10)} ${run.gateName}  #${run.prNumber} ${run.headSha.slice(0, 12)}` +
+                  (run.exitCode === null ? "" : `  (exit ${run.exitCode})`) +
+                  (run.output.trim().length === 0
+                    ? ""
+                    : `\n    ${run.output.trim().split("\n")[0]}`),
+              )
+              .join("\n"),
+          );
+        }
+
+        if (command === "gates" && sub === "run") {
+          const gate = resolveGate(argv[2] ?? "");
+          const prNumber = Number.parseInt(argv[3] ?? "", 10);
+          if (!Number.isFinite(prNumber)) return fail("expected a PR number");
+          const expectedHead = flag("head");
+          if (has("head") && (!expectedHead || expectedHead.startsWith("--"))) {
+            return fail("--head requires the exact pushed commit SHA");
+          }
+          const includeDraft = has("include-draft");
+          const force = has("force");
+          gh = createGhClient((await readSettings()).ghPath);
+          const pullRequest = await waitForPullRequestHead(
+            gate.repo,
+            prNumber,
+            expectedHead,
+          );
+          const match = evaluateGate(gate, pullRequest, { includeDraft });
+          if (!match.matched && !force) {
+            return fail(
+              `gate '${gate.name}' does not match PR #${prNumber}: ${match.reason}`,
+            );
+          }
+          const outcome = await dispatchGate(
+            force && !gate.enabled ? { ...gate, enabled: true } : gate,
+            pullRequest,
+            { force, includeDraft: includeDraft || force },
+          );
+          if (json) {
+            return ok(
+              JSON.stringify(
+                { ...outcome, headSha: pullRequest.headRefOid },
+                null,
+                2,
+              ),
+            );
+          }
+          if (outcome.run === null) {
+            return fail(outcome.blockedReason ?? "gate did not run");
+          }
+          return ok(
+            `Gate ${gate.name} on #${prNumber} (${gate.mode}): ${outcome.run.status}` +
+              ` head=${pullRequest.headRefOid} run=${outcome.run.id}` +
+              (outcome.run.output.trim().length === 0
+                ? ""
+                : `\n${outcome.run.output.trim()}`),
+          );
+        }
+
         return fail(
-          "Usage: bb slopcop <rules|runs|show|verify|check|dispatch|status> …\nRun `bb slopcop rules` to list rules.",
+          "Usage: bb slopcop <rules|gates|runs|show|verify|check|dispatch|status> …\nRun `bb slopcop rules` or `bb slopcop gates` to list entries.",
         );
       } catch (error) {
         return fail(error instanceof Error ? error.message : String(error));

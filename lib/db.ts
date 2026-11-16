@@ -1,6 +1,9 @@
 // Persistence. Migrations are append-only by statement index — never reorder
 // or edit a shipped statement, only push new ones.
 import type {
+  GateCheck,
+  GateRun,
+  GateRunStatus,
   Rule,
   Run,
   RunComment,
@@ -98,6 +101,37 @@ export const MIGRATIONS: string[] = [
      trigger TEXT NOT NULL,
      PRIMARY KEY (rule_id, repo, pr_number)
    )`,
+  `CREATE TABLE IF NOT EXISTS gate_checks (
+     id TEXT PRIMARY KEY,
+     name TEXT NOT NULL UNIQUE,
+     repo TEXT NOT NULL,
+     enabled INTEGER NOT NULL DEFAULT 1,
+     mode TEXT NOT NULL DEFAULT 'shadow',
+     author_trust TEXT NOT NULL DEFAULT 'write_access',
+     repo_dir TEXT NOT NULL,
+     command TEXT NOT NULL,
+     timeout_seconds INTEGER NOT NULL DEFAULT 60,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS gate_runs (
+     id TEXT PRIMARY KEY,
+     gate_id TEXT NOT NULL,
+     gate_name TEXT NOT NULL,
+     repo TEXT NOT NULL,
+     pr_number INTEGER NOT NULL,
+     head_sha TEXT NOT NULL,
+     base_sha TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL,
+     mode TEXT NOT NULL DEFAULT 'shadow',
+     exit_code INTEGER,
+     output TEXT NOT NULL DEFAULT '',
+     check_run_id INTEGER,
+     attempts INTEGER NOT NULL DEFAULT 1,
+     started_at INTEGER NOT NULL,
+     finished_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_gate_runs_lookup ON gate_runs(gate_id, repo, head_sha, started_at DESC)`,
 ];
 
 type Row = Record<string, unknown>;
@@ -160,6 +194,42 @@ export function rowToRun(row: Row): Run {
     detail: typeof row.detail === "string" ? row.detail : null,
     threadId: typeof row.thread_id === "string" ? row.thread_id : null,
     commentCount: num(row, "comment_count"),
+    startedAt: num(row, "started_at"),
+    finishedAt: typeof row.finished_at === "number" ? row.finished_at : null,
+  };
+}
+
+export function rowToGateCheck(row: Row): GateCheck {
+  return {
+    id: text(row, "id"),
+    name: text(row, "name"),
+    repo: text(row, "repo"),
+    enabled: num(row, "enabled") === 1,
+    mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
+    authorTrust: text(row, "author_trust", "write_access") as GateCheck["authorTrust"],
+    repoDir: text(row, "repo_dir"),
+    command: text(row, "command"),
+    timeoutSeconds: num(row, "timeout_seconds", 60),
+    createdAt: num(row, "created_at"),
+    updatedAt: num(row, "updated_at"),
+  };
+}
+
+export function rowToGateRun(row: Row): GateRun {
+  return {
+    id: text(row, "id"),
+    gateId: text(row, "gate_id"),
+    gateName: text(row, "gate_name"),
+    repo: text(row, "repo"),
+    prNumber: num(row, "pr_number"),
+    headSha: text(row, "head_sha"),
+    baseSha: text(row, "base_sha"),
+    status: text(row, "status", "running") as GateRunStatus,
+    mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
+    exitCode: typeof row.exit_code === "number" ? row.exit_code : null,
+    output: text(row, "output"),
+    checkRunId: typeof row.check_run_id === "number" ? row.check_run_id : null,
+    attempts: num(row, "attempts", 1),
     startedAt: num(row, "started_at"),
     finishedAt: typeof row.finished_at === "number" ? row.finished_at : null,
   };
@@ -508,6 +578,244 @@ export function createStore(db: Database) {
            head_sha = excluded.head_sha, was_draft = excluded.was_draft,
            updated_at = excluded.updated_at`,
       ).run(repo, prNumber, headSha, wasDraft ? 1 : 0, now);
+    },
+
+    listGates(): GateCheck[] {
+      return (
+        db.prepare(`SELECT * FROM gate_checks ORDER BY name`).all() as Row[]
+      ).map(rowToGateCheck);
+    },
+
+    getGate(id: string): GateCheck | null {
+      const row = db
+        .prepare(`SELECT * FROM gate_checks WHERE id = ?`)
+        .get(id) as Row | undefined;
+      return row === undefined ? null : rowToGateCheck(row);
+    },
+
+    findGateByName(name: string): GateCheck | null {
+      const row = db
+        .prepare(`SELECT * FROM gate_checks WHERE name = ?`)
+        .get(name) as Row | undefined;
+      return row === undefined ? null : rowToGateCheck(row);
+    },
+
+    upsertGate(gate: GateCheck): void {
+      db.prepare(
+        `INSERT INTO gate_checks (
+           id, name, repo, enabled, mode, author_trust, repo_dir, command,
+           timeout_seconds, created_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           repo = excluded.repo,
+           enabled = excluded.enabled,
+           mode = excluded.mode,
+           author_trust = excluded.author_trust,
+           repo_dir = excluded.repo_dir,
+           command = excluded.command,
+           timeout_seconds = excluded.timeout_seconds,
+           updated_at = excluded.updated_at`,
+      ).run(
+        gate.id,
+        gate.name,
+        gate.repo,
+        gate.enabled ? 1 : 0,
+        gate.mode,
+        gate.authorTrust,
+        gate.repoDir,
+        gate.command,
+        gate.timeoutSeconds,
+        gate.createdAt,
+        gate.updatedAt,
+      );
+    },
+
+    deleteGate(id: string): void {
+      db.prepare(`DELETE FROM gate_checks WHERE id = ?`).run(id);
+    },
+
+    admitGateRun(
+      run: GateRun,
+      force = false,
+    ): { run: GateRun; admitted: boolean } {
+      if (run.status === "running") {
+        const retried = db
+          .prepare(
+            `UPDATE gate_runs
+             SET pr_number = ?,
+                 base_sha = '',
+                 status = 'running',
+                 mode = ?,
+                 exit_code = NULL,
+                 output = '',
+                 attempts = CASE WHEN ? = 1 THEN 1 ELSE attempts + 1 END,
+                 started_at = ?,
+                 finished_at = NULL
+             WHERE id = (
+               SELECT id FROM gate_runs
+               WHERE gate_id = ? AND repo = ? AND head_sha = ?
+                 AND status = 'error'
+                 AND (
+                   ? = 1
+                   OR (
+                     attempts < 3
+                     AND NOT EXISTS (
+                       SELECT 1 FROM gate_runs AS settled
+                       WHERE settled.gate_id = ? AND settled.repo = ? AND settled.head_sha = ?
+                         AND settled.status IN ('running', 'passed', 'failed', 'skipped')
+                     )
+                   )
+                 )
+               ORDER BY started_at DESC, id DESC
+               LIMIT 1
+             )
+             RETURNING *`,
+          )
+          .get(
+            run.prNumber,
+            run.mode,
+            force ? 1 : 0,
+            run.startedAt,
+            run.gateId,
+            run.repo,
+            run.headSha,
+            force ? 1 : 0,
+            run.gateId,
+            run.repo,
+            run.headSha,
+          ) as Row | undefined;
+
+        if (retried !== undefined) {
+          return { run: rowToGateRun(retried), admitted: true };
+        }
+      }
+
+      const inserted = db
+        .prepare(
+          `INSERT INTO gate_runs (
+             id, gate_id, gate_name, repo, pr_number, head_sha, base_sha,
+             status, mode, exit_code, output, check_run_id, attempts,
+             started_at, finished_at
+           )
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE ? = 1 OR NOT EXISTS (
+             SELECT 1 FROM gate_runs
+             WHERE gate_id = ? AND repo = ? AND head_sha = ?
+           )
+           RETURNING *`,
+        )
+        .get(
+          run.id,
+          run.gateId,
+          run.gateName,
+          run.repo,
+          run.prNumber,
+          run.headSha,
+          run.baseSha,
+          run.status,
+          run.mode,
+          run.exitCode,
+          run.output,
+          run.checkRunId,
+          Math.max(1, run.attempts),
+          run.startedAt,
+          run.finishedAt,
+          force ? 1 : 0,
+          run.gateId,
+          run.repo,
+          run.headSha,
+        ) as Row | undefined;
+
+      if (inserted !== undefined) {
+        return { run: rowToGateRun(inserted), admitted: true };
+      }
+
+      const existing = db
+        .prepare(
+          `SELECT * FROM gate_runs
+           WHERE gate_id = ? AND repo = ? AND head_sha = ?
+           ORDER BY started_at DESC, id DESC LIMIT 1`,
+        )
+        .get(run.gateId, run.repo, run.headSha) as Row | undefined;
+      return {
+        run: existing === undefined ? run : rowToGateRun(existing),
+        admitted: false,
+      };
+    },
+
+    updateGateRun(
+      id: string,
+      patch: Partial<
+        Pick<
+          GateRun,
+          "baseSha" | "status" | "exitCode" | "output" | "checkRunId" | "finishedAt"
+        >
+      >,
+    ): void {
+      const sets: string[] = [];
+      const params: unknown[] = [];
+      if (patch.baseSha !== undefined) {
+        sets.push("base_sha = ?");
+        params.push(patch.baseSha);
+      }
+      if (patch.status !== undefined) {
+        sets.push("status = ?");
+        params.push(patch.status);
+      }
+      if (patch.exitCode !== undefined) {
+        sets.push("exit_code = ?");
+        params.push(patch.exitCode);
+      }
+      if (patch.output !== undefined) {
+        sets.push("output = ?");
+        params.push(patch.output);
+      }
+      if (patch.checkRunId !== undefined) {
+        sets.push("check_run_id = ?");
+        params.push(patch.checkRunId);
+      }
+      if (patch.finishedAt !== undefined) {
+        sets.push("finished_at = ?");
+        params.push(patch.finishedAt);
+      }
+      if (sets.length === 0) return;
+      params.push(id);
+      db.prepare(`UPDATE gate_runs SET ${sets.join(", ")} WHERE id = ?`).run(
+        ...params,
+      );
+    },
+
+    getGateRun(id: string): GateRun | null {
+      const row = db
+        .prepare(`SELECT * FROM gate_runs WHERE id = ?`)
+        .get(id) as Row | undefined;
+      return row === undefined ? null : rowToGateRun(row);
+    },
+
+    listGateRuns(options: { gateId?: string; limit?: number } = {}): GateRun[] {
+      const limit = options.limit ?? 50;
+      const rows =
+        options.gateId === undefined
+          ? db
+              .prepare(`SELECT * FROM gate_runs ORDER BY started_at DESC LIMIT ?`)
+              .all(limit)
+          : db
+              .prepare(
+                `SELECT * FROM gate_runs WHERE gate_id = ? ORDER BY started_at DESC LIMIT ?`,
+              )
+              .all(options.gateId, limit);
+      return (rows as Row[]).map(rowToGateRun);
+    },
+
+    listRunningGateRuns(): GateRun[] {
+      const rows = db
+        .prepare(
+          `SELECT * FROM gate_runs WHERE status = 'running' ORDER BY started_at`,
+        )
+        .all() as Row[];
+      return rows.map(rowToGateRun);
     },
   };
 }

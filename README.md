@@ -340,6 +340,34 @@ limits. Credentials never travel to review machines. The BB terminal route is
 general machine command access, not a per-PR authorization boundary.
 
 
+## Deterministic check gates
+
+Alongside agent review rules, SlopCop can evaluate deterministic shell commands
+against each open non-draft pull request's exact head commit and post a separate
+GitHub Check Run (`success` on exit 0, `failure` on nonzero exit) using the same
+GitHub App identity — consuming zero hosted CI minutes.
+
+```sh
+bb slopcop gates add \
+  --name startup-load \
+  --repo owner/repo \
+  --repo-dir ~/code/repo \
+  --command 'python3 -B tools/check-startup-sizes.py --base-ref "$SLOPCOP_BASE_SHA"' \
+  --live
+
+bb slopcop gates
+bb slopcop gates run startup-load 482 --include-draft
+bb slopcop gates runs --gate startup-load
+```
+
+Each gate run verifies `authorTrust` (`write_access` by default), fetches
+`+refs/pull/<pr>/head` and `+refs/heads/<base>` into temporary refs inside
+`--repo-dir` without modifying its checked-out branch or working tree, verifies
+the fetched commit matches `headRefOid`, runs `--command` in a detached temporary
+worktree with `SLOPCOP_REPO`, `SLOPCOP_PR_NUMBER`, `SLOPCOP_HEAD_SHA`,
+`SLOPCOP_BASE_REF`, `SLOPCOP_BASE_SHA`, and `SLOPCOP_REPO_DIR` set, and removes
+the temporary worktree and refs on completion.
+
 ## License
 
 MIT
