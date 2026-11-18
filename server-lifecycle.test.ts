@@ -63,7 +63,10 @@ function stubGh(options: {
   fork?: boolean;
   draft?: boolean;
   pollHead?: () => string;
+  detailHead?: () => string;
   pollOpen?: () => boolean;
+  pollFiles?: () => string[] | null;
+  existingChecks?: () => { id: number; status: string; external_id: string }[];
 } = {}): void {
   let polls = 0;
   let reads = 0;
@@ -93,8 +96,17 @@ function stubGh(options: {
       }
       response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
     } else if (args.includes("repos/acme/widgets/pulls/7")) {
-      capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? options.pollHead?.() ?? "sha-7";
+      capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? options.detailHead?.() ?? options.pollHead?.() ?? "sha-7";
       response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
+    } else if (args.some(arg => arg.includes("/pulls/7/files?"))) {
+      const files = options.pollFiles === undefined ? [] : options.pollFiles();
+      if (files === null) {
+        callback(new Error("temporary GitHub file-list failure"), "", "");
+        return undefined as never;
+      }
+      response = JSON.stringify(files.map(filename => ({ filename })));
+    } else if (options.existingChecks && args.some(arg => arg.includes("/check-runs?"))) {
+      response = JSON.stringify({ check_runs: options.existingChecks() });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       capturedHead = options.pollHead?.() ?? "sha-7";
       response =
@@ -1550,10 +1562,10 @@ it("reviews a ready PR without comparing an unrelated draft or idle poll", async
   }
 });
 
-async function setupSettling(settleMinutes = 1) {
+async function setupSettling(settleMinutes = 1, options: Parameters<typeof stubGh>[0] = {}) {
   vi.useFakeTimers();
   let head = "sha-7";
-  stubGh({ readyPullRequest: true, pollHead: () => head });
+  stubGh({ ...options, readyPullRequest: true, pollHead: () => head });
   const writes = stubCheckWrites(true);
   let spawned = 0;
   const configure = ({ harness }: ReturnType<typeof createFakePluginHost>) => {
@@ -1629,7 +1641,7 @@ it("restarts a live settle wait on a push, retires its queued check, and dispatc
     const replaced = await harness.behavior.runCli(["check", "settling-review", "7"]);
     expect(replaced.stdout).toContain("skipped");
     expect(writes).toContainEqual(expect.objectContaining({
-      endpoint: "repos/acme/widgets/check-runs/48", status: "completed", conclusion: "cancelled",
+      endpoint: "repos/acme/widgets/check-runs/48", status: "completed", conclusion: "neutral",
       output: expect.objectContaining({ summary: expect.stringContaining("sha-9") }),
     }));
     await vi.advanceTimersByTimeAsync(45_000);
@@ -1644,8 +1656,11 @@ it("restarts a live settle wait on a push, retires its queued check, and dispatc
   }
 });
 
-it("promotes the same waiting run and check exactly once after plugin reload", async () => {
-  const first = await setupSettling();
+it.each([false, true])("promotes the same waiting run and check after reload (check ID lost: %s)", async (loseId) => {
+  let runId = "";
+  const first = await setupSettling(1, {
+    existingChecks: () => [{ id: 48, status: "queued", external_id: runId }],
+  });
   let host: Pick<typeof first, "bb" | "harness"> = first;
   try {
     const service = host.harness.behavior.runService("watcher");
@@ -1654,6 +1669,10 @@ it("promotes the same waiting run and check exactly once after plugin reload", a
       first.push("sha-8");
       await vi.advanceTimersByTimeAsync(30_000);
       expect(first.writes.filter(write => write.head_sha === "sha-8")).toMatchObject([{ status: "queued" }]);
+      const db = host.bb.storage.database();
+      runId = createStore(db as never).listRuns().find(run => run.headSha === "sha-8")!.id;
+      // GitHub may have created the check just before loss of the local POST acknowledgment.
+      if (loseId) db.prepare("UPDATE runs SET check_run_id = NULL WHERE id = ?").run(runId);
     } finally {
       service.controller.abort();
       await service.done;
@@ -1664,11 +1683,13 @@ it("promotes the same waiting run and check exactly once after plugin reload", a
     try {
       await vi.advanceTimersByTimeAsync(30_000);
       expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
-      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(15_000); // The original deadline, before a reset would expire.
       expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
       expect(first.writes.filter(write => write.head_sha === "sha-8")).toMatchObject([{ status: "queued" }]);
       expect(first.writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/48")).toMatchObject([{ status: "in_progress" }]);
       expect(createStore(host.bb.storage.database() as never).listRuns().filter(run => run.headSha === "sha-8")).toMatchObject([{ status: "reviewing" }]);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
     } finally {
       restarted.controller.abort();
       await restarted.done;
@@ -1711,6 +1732,191 @@ it("sets and lists settle minutes through the CLI without resetting them on a la
     expect(JSON.parse((await list()).stdout!)).toMatchObject([{ settleMinutes: 3 }]);
     expect((await harness.behavior.runCli(["rules", "edit", "settling-review", "--settle-minutes", "1.5"])).exitCode).toBe(1);
   } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("retains a path-filtered wait when GitHub temporarily fails to list changed files", async () => {
+  let files: string[] | null = ["src/feature.ts"];
+  const { bb, harness, push, writes } = await setupSettling(1, { pollFiles: () => files });
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    expect((await harness.behavior.runCli(["rules", "edit", "settling-review", "--paths", "src/**"])).exitCode).toBe(0);
+    await vi.advanceTimersByTimeAsync(15_000);
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(15_000);
+    files = null;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(store.listRuns().filter(run => run.headSha === "sha-8")).toMatchObject([{ status: "waiting" }]);
+    expect(writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/48")).toHaveLength(0);
+    files = ["src/feature.ts"];
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(store.listRuns().filter(run => run.headSha === "sha-8")).toMatchObject([{ status: "reviewing" }]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("retires exactly the existing wait when admission discovers a newer head than the poll", async () => {
+  let currentHead = "sha-7";
+  const { bb, harness, push, writes } = await setupSettling(1, { detailHead: () => currentHead });
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    push("sha-8");
+    currentHead = "sha-8";
+    await vi.advanceTimersByTimeAsync(60_000);
+    currentHead = "sha-9";
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(store.listRuns().filter(run => run.headSha === "sha-8")).toMatchObject([
+      { status: "skipped", detail: "superseded by newer head sha-9", finishedAt: expect.any(Number) },
+    ]);
+    expect(writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/48")).toMatchObject([
+      { status: "completed", conclusion: "neutral", output: { summary: expect.stringContaining("sha-9") } },
+    ]);
+    await vi.advanceTimersByTimeAsync(15_000); // The repo list is still behind the single-PR lookup.
+    expect(store.listRuns().filter(run => run.headSha === "sha-8")).toHaveLength(1);
+    push("sha-9");
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    expect(store.listRuns().filter(run => run.headSha === "sha-9")).toMatchObject([{ status: "reviewing" }]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("closes a discarded queued check without claiming a review ran", async () => {
+  let open = true;
+  const { harness, push, writes } = await setupSettling(1, { pollOpen: () => open });
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(15_000);
+    open = false;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/48")).toMatchObject([
+      { status: "completed", conclusion: "neutral", output: {
+        title: "Review skipped",
+        summary: expect.stringContaining("closed or returned to draft"),
+      } },
+    ]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("retries a failed stop of a superseded thread discovered during reload recovery", async () => {
+  vi.useFakeTimers();
+  stubGhLogin();
+  const detail = "superseded by newer head sha-8";
+  const { bb, harness, store } = await setup({ status: "cancelled", detail, threadId: null });
+  const title = buildThreadTitle({
+    runId: "run_1", rule: { name: "restraint-review", mode: "shadow" }, pullRequest: { number: 42 },
+  });
+  harness.inspection.sdk.stub("threads.list", ({ archived }) => archived ? [] : [
+    makeThreadResponse({ id: THREAD_ID, title, originPluginId: bb.pluginId }),
+  ]);
+  let attempted = 0;
+  harness.inspection.sdk.stub("threads.stop", () => {
+    if (++attempted === 1) throw new Error("temporary BB stop failure");
+    return { ok: true };
+  });
+  try {
+    await startWatcher(harness);
+    expect(harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(2);
+    expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(1);
+    expect(store.getRun("run_1")).toMatchObject({ status: "cancelled", threadId: THREAD_ID, detail, finishedAt: expect.any(Number) });
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("allows an operator to cancel an unfinished wait and close its queued check", async () => {
+  const { bb, harness, push, writes } = await setupSettling();
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(15_000);
+    const waiting = store.listRuns().find(run => run.headSha === "sha-8")!;
+    expect((await harness.behavior.runCli(["runs", "cancel", waiting.id])).exitCode).toBe(0);
+    await vi.advanceTimersByTimeAsync(75_000);
+    expect(store.getRun(waiting.id)).toMatchObject({ status: "cancelled", threadId: null });
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/48")).toMatchObject([
+      { status: "completed", conclusion: "cancelled", output: { summary: expect.stringContaining("waiting") } },
+    ]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("stops an older thread whose spawn finishes after supersession", async () => {
+  const { bb, harness, push } = await setupSettling(0);
+  let releaseOldSpawn!: () => void;
+  let attempt = 0;
+  harness.inspection.sdk.stub("threads.spawn", () => {
+    if (++attempt === 1) return new Promise(resolve => {
+      releaseOldSpawn = () => resolve(makeThreadResponse({ id: "thr_late" }));
+    });
+    return makeThreadResponse({ id: "thr_replacement" });
+  });
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    const old = store.listRuns()[0]!;
+    expect(old).toMatchObject({ status: "dispatched", threadId: null });
+    push("sha-8");
+    expect((await harness.behavior.runCli(["dispatch", "settling-review", "7"])).exitCode).toBe(0);
+    expect(store.getRun(old.id)).toMatchObject({ status: "cancelled", threadId: null, finishedAt: null });
+    releaseOldSpawn();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(harness.inspection.sdk.callsTo("threads.stop")).toEqual([[{ threadId: "thr_late" }]]);
+    expect(store.getRun(old.id)).toMatchObject({ status: "cancelled", threadId: "thr_late", finishedAt: expect.any(Number) });
+    expect(store.listRuns().filter(run => run.headSha === "sha-8")).toMatchObject([
+      { status: "reviewing", threadId: "thr_replacement" },
+    ]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("leaves a finished thread's verdict alone while it is being verified", async () => {
+  const { bb, harness, push } = await setupSettling(0);
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(29_000);
+    const old = store.listRuns()[0]!;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: old.threadId!, status: "idle" }),
+      lastAssistantText: "",
+    });
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    expect(store.getRun(old.id)?.status).toBe("reviewing");
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+    expect(store.getRun(old.id)).toMatchObject({ status: "no_comment", finishedAt: expect.any(Number) });
+  } finally {
+    service.controller.abort();
+    await service.done;
     await harness.lifecycle.dispose();
   }
 });

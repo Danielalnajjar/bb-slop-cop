@@ -137,10 +137,12 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE deferred_reviews ADD COLUMN waiting_run_id TEXT`,
   `ALTER TABLE deferred_reviews ADD COLUMN first_observed_at INTEGER`,
   `ALTER TABLE runs ADD COLUMN check_run_id INTEGER`,
+  `ALTER TABLE deferred_reviews ADD COLUMN head_sha TEXT`,
 ];
 
 type Row = Record<string, unknown>;
 export const SUPERSEDED_DETAIL = "superseded by newer head ";
+export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
 
 function text(row: Row, key: string, fallback = ""): string {
   const value = row[key];
@@ -330,19 +332,23 @@ export function createStore(db: Database) {
       }));
     },
 
-    deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger, firstObservedAt: number): void {
+    deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger, headSha: string, firstObservedAt: number): void {
       db.prepare(
-        `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger, first_observed_at) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger, head_sha, first_observed_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(rule_id, repo, pr_number) DO UPDATE SET
-           trigger = excluded.trigger, first_observed_at = excluded.first_observed_at`,
-      ).run(ruleId, repo, prNumber, trigger, firstObservedAt);
+           trigger = excluded.trigger, head_sha = excluded.head_sha,
+           first_observed_at = CASE WHEN deferred_reviews.head_sha = excluded.head_sha
+             THEN deferred_reviews.first_observed_at ELSE excluded.first_observed_at END`,
+      ).run(ruleId, repo, prNumber, trigger, headSha, firstObservedAt);
     },
 
     getDeferredReview(ruleId: string, repo: string, prNumber: number): {
-      trigger: Trigger; waiting: Run | null; firstObservedAt: number | null;
+      trigger: Trigger; waiting: Run | null; headSha: string | null; firstObservedAt: number | null;
     } | null {
       const row = db.prepare(
-        `SELECT deferred_reviews.trigger, deferred_reviews.first_observed_at, runs.* FROM deferred_reviews
+        `SELECT deferred_reviews.trigger, deferred_reviews.first_observed_at,
+           deferred_reviews.head_sha AS deferred_head_sha, runs.* FROM deferred_reviews
          LEFT JOIN runs ON runs.id = deferred_reviews.waiting_run_id
          WHERE deferred_reviews.rule_id = ? AND deferred_reviews.repo = ? AND deferred_reviews.pr_number = ?`,
       ).get(ruleId, repo, prNumber) as Row | undefined;
@@ -350,6 +356,7 @@ export function createStore(db: Database) {
       return {
         trigger: text(row, "trigger") as Trigger,
         waiting: row.id == null ? null : rowToRun(row),
+        headSha: typeof row.deferred_head_sha === "string" ? row.deferred_head_sha : null,
         firstObservedAt: typeof row.first_observed_at === "number" ? row.first_observed_at : null,
       };
     },
@@ -358,6 +365,16 @@ export function createStore(db: Database) {
       db.prepare(
         `UPDATE deferred_reviews SET waiting_run_id = ? WHERE rule_id = ? AND repo = ? AND pr_number = ?`,
       ).run(run.id, run.ruleId, run.repo, run.prNumber);
+    },
+
+    replaceWaitingHead(run: Run, trigger: Trigger, headSha: string, detail: string, now: number): void {
+      db.transaction(() => {
+        db.prepare(
+          `UPDATE deferred_reviews SET waiting_run_id = NULL WHERE waiting_run_id = ?`,
+        ).run(run.id);
+        this.updateRun(run.id, { status: "skipped", detail });
+        this.deferReview(run.ruleId, run.repo, run.prNumber, trigger, headSha, now);
+      })();
     },
 
     discardDeferredReview(ruleId: string, repo: string, prNumber: number, detail: string): void {
@@ -532,12 +549,12 @@ export function createStore(db: Database) {
       return (rows as Row[]).map(rowToRun);
     },
 
-    listSupersededOrDiscardedRuns(): Run[] {
+    listReviewCleanupRuns(): Run[] {
       return (db.prepare(
         `SELECT * FROM runs WHERE finished_at IS NULL AND (
-           status = 'skipped' OR (status = 'cancelled' AND detail LIKE ?)
+           status = 'skipped' OR (status = 'cancelled' AND (detail LIKE ? OR detail = ?))
          )`,
-      ).all(`${SUPERSEDED_DETAIL}%`) as Row[]).map(rowToRun);
+      ).all(`${SUPERSEDED_DETAIL}%`, WAITING_CANCELLED_DETAIL) as Row[]).map(rowToRun);
     },
 
     findRunByThread(threadId: string): Run | null {

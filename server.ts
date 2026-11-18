@@ -12,7 +12,7 @@ import {
 import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
-import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, type Store } from "./lib/db";
+import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
 import { buildReviewEnvironment } from "./lib/review-input";
 import {
@@ -336,13 +336,11 @@ export default async function plugin(bb: BbPluginApi) {
     rules: Rule[],
     repo: string,
     pullRequest: PullRequest,
-  ): Promise<void> {
-    const needsFiles = rules.some((rule) =>
-      rule.conditions.some((condition) => condition.kind === "paths"),
-    );
-    if (!needsFiles || pullRequest.files.length > 0) return;
+  ): Promise<boolean> {
+    if (!rules.some(hasPathFilter) || pullRequest.files.length > 0) return true;
     try {
       pullRequest.files = await waitForWork(() => gh.listFiles(repo, pullRequest.number));
+      return true;
     } catch (error) {
       watcherSignal?.throwIfAborted();
       bb.log.warn(
@@ -350,7 +348,12 @@ export default async function plugin(bb: BbPluginApi) {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      return false;
     }
+  }
+
+  function hasPathFilter(rule: Rule): boolean {
+    return rule.conditions.some(condition => condition.kind === "paths");
   }
 
   /**
@@ -371,7 +374,16 @@ export default async function plugin(bb: BbPluginApi) {
     if (deferred()?.waiting || store.listOlderActiveRuns(scope).length > 0) {
       const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
       if (latest.headRefOid !== headSha) {
-        const skipped = recordSkip(rule, pullRequest, supersededBy(latest.headRefOid));
+        const detail = supersededBy(latest.headRefOid);
+        const pending = deferred();
+        if (pending?.waiting?.headSha === headSha) {
+          const skipped = { ...pending.waiting, status: "skipped" as const, detail };
+          store.replaceWaitingHead(pending.waiting, pending.trigger, latest.headRefOid, detail, Date.now());
+          announce();
+          await finalizeRun(skipped);
+          return { runId: skipped.id, threadId: null };
+        }
+        const skipped = recordSkip(rule, pullRequest, detail);
         announce();
         return { runId: skipped.id, threadId: null };
       }
@@ -857,7 +869,7 @@ export default async function plugin(bb: BbPluginApi) {
           });
           for (const rule of repoRules) {
             const trigger = triggers.find(candidate => rule.triggers.includes(candidate));
-            if (trigger !== undefined) store.deferReview(rule.id, repo, prNumber, trigger, observedAt);
+            if (trigger !== undefined) store.deferReview(rule.id, repo, prNumber, trigger, headSha, observedAt);
           }
           // A reload cannot consume a head edge without first recording its work.
           store.markSeen(repo, prNumber, headSha, pullRequest.isDraft, observedAt);
@@ -869,24 +881,35 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const pendingRules = repoRules.filter(rule => store.getDeferredReview(rule.id, repo, prNumber) !== null);
         if (pendingRules.length === 0) continue;
-        await hydrateFiles(pendingRules, repo, pullRequest);
+        const filesAvailable = await hydrateFiles(pendingRules, repo, pullRequest);
         for (const rule of pendingRules) {
+          if (!filesAvailable && hasPathFilter(rule)) continue;
           await dispatchDeferred(rule, pullRequest, maxConcurrent);
         }
       }
 
       store.markBootstrapped(repo, Date.now());
     }
-    for (const run of store.listSupersededOrDiscardedRuns()) await finalizeRun(run);
+    for (const run of store.listReviewCleanupRuns()) await finalizeRun(run);
   }
 
   async function dispatchDeferred(observedRule: Rule, pullRequest: PullRequest, maxConcurrent: number): Promise<void> {
     const { number: prNumber, headRefOid: headSha } = pullRequest;
     const rule = store.getRule(observedRule.id);
-    if (rule === null || rule.repo !== observedRule.repo) return;
+    if (rule === null || rule.repo !== observedRule.repo || rule.updatedAt !== observedRule.updatedAt) return;
     const ruleId = rule.id;
-    const pending = store.getDeferredReview(ruleId, rule.repo, prNumber);
+    let pending = store.getDeferredReview(ruleId, rule.repo, prNumber);
     if (pending === null) return; // An explicit dispatch may have consumed it.
+    if (pending.headSha !== null && pending.headSha !== headSha) {
+      // A single-PR lookup may have seen a push before the repo list caught up.
+      // Don't recreate the old wait from the older list response.
+      const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
+      if (latest.headRefOid !== headSha || store.getRule(ruleId)?.updatedAt !== rule.updatedAt) return;
+      pending = store.getDeferredReview(ruleId, rule.repo, prNumber);
+      if (pending === null) return;
+      store.deferReview(ruleId, rule.repo, prNumber, pending.trigger, headSha, Date.now());
+      pending = store.getDeferredReview(ruleId, rule.repo, prNumber)!;
+    }
     const { trigger, waiting } = pending;
     const result = evaluateRule(rule, pullRequest, trigger);
     const replaced = waiting !== null && waiting.headSha !== headSha;
@@ -912,7 +935,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (waiting !== null) {
             store.discardDeferredReview(ruleId, rule.repo, prNumber,
               replaced ? supersededBy(headSha) : "rule mode changed while waiting");
-            store.deferReview(ruleId, rule.repo, prNumber, trigger, next.startedAt);
+            store.deferReview(ruleId, rule.repo, prNumber, trigger, headSha, next.startedAt);
           }
           store.insertRun(next);
           store.attachWaitingRun(next);
@@ -1097,14 +1120,11 @@ export default async function plugin(bb: BbPluginApi) {
   async function finalizeRunOnce(run: Run): Promise<void> {
     if (store.getRun(run.id)?.finishedAt !== null) return;
     const superseded = run.detail?.startsWith(SUPERSEDED_DETAIL) === true;
-    const awaitingCleanup = superseded || run.status === "skipped";
+    const awaitingCleanup = superseded || run.status === "skipped" || run.detail === WAITING_CANCELLED_DETAIL;
     let threadId = run.threadId;
     let stopped = true;
     if (superseded && threadId !== null) stopped = await stopReviewThread(threadId);
-    const reported = await reportCheck("complete", run, {
-      ...run,
-      status: run.status === "skipped" ? (superseded ? "cancelled" : "no_comment") : run.status,
-    });
+    const reported = await reportCheck("complete", run);
     if (superseded && threadId === null) {
       threadId = store.getRun(run.id)?.threadId ?? null;
       if (threadId !== null) stopped = await stopReviewThread(threadId);
@@ -1442,9 +1462,14 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         if (threadId === null && run.status === "cancelled" && run.detail?.startsWith(SUPERSEDED_DETAIL)) {
           // The old loader may have been stopped before spawn returned its ID.
-          for (const id of await findDispatchedThreads(run)) {
-            await stopReviewThread(id);
-            await waitForWork(() => archiveReviewThread(bb, id));
+          const matches = await findDispatchedThreads(run);
+          if (matches.length === 1) {
+            threadId = matches[0]!;
+            store.updateRun(run.id, { threadId });
+            run = { ...run, threadId };
+          } else if (matches.length > 1) {
+            bb.log.warn(`could not recover superseded run ${run.id}: multiple matching threads`);
+            continue;
           }
         }
         if (threadId === null && (isReviewInProgress(run) ||
@@ -1545,13 +1570,14 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function cancelRun(run: Run): Promise<void> {
     if (run.threadId === null) {
-      store.updateRun(run.id, {
-        status: "cancelled",
-        detail: CANCELLED_DETAIL,
-        finishedAt: null,
+      const waiting = run.status === "waiting";
+      const detail = waiting ? WAITING_CANCELLED_DETAIL : CANCELLED_DETAIL;
+      store.atomic(() => {
+        if (waiting) store.clearDeferredReview(run.ruleId, run.repo, run.prNumber);
+        store.updateRun(run.id, { status: "cancelled", detail, finishedAt: null });
       });
       announce();
-      await finalizeRun({ ...run, status: "cancelled", detail: CANCELLED_DETAIL });
+      await finalizeRun({ ...run, status: "cancelled", detail });
       return;
     }
     await finishRun(run.threadId, null, CANCELLED_DETAIL);
@@ -1846,7 +1872,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "runs-cancel",
-        summary: "Fail an unfinished run and stop its review thread",
+        summary: "Cancel an unfinished run and stop its thread if it started",
         usage: "bb slopcop runs cancel <run-id>",
       },
       {
@@ -2094,7 +2120,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
           const run = store.getRun(runId);
           if (run === null) return fail(`no such run '${runId}'`);
-          if (!isReviewInProgress(run)) {
+          if (run.status !== "waiting" && !isReviewInProgress(run)) {
             return fail(
               `run ${run.id} already finished as ${run.status} — nothing to cancel`,
             );
@@ -2110,7 +2136,7 @@ export default async function plugin(bb: BbPluginApi) {
             );
           }
           return ok(
-            `Cancelled ${run.id} (${run.ruleName} #${run.prNumber}) — ${CANCELLED_DETAIL}.`,
+            `Cancelled ${run.id} (${run.ruleName} #${run.prNumber}) — ${cancelled?.detail ?? CANCELLED_DETAIL}.`,
           );
         }
 
@@ -2215,7 +2241,9 @@ export default async function plugin(bb: BbPluginApi) {
               matched: result.matched,
               reason: result.matched ? null : result.reason,
               settleUntil,
-              superseded: superseded === null ? null : { headSha: superseded.headSha, reason: superseded.detail },
+              superseded: superseded === null ? null : {
+                headSha: superseded.headSha, status: superseded.status, reason: superseded.detail,
+              },
               pr: {
                 number: pullRequest.number,
                 title: pullRequest.title,

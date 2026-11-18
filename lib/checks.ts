@@ -57,12 +57,12 @@ export function conclusionFor(status: RunStatus): CheckConclusion | null {
       return "success";
     case "no_comment":
     case "commented_unattributed":
+    case "skipped":
       return "neutral";
     case "failed":
       return "failure";
     case "cancelled":
       return "cancelled";
-    case "skipped":
     case "waiting":
     case "shadowed":
     case "dispatched":
@@ -99,6 +99,11 @@ export function outputFor(input: CompleteCheckInput): {
         title: "Review not attributable",
         summary: `A comment landed on PR #${prNumber} but could not be proven as SlopCop's.${extra}`,
       };
+    case "skipped":
+      return {
+        title: "Review skipped",
+        summary: `SlopCop did not run \`${ruleName}\` on PR #${prNumber}.${extra}`,
+      };
     case "failed":
       return {
         title: "Review failed",
@@ -107,7 +112,7 @@ export function outputFor(input: CompleteCheckInput): {
     case "cancelled":
       return {
         title: "Review cancelled",
-        summary: `SlopCop's review thread for \`${ruleName}\` ended before it reached a verdict on PR #${prNumber}; ${commentCount > 0 ? `${commentCount} comment(s) recorded, review incomplete.` : "no findings recorded."}${extra}`,
+        summary: `SlopCop did not reach a verdict for \`${ruleName}\` on PR #${prNumber}; ${commentCount > 0 ? `${commentCount} comment(s) recorded, review incomplete.` : "no findings recorded."}${extra}`,
       };
     default:
       return {
