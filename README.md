@@ -205,7 +205,7 @@ Two consequences worth knowing:
 | `bb slopcop check <rule> <pr> [--include-draft]` | Dry run — match, or the exact reason it did not |
 | `bb slopcop dispatch <rule> <pr> [--force] [--include-draft] [--head <sha>]` | Run now; with `--head`, wait up to 60 seconds for GitHub to report that exact commit or refuse without creating a run. `--include-draft` lifts only the draft gate (trust and conditions still apply), where `--force` lifts every gate. A draft-time run counts for dedupe: under `once_per_pr` it is the PR's one review, and under `once_per_head_sha` marking the PR ready on the same head does not review it again |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
-| `bb slopcop runs cancel <run-id>` | Fail an unfinished run and stop its review thread |
+| `bb slopcop runs cancel <run-id>` | Cancel an unfinished run and stop its review thread if it started |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
 | `bb slopcop verify [run-id]` | Re-check a finished live run against GitHub and complete its merge-box check (not a cancelled one: a verdict would dedupe the PR away from its re-review) |
 | `bb slopcop status` | gh auth, watched repos, poll interval |
@@ -215,10 +215,11 @@ SlopCop fails a run with a clear error if that section no longer exists. `botGhP
 switches every GitHub call to a bot identity — see above.
 
 Rule flags: `--name --repo --project --provider --model --reasoning --permission
---prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger
+--prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger --settle-minutes
 --live --shadow --disabled --hidden --visible`. Add `--json` to any command.
 
-`check` answers "why didn't SlopCop review my PR?" with the single decisive reason.
+`check` explains the rule match and reports whether the head is waiting to settle
+or a previous head was skipped or cancelled because it was superseded.
 
 ## Rules
 
@@ -230,13 +231,29 @@ Rule flags: `--name --repo --project --provider --model --reasoning --permission
 | `authorTrust` | `write_access` (default), `past_contributors`, `anyone` |
 | `mode` | `shadow` (default) or `live` |
 | `dedupe` | `once_per_pr` (default) or `once_per_head_sha` |
+| `settleMinutes` | Whole minutes a head must stay unchanged before a `new_commits` review; defaults to `0` (no wait) |
 | `visibility` | `visible` (default) or `hidden` review threads |
+
+For example, `bb slopcop rules edit security-sweep --settle-minutes 3` sets a
+three-minute window. SlopCop measures it from the first poll that observes the
+push. A different head restarts the wait; the old head is recorded as skipped
+and is never dispatched. The wait survives a plugin reload. A live rule opens
+a queued GitHub check while waiting and updates that check on dispatch.
+`ready_for_review` and explicit `bb slopcop dispatch` do not wait; normal
+matching and deduplication still apply.
+
+When a newer head is admitted, SlopCop cancels and stops any unfinished reviews
+of older heads for the same rule and PR. It completes superseded live checks
+with the replacement SHA in the summary. Finished reviews and other rules'
+reviews are untouched.
 
 ### Run statuses
 
 `shadowed` · `commented` · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
-without posting) · `skipped` (matched nothing, e.g. blocked by the trust gate) ·
+without posting) · `waiting` (head is settling or waiting for capacity after
+settling) · `skipped` (not dispatched, e.g. blocked by the trust gate or
+superseded while waiting) ·
 `cancelled` (the thread ended, errored, was retired, or was cancelled before
 the review reached a verdict) · `failed` (the review ran and its own result or
 posting failed).

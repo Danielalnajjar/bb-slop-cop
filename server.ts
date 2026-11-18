@@ -12,7 +12,7 @@ import {
 import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
-import { createStore, MIGRATIONS, type Store } from "./lib/db";
+import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
 import { buildReviewEnvironment } from "./lib/review-input";
 import {
@@ -53,6 +53,7 @@ import {
   dedupeSchema,
   gateNameSchema,
   reviewStrategySchema,
+  settleMinutesSchema,
   ruleModeSchema,
   threadRequestSchema,
   triggerSchema,
@@ -78,6 +79,7 @@ const ruleInputSchema = z.object({
   prompt: z.string().default(""),
   request: threadRequestSchema.nullable().default(null),
   dedupe: dedupeSchema.default("once_per_pr"),
+  settleMinutes: settleMinutesSchema.default(0),
   reviewStrategy: reviewStrategySchema.default("update"),
   visibility: visibilitySchema.default("visible"),
 });
@@ -105,6 +107,7 @@ const ruleOutputSchema = z.object({
   prompt: z.string(),
   request: z.unknown().nullable(),
   dedupe: z.string(),
+  settleMinutes: z.number(),
   reviewStrategy: z.string(),
   visibility: z.string(),
   createdAt: z.number(),
@@ -247,7 +250,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   let gh: GhClient = createGhClient("gh");
   let ghLogin: string | null = null;
-  let inFlight = 0;
+  const inFlight = new Set<string>();
+  const spawning = new Set<string>();
 
   let watcherSignal: AbortSignal | undefined;
   const waitForWork = <T>(work: () => Promise<T>): Promise<T> =>
@@ -282,55 +286,45 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish(RUNS_CHANNEL, { at: Date.now() });
   };
 
-  /**
-   * Best-effort: a missing Checks permission must not fail the review.
-   * Process-local ids are start's POST response so complete can PATCH
-   * before the list endpoint catches up. Not a DB replica.
-   */
-  const checkRunIds = new Map<string, number>();
+  // A superseding dispatch can land while the old check's POST is in flight.
+  // Complete must wait for its ID rather than race an eventually consistent list.
+  const checkWrites = new Map<string, Promise<boolean>>();
 
-  async function reportCheck(
-    kind: "start" | "complete",
-    run: Pick<
-      Run,
-      "id" | "repo" | "headSha" | "ruleName" | "prNumber" | "mode"
-    >,
-    complete?: Pick<CompleteCheckInput, "status" | "commentCount" | "detail">,
-  ): Promise<void> {
-    if (run.mode !== "live" || run.headSha.length === 0) return;
-    const request: GhClient["request"] = (...args) =>
-      waitForWork(() => gh.request(...args));
-    const base = {
-      repo: run.repo,
-      sha: run.headSha,
-      runId: run.id,
-      ruleName: run.ruleName,
-      prNumber: run.prNumber,
-    };
-    try {
-      if (kind === "start") {
-        const id = await waitForWork(() => startCheckRun(request, base));
-        if (id !== null) checkRunIds.set(run.id, id);
-        return;
-      }
-      if (complete === undefined) return;
+  function reportCheck(
+    kind: "queued" | "start" | "complete",
+    run: Run,
+    complete: Pick<CompleteCheckInput, "status" | "commentCount" | "detail"> = run,
+    wasWaiting = false,
+  ): Promise<boolean> {
+    if (run.mode !== "live" || run.headSha.length === 0) return Promise.resolve(true);
+    const write = async () => {
+      const request: GhClient["request"] = (...args) => waitForWork(() => gh.request(...args));
+      const base = { repo: run.repo, sha: run.headSha, runId: run.id, ruleName: run.ruleName, prNumber: run.prNumber };
       try {
-        await waitForWork(() => completeCheckRun(request, {
-          ...base,
-          ...complete,
-          checkRunId: checkRunIds.get(run.id) ?? null,
-        }));
-      } finally {
-        checkRunIds.delete(run.id);
+        const checkRunId = store.getCheckRunId(run.id);
+        if (kind === "complete") {
+          await completeCheckRun(request, { ...base, ...complete, checkRunId });
+        } else {
+          const current = store.getRun(run.id);
+          const queued = kind === "queued";
+          if (current === null || (queued ? current.status !== "waiting" : !isReviewInProgress(current))) return true;
+          const id = await startCheckRun(request, base, { queued, checkRunId, recover: queued || wasWaiting });
+          if (id !== null) store.setCheckRunId(run.id, id);
+        }
+        return true;
+      } catch (error) {
+        watcherSignal?.throwIfAborted();
+        bb.log.warn(
+          `check run ${kind} failed for ${run.repo}#${run.prNumber}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
       }
-    } catch (error) {
-      watcherSignal?.throwIfAborted();
-      bb.log.warn(
-        `check run ${kind} failed for ${run.repo}#${run.prNumber}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+    };
+    const pending = (checkWrites.get(run.id) ?? Promise.resolve()).then(write).finally(() => {
+      if (checkWrites.get(run.id) === pending) checkWrites.delete(run.id);
+    });
+    checkWrites.set(run.id, pending);
+    return pending;
   }
 
   /**
@@ -342,13 +336,11 @@ export default async function plugin(bb: BbPluginApi) {
     rules: Rule[],
     repo: string,
     pullRequest: PullRequest,
-  ): Promise<void> {
-    const needsFiles = rules.some((rule) =>
-      rule.conditions.some((condition) => condition.kind === "paths"),
-    );
-    if (!needsFiles || pullRequest.files.length > 0) return;
+  ): Promise<boolean> {
+    if (!rules.some(hasPathFilter) || pullRequest.files.length > 0) return true;
     try {
       pullRequest.files = await waitForWork(() => gh.listFiles(repo, pullRequest.number));
+      return true;
     } catch (error) {
       watcherSignal?.throwIfAborted();
       bb.log.warn(
@@ -356,7 +348,12 @@ export default async function plugin(bb: BbPluginApi) {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      return false;
     }
+  }
+
+  function hasPathFilter(rule: Rule): boolean {
+    return rule.conditions.some(condition => condition.kind === "paths");
   }
 
   /**
@@ -366,38 +363,73 @@ export default async function plugin(bb: BbPluginApi) {
   async function dispatch(
     rule: Rule,
     pullRequest: PullRequest,
-    options: { forcedReason?: string | null; force?: boolean } = {},
+    options: { forcedReason?: string | null; force?: boolean; automatic?: boolean } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
-    // Watcher, RPC and CLI attempts all consume this rule's capacity deferral,
-    // even when the attempted review later fails or is cancelled.
-    store.clearDeferredReview(rule.id, rule.repo, pullRequest.number);
+    const { number: prNumber, headRefOid: headSha } = pullRequest;
+    const scope = { ruleId: rule.id, repo: rule.repo, prNumber, headSha };
+    const deferred = () => store.getDeferredReview(rule.id, rule.repo, prNumber);
     const { botGhPath, defaultThreadSection } = await readSettings();
-    const runId = newId("run");
-    const now = Date.now();
+    // A poll snapshot can age while a gate or path lookup runs. Recheck before
+    // promoting a wait or cancelling work on what might really be a newer SHA.
+    if (deferred()?.waiting || store.listOlderActiveRuns(scope).length > 0) {
+      const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
+      if (latest.headRefOid !== headSha) {
+        const detail = supersededBy(latest.headRefOid);
+        const pending = deferred();
+        if (pending?.waiting?.headSha === headSha) {
+          const skipped = { ...pending.waiting, status: "skipped" as const, detail };
+          store.replaceWaitingHead(pending.waiting, pending.trigger, latest.headRefOid, detail, Date.now());
+          announce();
+          await finalizeRun(skipped);
+          return { runId: skipped.id, threadId: null };
+        }
+        const skipped = recordSkip(rule, pullRequest, detail);
+        announce();
+        return { runId: skipped.id, threadId: null };
+      }
+    }
+    const pending = deferred();
+    if (options.automatic && (
+      pending === null || store.getRule(rule.id)?.updatedAt !== rule.updatedAt
+    )) return { runId: "", threadId: null };
+    const waiting = pending?.waiting ?? null;
+    const promoted = waiting?.headSha === headSha && waiting.mode === rule.mode;
+    const runId = promoted ? waiting.id : newId("run");
+    const replaced: Run[] = [];
     // A forced run bypassed a gate the rule would otherwise have honoured, so
     // record why on the run itself — otherwise the activity feed shows a
     // perfectly ordinary review and the override is invisible in hindsight.
     const forcedReason = options.forcedReason ?? null;
-    const reservation = store.admitRun({
-      id: runId,
-      ruleId: rule.id,
-      ruleName: rule.name,
-      repo: rule.repo,
-      prNumber: pullRequest.number,
-      prTitle: pullRequest.title,
-      prAuthor: pullRequest.author?.login ?? "",
-      headSha: pullRequest.headRefOid,
-      status: "dispatched",
-      mode: rule.mode,
-      detail:
-        forcedReason === null ? null : `forced past the gate — ${forcedReason}`,
-      threadId: null,
-      commentCount: 0,
-      startedAt: now,
-      finishedAt: null,
-    }, rule.dedupe, options.force);
+    const reservation = store.atomic(() => {
+      const admitted = store.admitRun({
+        ...newRun(rule, pullRequest, "dispatched", runId),
+        detail: forcedReason === null ? null : `forced past the gate — ${forcedReason}`,
+      }, rule.dedupe, options.force, promoted);
+      if (waiting !== null && !promoted) {
+        store.discardDeferredReview(rule.id, rule.repo, prNumber,
+          waiting.headSha !== headSha ? supersededBy(headSha) : "rule mode changed while waiting");
+        replaced.push(store.getRun(waiting.id)!);
+      } else {
+        store.clearDeferredReview(rule.id, rule.repo, prNumber);
+      }
+      if (admitted.status !== "skipped") {
+        for (const older of store.listOlderActiveRuns(scope)) {
+          // An idle event that already selected verification owns its verdict.
+          if (older.threadId !== null && finalizing.has(older.threadId)) continue;
+          const cancelled = { ...older, status: "cancelled" as const, detail: supersededBy(headSha) };
+          store.updateRun(older.id, { status: cancelled.status, detail: cancelled.detail });
+          replaced.push(cancelled);
+        }
+      }
+      return admitted;
+    });
+    for (const run of replaced) inFlight.delete(run.id);
     announce();
-    if (reservation.status === "skipped") return { runId, threadId: null };
+    if (reservation.status === "skipped") {
+      if (promoted) replaced.push(reservation);
+      await Promise.all(replaced.map(run => finalizeRun(run)));
+      return { runId, threadId: null };
+    }
 
     const throwIfDispatchAborted = () => {
       if (!watcherSignal?.aborted) return;
@@ -413,25 +445,20 @@ export default async function plugin(bb: BbPluginApi) {
       watcherSignal.throwIfAborted();
     };
 
+    await Promise.all(replaced.map(run => finalizeRun(run)));
+    if (!isReviewInProgress(store.getRun(runId)!)) return { runId, threadId: null };
     if (rule.request === null) {
+      const detail = "rule has no agent configuration — open it in the SlopCop panel and save it once";
       store.updateRun(runId, {
         status: "failed",
-        detail:
-          "rule has no agent configuration — open it in the SlopCop panel and save it once",
-        finishedAt: Date.now(),
+        detail,
+        finishedAt: promoted ? null : Date.now(),
       });
       announce();
+      if (promoted) await finalizeRun({ ...reservation, status: "failed", detail });
       return { runId, threadId: null };
     }
 
-    const checkRun = {
-      id: runId,
-      repo: rule.repo,
-      headSha: pullRequest.headRefOid,
-      ruleName: rule.name,
-      prNumber: pullRequest.number,
-      mode: rule.mode,
-    };
     let priorComments: ReturnType<typeof collectPriorComments> = [];
     try {
       const [issues, review, reviews] = await waitForWork(() => Promise.all([
@@ -486,7 +513,8 @@ export default async function plugin(bb: BbPluginApi) {
           : [],
       );
       // thread.idle / thread.failed already run finishRun concurrently.
-      await reportCheck("start", checkRun);
+      if (!isReviewInProgress(store.getRun(runId)!)) return { runId, threadId: null };
+      await reportCheck("start", reservation, undefined, promoted);
       preparingInputs = true;
       const reviewPullRequest = {
         ...pullRequest,
@@ -510,6 +538,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const dispatchSignal = watcherSignal;
       const logInfo = bb.log.info;
+      spawning.add(runId);
       const thread = await waitForWork(async () => {
         const thread = await bb.sdk.threads.spawn({
           ...execution,
@@ -525,7 +554,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         store.updateRun(runId, { threadId: (thread as { id: string }).id });
         return thread;
-      });
+      }).finally(() => spawning.delete(runId));
       preparingInputs = false;
       const threadId = (thread as { id: string }).id;
       // `runs cancel` can finalize this run while it still has no thread. The
@@ -534,14 +563,18 @@ export default async function plugin(bb: BbPluginApi) {
       const reserved = store.getRun(runId);
       if (reserved !== null && !isReviewInProgress(reserved)) {
         store.updateRun(runId, { threadId });
-        await stopReviewThread(threadId);
+        if (reserved.detail?.startsWith(SUPERSEDED_DETAIL)) {
+          await finalizeRun({ ...reserved, threadId });
+        } else {
+          await stopReviewThread(threadId);
+        }
         bb.log.info(
           `run ${runId} was cancelled before ${threadId} spawned; stopped it`,
         );
         return { runId, threadId };
       }
       store.updateRun(runId, { status: "reviewing", threadId });
-      inFlight += 1;
+      inFlight.add(runId);
       announce();
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
@@ -554,6 +587,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId, threadId };
     } catch (error) {
       throwIfDispatchAborted();
+      if (!isReviewInProgress(store.getRun(runId)!)) return { runId, threadId: null };
       store.updateRun(runId, {
         status: preparingInputs ? "cancelled" : "failed",
         detail: error instanceof Error ? error.message : String(error),
@@ -565,14 +599,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** Records a rule that matched nothing, so "why no review?" is answerable. */
-  function recordSkip(
-    rule: Rule,
-    pullRequest: PullRequest,
-    reason: string,
-  ): void {
-    store.insertRun({
-      id: newId("run"),
+  function newRun(rule: Rule, pullRequest: PullRequest, status: Run["status"], id = newId("run")): Run {
+    return {
+      id,
       ruleId: rule.id,
       ruleName: rule.name,
       repo: rule.repo,
@@ -580,14 +609,24 @@ export default async function plugin(bb: BbPluginApi) {
       prTitle: pullRequest.title,
       prAuthor: pullRequest.author?.login ?? "",
       headSha: pullRequest.headRefOid,
-      status: "skipped",
+      status,
       mode: rule.mode,
-      detail: reason,
+      detail: null,
       threadId: null,
       commentCount: 0,
       startedAt: Date.now(),
-      finishedAt: Date.now(),
-    });
+      finishedAt: null,
+    };
+  }
+
+  function recordSkip(rule: Rule, pullRequest: PullRequest, reason: string): Run {
+    const run = { ...newRun(rule, pullRequest, "skipped"), detail: reason, finishedAt: Date.now() };
+    store.insertRun(run);
+    return run;
+  }
+
+  function supersededBy(headSha: string): string {
+    return SUPERSEDED_DETAIL + headSha;
   }
 
   /**
@@ -810,73 +849,112 @@ export default async function plugin(bb: BbPluginApi) {
 
       const repoRules = rules.filter((candidate) => candidate.repo === repo);
       const repoGates = gates.filter((candidate) => candidate.repo === repo);
-      const deferred = store.listDeferredReviews(repo);
-      for (const pending of deferred) {
+      for (const pending of store.listDeferredReviews(repo)) {
         if (!pullRequests.some(pr => pr.number === pending.prNumber && !pr.isDraft)) {
-          store.clearDeferredReview(pending.ruleId, repo, pending.prNumber);
+          store.atomic(() => store.discardDeferredReview(
+            pending.ruleId, repo, pending.prNumber, "pull request closed or returned to draft",
+          ));
         }
       }
 
       for (const pullRequest of pullRequests) {
-        const triggers: Trigger[] = computeTriggers({
-          seen: store.getSeen(repo, pullRequest.number),
-          isDraft: pullRequest.isDraft,
-          headSha: pullRequest.headRefOid,
-          repoBootstrapped,
+        const { number: prNumber, headRefOid: headSha } = pullRequest;
+        const observedAt = Date.now();
+        store.atomic(() => {
+          const triggers = computeTriggers({
+            seen: store.getSeen(repo, prNumber),
+            isDraft: pullRequest.isDraft,
+            headSha,
+            repoBootstrapped,
+          });
+          for (const rule of repoRules) {
+            const trigger = triggers.find(candidate => rule.triggers.includes(candidate));
+            if (trigger !== undefined) store.deferReview(rule.id, repo, prNumber, trigger, headSha, observedAt);
+          }
+          // A reload cannot consume a head edge without first recording its work.
+          store.markSeen(repo, prNumber, headSha, pullRequest.isDraft, observedAt);
         });
-        store.markSeen(
-          repo,
-          pullRequest.number,
-          pullRequest.headRefOid,
-          pullRequest.isDraft,
-          Date.now(),
-        );
         if (!pullRequest.isDraft) {
           for (const gate of repoGates) {
             await dispatchGate(gate, pullRequest);
           }
         }
-        const pending = pullRequest.isDraft
-          ? []
-          : deferred.filter(item => item.prNumber === pullRequest.number);
-        if (triggers.length === 0 && pending.length === 0) continue;
-
-        await hydrateFiles(repoRules, repo, pullRequest);
-
-        for (const rule of repoRules) {
-          // A manual dispatch may have consumed this deferral while files loaded.
-          const deferredTrigger = pullRequest.isDraft
-            ? null
-            : store.getDeferredTrigger(rule.id, repo, pullRequest.number);
-          const ruleTriggers = [...new Set([
-            ...triggers,
-            ...(deferredTrigger === null ? [] : [deferredTrigger]),
-          ])];
-          for (const trigger of ruleTriggers) {
-            const result = evaluateRule(rule, pullRequest, trigger);
-            if (!result.matched) {
-              store.clearDeferredReview(rule.id, repo, pullRequest.number);
-              if (result.blockedByTrust) {
-                recordSkip(rule, pullRequest, result.reason);
-                announce();
-              }
-              continue;
-            }
-            if (inFlight >= maxConcurrent) {
-              store.deferReview(rule.id, repo, pullRequest.number, trigger);
-              bb.log.info(
-                `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
-              );
-              break;
-            }
-            await dispatch(rule, pullRequest);
-            break;
-          }
+        const pendingRules = repoRules.filter(rule => store.getDeferredReview(rule.id, repo, prNumber) !== null);
+        if (pendingRules.length === 0) continue;
+        const filesAvailable = await hydrateFiles(pendingRules, repo, pullRequest);
+        for (const rule of pendingRules) {
+          if (!filesAvailable && hasPathFilter(rule)) continue;
+          await dispatchDeferred(rule, pullRequest, maxConcurrent);
         }
       }
 
       store.markBootstrapped(repo, Date.now());
     }
+    for (const run of store.listReviewCleanupRuns()) await finalizeRun(run);
+  }
+
+  async function dispatchDeferred(observedRule: Rule, pullRequest: PullRequest, maxConcurrent: number): Promise<void> {
+    const { number: prNumber, headRefOid: headSha } = pullRequest;
+    const rule = store.getRule(observedRule.id);
+    if (rule === null || rule.repo !== observedRule.repo || rule.updatedAt !== observedRule.updatedAt) return;
+    const ruleId = rule.id;
+    let pending = store.getDeferredReview(ruleId, rule.repo, prNumber);
+    if (pending === null) return; // An explicit dispatch may have consumed it.
+    if (pending.headSha !== null && pending.headSha !== headSha) {
+      // A single-PR lookup may have seen a push before the repo list caught up.
+      // Don't recreate the old wait from the older list response.
+      const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
+      if (latest.headRefOid !== headSha || store.getRule(ruleId)?.updatedAt !== rule.updatedAt) return;
+      pending = store.getDeferredReview(ruleId, rule.repo, prNumber);
+      if (pending === null) return;
+      store.deferReview(ruleId, rule.repo, prNumber, pending.trigger, headSha, Date.now());
+      pending = store.getDeferredReview(ruleId, rule.repo, prNumber)!;
+    }
+    const { trigger, waiting } = pending;
+    const result = evaluateRule(rule, pullRequest, trigger);
+    const replaced = waiting !== null && waiting.headSha !== headSha;
+    if (!result.matched) {
+      const detail = replaced ? supersededBy(headSha) : result.reason;
+      store.atomic(() => store.discardDeferredReview(ruleId, rule.repo, prNumber, detail));
+      if (result.blockedByTrust) recordSkip(rule, pullRequest, result.reason);
+      if (waiting !== null || result.blockedByTrust) announce();
+      return;
+    }
+
+    const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
+    if (trigger === "new_commits" && rule.settleMinutes > 0 &&
+        !store.hasRunFor(ruleId, rule.repo, prNumber, dedupeHead)) {
+      let current = waiting;
+      if (current === null || replaced || current.mode !== rule.mode) {
+        const next = {
+          ...newRun(rule, pullRequest, "waiting"),
+          detail: "waiting to settle",
+          startedAt: pending.firstObservedAt ?? Date.now(),
+        };
+        store.atomic(() => {
+          if (waiting !== null) {
+            store.discardDeferredReview(ruleId, rule.repo, prNumber,
+              replaced ? supersededBy(headSha) : "rule mode changed while waiting");
+            store.deferReview(ruleId, rule.repo, prNumber, trigger, headSha, next.startedAt);
+          }
+          store.insertRun(next);
+          store.attachWaitingRun(next);
+        });
+        current = next;
+        announce();
+      }
+      if (store.getCheckRunId(current.id) === null) await reportCheck("queued", current);
+      if (Date.now() - current.startedAt < rule.settleMinutes * 60_000) return;
+    }
+
+    if (inFlight.size >= maxConcurrent) {
+      // The replacement can take the slot it will free, but not if dedupe
+      // rejects it or the old thread is already finishing.
+      const replacesInFlight = store.listOlderActiveRuns({ ruleId, repo: rule.repo, prNumber, headSha }).some(run =>
+        inFlight.has(run.id) && run.threadId !== null && !finalizing.has(run.threadId));
+      if (!replacesInFlight) return;
+    }
+    await dispatch(rule, pullRequest, { automatic: true });
   }
 
   // --- verification ------------------------------------------------------
@@ -1029,14 +1107,36 @@ export default async function plugin(bb: BbPluginApi) {
     return run.status === "dispatched" || run.status === "reviewing";
   }
 
-  async function finalizeRun(run: Run): Promise<void> {
-    await reportCheck("complete", run, run);
-    const threadId = run.threadId;
-    if (threadId !== null) {
-      await waitForWork(() => archiveReviewThread(bb, threadId));
+  const runCleanup = new Map<string, Promise<void>>();
+
+  function finalizeRun(run: Run): Promise<void> {
+    const existing = runCleanup.get(run.id);
+    if (existing !== undefined) return existing;
+    const cleanup = finalizeRunOnce(run).finally(() => runCleanup.delete(run.id));
+    runCleanup.set(run.id, cleanup);
+    return cleanup;
+  }
+
+  async function finalizeRunOnce(run: Run): Promise<void> {
+    if (store.getRun(run.id)?.finishedAt !== null) return;
+    const superseded = run.detail?.startsWith(SUPERSEDED_DETAIL) === true;
+    const awaitingCleanup = superseded || run.status === "skipped" || run.detail === WAITING_CANCELLED_DETAIL;
+    let threadId = run.threadId;
+    let stopped = true;
+    if (superseded && threadId !== null) stopped = await stopReviewThread(threadId);
+    const reported = await reportCheck("complete", run);
+    if (superseded && threadId === null) {
+      threadId = store.getRun(run.id)?.threadId ?? null;
+      if (threadId !== null) stopped = await stopReviewThread(threadId);
+      else if (spawning.has(run.id)) return;
     }
-    store.updateRun(run.id, { finishedAt: Date.now() });
-    announce();
+    if (!stopped) return;
+    if (threadId !== null) await waitForWork(() => archiveReviewThread(bb, threadId));
+    // Reload and later polls retry terminal check writes for obsolete heads.
+    if (reported || !awaitingCleanup) {
+      store.updateRun(run.id, { finishedAt: Date.now() });
+      announce();
+    }
   }
 
   async function finishRunOnce(
@@ -1055,7 +1155,7 @@ export default async function plugin(bb: BbPluginApi) {
       await finalizeRun(run);
       return;
     }
-    inFlight = Math.max(0, inFlight - 1);
+    inFlight.delete(run.id);
 
     const runVerify = () =>
       verifyLive({
@@ -1360,6 +1460,18 @@ export default async function plugin(bb: BbPluginApi) {
     for (let run of store.listUnfinishedRuns()) {
       let threadId = run.threadId;
       try {
+        if (threadId === null && run.status === "cancelled" && run.detail?.startsWith(SUPERSEDED_DETAIL)) {
+          // The old loader may have been stopped before spawn returned its ID.
+          const matches = await findDispatchedThreads(run);
+          if (matches.length === 1) {
+            threadId = matches[0]!;
+            store.updateRun(run.id, { threadId });
+            run = { ...run, threadId };
+          } else if (matches.length > 1) {
+            bb.log.warn(`could not recover superseded run ${run.id}: multiple matching threads`);
+            continue;
+          }
+        }
         if (threadId === null && (isReviewInProgress(run) ||
             run.detail === "plugin stopped before dispatch completed")) {
           const matches = await findDispatchedThreads(run);
@@ -1390,9 +1502,7 @@ export default async function plugin(bb: BbPluginApi) {
         };
         const outcome = reviewThreadOutcome(thread);
         if (outcome.kind === "running") {
-          // `inFlight` starts at zero on load, and this is the only pass that
-          // knows a recovered review still occupies one of its slots.
-          inFlight += 1;
+          inFlight.add(run.id);
           continue;
         }
         bb.log.info(
@@ -1436,9 +1546,10 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function stopReviewThread(threadId: string): Promise<void> {
+  async function stopReviewThread(threadId: string): Promise<boolean> {
     try {
       await waitForWork(() => bb.sdk.threads.stop({ threadId }));
+      return true;
     } catch (error) {
       watcherSignal?.throwIfAborted();
       bb.log.warn(
@@ -1446,6 +1557,7 @@ export default async function plugin(bb: BbPluginApi) {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      return false;
     }
   }
 
@@ -1458,13 +1570,14 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function cancelRun(run: Run): Promise<void> {
     if (run.threadId === null) {
-      store.updateRun(run.id, {
-        status: "cancelled",
-        detail: CANCELLED_DETAIL,
-        finishedAt: null,
+      const waiting = run.status === "waiting";
+      const detail = waiting ? WAITING_CANCELLED_DETAIL : CANCELLED_DETAIL;
+      store.atomic(() => {
+        if (waiting) store.clearDeferredReview(run.ruleId, run.repo, run.prNumber);
+        store.updateRun(run.id, { status: "cancelled", detail, finishedAt: null });
       });
       announce();
-      await finalizeRun({ ...run, status: "cancelled", detail: CANCELLED_DETAIL });
+      await finalizeRun({ ...run, status: "cancelled", detail });
       return;
     }
     await finishRun(run.threadId, null, CANCELLED_DETAIL);
@@ -1718,7 +1831,7 @@ export default async function plugin(bb: BbPluginApi) {
         name: "rules-add",
         summary: "Create a rule",
         usage:
-          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,…>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--live] [--hidden]",
+          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,…>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--settle-minutes <N>] [--live] [--hidden]",
       },
       {
         name: "rules-edit",
@@ -1759,7 +1872,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "runs-cancel",
-        summary: "Fail an unfinished run and stop its review thread",
+        summary: "Cancel an unfinished run and stop its thread if it started",
         usage: "bb slopcop runs cancel <run-id>",
       },
       {
@@ -1852,6 +1965,7 @@ export default async function plugin(bb: BbPluginApi) {
                   rule.mode,
                   ...(rule.visibility === "hidden" ? ["hidden threads"] : []),
                   describeTrust(rule.authorTrust),
+                  `settle: ${rule.settleMinutes} min`,
                 ];
                 return `${rule.name}  ${rule.repo}  [${flags.join(" · ")}]  ${rule.id}`;
               })
@@ -1891,6 +2005,10 @@ export default async function plugin(bb: BbPluginApi) {
             conditions.push({ kind: "missing_label", labels: skipLabel });
           }
 
+          const settleMinutes = flag("settle-minutes");
+          if (has("settle-minutes") && (settleMinutes === undefined || !/^\d+$/.test(settleMinutes))) {
+            return fail("--settle-minutes requires a whole number of minutes (0 or more)");
+          }
           const parsed = ruleInputSchema.parse({
             name: flag("name") ?? existing?.name,
             repo: flag("repo") ?? existing?.repo,
@@ -1908,6 +2026,7 @@ export default async function plugin(bb: BbPluginApi) {
             prompt: flag("prompt") ?? existing?.prompt ?? "",
             request: existing?.request ?? null,
             dedupe: flag("dedupe") ?? existing?.dedupe ?? "once_per_pr",
+            settleMinutes: settleMinutes === undefined ? existing?.settleMinutes : Number(settleMinutes),
             reviewStrategy:
               flag("strategy") ?? existing?.reviewStrategy ?? "update",
             visibility: has("hidden")
@@ -2001,7 +2120,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (runId === "") return fail("Usage: bb slopcop runs cancel <run-id>");
           const run = store.getRun(runId);
           if (run === null) return fail(`no such run '${runId}'`);
-          if (!isReviewInProgress(run)) {
+          if (run.status !== "waiting" && !isReviewInProgress(run)) {
             return fail(
               `run ${run.id} already finished as ${run.status} — nothing to cancel`,
             );
@@ -2017,7 +2136,7 @@ export default async function plugin(bb: BbPluginApi) {
             );
           }
           return ok(
-            `Cancelled ${run.id} (${run.ruleName} #${run.prNumber}) — ${CANCELLED_DETAIL}.`,
+            `Cancelled ${run.id} (${run.ruleName} #${run.prNumber}) — ${cancelled?.detail ?? CANCELLED_DETAIL}.`,
           );
         }
 
@@ -2114,9 +2233,17 @@ export default async function plugin(bb: BbPluginApi) {
 
           if (command === "check") {
             const { pullRequest, result } = await checkPr(rule, prNumber, undefined, { includeDraft });
+            const pending = store.getDeferredReview(rule.id, rule.repo, prNumber)?.waiting;
+            const waiting = pending?.headSha === pullRequest.headRefOid ? pending : null;
+            const settleUntil = waiting === null ? null : waiting.startedAt + rule.settleMinutes * 60_000;
+            const superseded = store.latestSupersededRun(rule.id, rule.repo, prNumber);
             const payload = {
               matched: result.matched,
               reason: result.matched ? null : result.reason,
+              settleUntil,
+              superseded: superseded === null ? null : {
+                headSha: superseded.headSha, status: superseded.status, reason: superseded.detail,
+              },
               pr: {
                 number: pullRequest.number,
                 title: pullRequest.title,
@@ -2124,12 +2251,20 @@ export default async function plugin(bb: BbPluginApi) {
                 association: pullRequest.authorAssociation,
               },
             };
+            const match = result.matched
+              ? `MATCH — '${rule.name}' would review #${prNumber} (${pullRequest.title}) in ${rule.mode} mode.`
+              : `NO MATCH — ${result.reason}`;
+            const details = [
+              waiting === null || settleUntil === null ? null : Date.now() < settleUntil
+                ? `Head ${waiting.headSha} is waiting to settle (a ${rule.settleMinutes}-minute window).`
+                : `Head ${waiting.headSha} has settled and is waiting for dispatch.`,
+              superseded === null ? null
+                : `Head ${superseded.headSha} was ${superseded.status}: ${superseded.detail}.`,
+            ];
             return ok(
               json
                 ? JSON.stringify(payload, null, 2)
-                : result.matched
-                  ? `MATCH — '${rule.name}' would review #${prNumber} (${pullRequest.title}) in ${rule.mode} mode.`
-                  : `NO MATCH — ${result.reason}`,
+                : [match, ...details.filter(detail => detail !== null)].join("\n"),
             );
           }
 

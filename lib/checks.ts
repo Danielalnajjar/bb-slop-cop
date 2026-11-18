@@ -57,12 +57,13 @@ export function conclusionFor(status: RunStatus): CheckConclusion | null {
       return "success";
     case "no_comment":
     case "commented_unattributed":
+    case "skipped":
       return "neutral";
     case "failed":
       return "failure";
     case "cancelled":
       return "cancelled";
-    case "skipped":
+    case "waiting":
     case "shadowed":
     case "dispatched":
     case "reviewing":
@@ -98,6 +99,11 @@ export function outputFor(input: CompleteCheckInput): {
         title: "Review not attributable",
         summary: `A comment landed on PR #${prNumber} but could not be proven as SlopCop's.${extra}`,
       };
+    case "skipped":
+      return {
+        title: "Review skipped",
+        summary: `SlopCop did not run \`${ruleName}\` on PR #${prNumber}.${extra}`,
+      };
     case "failed":
       return {
         title: "Review failed",
@@ -106,7 +112,7 @@ export function outputFor(input: CompleteCheckInput): {
     case "cancelled":
       return {
         title: "Review cancelled",
-        summary: `SlopCop's review thread for \`${ruleName}\` ended before it reached a verdict on PR #${prNumber}; ${commentCount > 0 ? `${commentCount} comment(s) recorded, review incomplete.` : "no findings recorded."}${extra}`,
+        summary: `SlopCop did not reach a verdict for \`${ruleName}\` on PR #${prNumber}; ${commentCount > 0 ? `${commentCount} comment(s) recorded, review incomplete.` : "no findings recorded."}${extra}`,
       };
     default:
       return {
@@ -136,7 +142,7 @@ async function findCheckRunId(
     (row) => asRecord(row).external_id === input.runId,
   );
   const inProgress = ours.find(
-    (row) => asRecord(row).status === "in_progress",
+    (row) => ["in_progress", "queued"].includes(String(asRecord(row).status)),
   );
   return checkId(inProgress ?? ours[0] ?? null);
 }
@@ -144,23 +150,26 @@ async function findCheckRunId(
 export async function startCheckRun(
   request: CheckRequest,
   input: StartCheckInput,
+  options: { queued?: boolean; checkRunId?: number | null; recover?: boolean } = {},
 ): Promise<number | null> {
-  const created = await request(
-    "POST",
-    `repos/${input.repo}/check-runs`,
-    {
-      name: CHECK_NAME,
-      head_sha: input.sha,
-      status: "in_progress",
-      external_id: input.runId,
-      details_url: prUrl(input.repo, input.prNumber),
-      started_at: new Date().toISOString(),
-      output: {
-        title: "Reviewing",
-        summary: `SlopCop is running \`${input.ruleName}\` on PR #${input.prNumber}.`,
-      },
-    },
-  );
+  const id = options.checkRunId ?? (options.recover ? await findCheckRunId(request, input) : null);
+  if (options.queued && id !== null) return id;
+  const body = {
+    name: CHECK_NAME,
+    status: options.queued ? "queued" : "in_progress",
+    details_url: prUrl(input.repo, input.prNumber),
+    ...(options.queued ? {} : { started_at: new Date().toISOString() }),
+    output: options.queued
+      ? { title: "Waiting to settle", summary: `SlopCop is waiting for the head of PR #${input.prNumber} to settle before running \`${input.ruleName}\`.` }
+      : { title: "Reviewing", summary: `SlopCop is running \`${input.ruleName}\` on PR #${input.prNumber}.` },
+  };
+  if (id !== null) {
+    await request("PATCH", `repos/${input.repo}/check-runs/${id}`, body);
+    return id;
+  }
+  const created = await request("POST", `repos/${input.repo}/check-runs`, {
+    ...body, head_sha: input.sha, external_id: input.runId,
+  });
   return checkId(created);
 }
 

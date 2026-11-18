@@ -16,6 +16,7 @@ import type {
 // The plugin SDK's database handle is better-sqlite3; typed structurally so
 // this module stays unit-testable without importing the driver.
 export interface Database {
+  transaction<T>(work: () => T): () => T;
   prepare(sql: string): {
     run(...params: unknown[]): unknown;
     get(...params: unknown[]): unknown;
@@ -132,9 +133,16 @@ export const MIGRATIONS: string[] = [
      finished_at INTEGER
    )`,
   `CREATE INDEX IF NOT EXISTS idx_gate_runs_lookup ON gate_runs(gate_id, repo, head_sha, started_at DESC)`,
+  `ALTER TABLE rules ADD COLUMN settle_minutes INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE deferred_reviews ADD COLUMN waiting_run_id TEXT`,
+  `ALTER TABLE deferred_reviews ADD COLUMN first_observed_at INTEGER`,
+  `ALTER TABLE runs ADD COLUMN check_run_id INTEGER`,
+  `ALTER TABLE deferred_reviews ADD COLUMN head_sha TEXT`,
 ];
 
 type Row = Record<string, unknown>;
+export const SUPERSEDED_DETAIL = "superseded by newer head ";
+export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
 
 function text(row: Row, key: string, fallback = ""): string {
   const value = row[key];
@@ -166,6 +174,7 @@ export function rowToRule(row: Row): Rule {
     prompt: text(row, "prompt"),
     request: parseJson<ThreadRequest | null>(row.request, null),
     dedupe: text(row, "dedupe", "once_per_pr") as Rule["dedupe"],
+    settleMinutes: num(row, "settle_minutes"),
     reviewStrategy: text(
       row,
       "review_strategy",
@@ -236,7 +245,21 @@ export function rowToGateRun(row: Row): GateRun {
 }
 
 export function createStore(db: Database) {
+  function discardWaiting(where: string, params: unknown[], detail: string): void {
+    db.prepare(
+      `UPDATE runs SET status = 'skipped', detail = ?
+       WHERE status = 'waiting' AND id IN (
+         SELECT waiting_run_id FROM deferred_reviews WHERE ${where}
+       )`,
+    ).run(detail, ...params);
+    db.prepare(`DELETE FROM deferred_reviews WHERE ${where}`).run(...params);
+  }
+
   return {
+    atomic<T>(work: () => T): T {
+      return db.transaction(work)();
+    },
+
     listRules(): Rule[] {
       return (db.prepare(`SELECT * FROM rules ORDER BY name`).all() as Row[]).map(
         rowToRule,
@@ -261,15 +284,16 @@ export function createStore(db: Database) {
       db.prepare(
         `INSERT INTO rules (id, name, repo, enabled, mode, triggers, conditions,
            author_trust, prompt, request, dedupe, review_strategy, visibility,
-           created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           created_at, updated_at, settle_minutes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, repo = excluded.repo, enabled = excluded.enabled,
            mode = excluded.mode, triggers = excluded.triggers,
            conditions = excluded.conditions, author_trust = excluded.author_trust,
            prompt = excluded.prompt, request = excluded.request,
            dedupe = excluded.dedupe, review_strategy = excluded.review_strategy,
-           visibility = excluded.visibility, updated_at = excluded.updated_at`,
+           visibility = excluded.visibility, updated_at = excluded.updated_at,
+           settle_minutes = excluded.settle_minutes`,
       ).run(
         rule.id,
         rule.name,
@@ -286,14 +310,14 @@ export function createStore(db: Database) {
         rule.visibility,
         rule.createdAt,
         rule.updatedAt,
+        rule.settleMinutes,
       );
-      db.prepare(
-        `DELETE FROM deferred_reviews WHERE rule_id = ? AND (repo != ? OR ? = 0)`,
-      ).run(rule.id, rule.repo, rule.enabled ? 1 : 0);
+      discardWaiting("rule_id = ? AND (repo != ? OR ? = 0)",
+        [rule.id, rule.repo, rule.enabled ? 1 : 0], "rule disabled or moved to a different repository");
     },
 
     deleteRule(id: string): void {
-      db.prepare(`DELETE FROM deferred_reviews WHERE rule_id = ?`).run(id);
+      discardWaiting("rule_id = ?", [id], "rule removed");
       db.prepare(`DELETE FROM rules WHERE id = ?`).run(id);
     },
 
@@ -308,18 +332,53 @@ export function createStore(db: Database) {
       }));
     },
 
-    deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger): void {
+    deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger, headSha: string, firstObservedAt: number): void {
       db.prepare(
-        `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger) VALUES (?, ?, ?, ?)
-         ON CONFLICT(rule_id, repo, pr_number) DO UPDATE SET trigger = excluded.trigger`,
-      ).run(ruleId, repo, prNumber, trigger);
+        `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger, head_sha, first_observed_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(rule_id, repo, pr_number) DO UPDATE SET
+           trigger = excluded.trigger, head_sha = excluded.head_sha,
+           first_observed_at = CASE WHEN deferred_reviews.head_sha = excluded.head_sha
+             THEN deferred_reviews.first_observed_at ELSE excluded.first_observed_at END`,
+      ).run(ruleId, repo, prNumber, trigger, headSha, firstObservedAt);
     },
 
-    getDeferredTrigger(ruleId: string, repo: string, prNumber: number): Trigger | null {
+    getDeferredReview(ruleId: string, repo: string, prNumber: number): {
+      trigger: Trigger; waiting: Run | null; headSha: string | null; firstObservedAt: number | null;
+    } | null {
       const row = db.prepare(
-        `SELECT trigger FROM deferred_reviews WHERE rule_id = ? AND repo = ? AND pr_number = ?`,
+        `SELECT deferred_reviews.trigger, deferred_reviews.first_observed_at,
+           deferred_reviews.head_sha AS deferred_head_sha, runs.* FROM deferred_reviews
+         LEFT JOIN runs ON runs.id = deferred_reviews.waiting_run_id
+         WHERE deferred_reviews.rule_id = ? AND deferred_reviews.repo = ? AND deferred_reviews.pr_number = ?`,
       ).get(ruleId, repo, prNumber) as Row | undefined;
-      return row === undefined ? null : text(row, "trigger") as Trigger;
+      if (row === undefined) return null;
+      return {
+        trigger: text(row, "trigger") as Trigger,
+        waiting: row.id == null ? null : rowToRun(row),
+        headSha: typeof row.deferred_head_sha === "string" ? row.deferred_head_sha : null,
+        firstObservedAt: typeof row.first_observed_at === "number" ? row.first_observed_at : null,
+      };
+    },
+
+    attachWaitingRun(run: Run): void {
+      db.prepare(
+        `UPDATE deferred_reviews SET waiting_run_id = ? WHERE rule_id = ? AND repo = ? AND pr_number = ?`,
+      ).run(run.id, run.ruleId, run.repo, run.prNumber);
+    },
+
+    replaceWaitingHead(run: Run, trigger: Trigger, headSha: string, detail: string, now: number): void {
+      db.transaction(() => {
+        db.prepare(
+          `UPDATE deferred_reviews SET waiting_run_id = NULL WHERE waiting_run_id = ?`,
+        ).run(run.id);
+        this.updateRun(run.id, { status: "skipped", detail });
+        this.deferReview(run.ruleId, run.repo, run.prNumber, trigger, headSha, now);
+      })();
+    },
+
+    discardDeferredReview(ruleId: string, repo: string, prNumber: number, detail: string): void {
+      discardWaiting("rule_id = ? AND repo = ? AND pr_number = ?", [ruleId, repo, prNumber], detail);
     },
 
     clearDeferredReview(ruleId: string, repo: string, prNumber: number): void {
@@ -376,7 +435,7 @@ export function createStore(db: Database) {
     },
 
     /** Atomically reserve a review or record a skip naming the winning run. */
-    admitRun(run: Run, dedupe: Rule["dedupe"], force = false): Run {
+    admitRun(run: Run, dedupe: Rule["dedupe"], force = false, promoted = false): Run {
       // One write statement, not a read followed by a write: SQLite serializes
       // this decision even for separate connections. Materialize the winner
       // before inserting so every derived field uses the same prior run.
@@ -386,7 +445,7 @@ export function createStore(db: Database) {
            SELECT id FROM runs
            WHERE ? = 0 AND rule_id = ? AND repo = ? AND pr_number = ?
              AND (? IS NULL OR head_sha = ?)
-             AND status NOT IN ('skipped', 'cancelled', 'failed')
+             AND status NOT IN ('waiting', 'skipped', 'cancelled', 'failed')
            ORDER BY started_at, id LIMIT 1
          )
          INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
@@ -399,14 +458,42 @@ export function createStore(db: Database) {
              THEN 'already admitted by run ' || (SELECT id FROM winner) ELSE ? END,
            ?, ?, ?,
            CASE WHEN EXISTS (SELECT 1 FROM winner) THEN ? ELSE ? END)
+         ON CONFLICT(id) DO UPDATE SET
+           status = excluded.status, detail = excluded.detail, pr_title = excluded.pr_title,
+           rule_name = excluded.rule_name,
+           pr_author = excluded.pr_author, started_at = excluded.started_at, finished_at = excluded.finished_at
          RETURNING *`,
       ).get(
         force ? 1 : 0, run.ruleId, run.repo, run.prNumber, headSha, headSha,
         run.id, run.ruleId, run.ruleName, run.repo, run.prNumber, run.prTitle,
         run.prAuthor, run.headSha, run.status, run.mode, run.detail,
-        run.threadId, run.commentCount, run.startedAt, run.startedAt, run.finishedAt,
+        run.threadId, run.commentCount, run.startedAt, promoted ? null : run.startedAt, run.finishedAt,
       ) as Row;
       return rowToRun(row);
+    },
+
+    listOlderActiveRuns(run: Pick<Run, "ruleId" | "repo" | "prNumber" | "headSha">): Run[] {
+      return (db.prepare(
+        `SELECT * FROM runs WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha != ?
+         AND finished_at IS NULL AND status IN ('dispatched', 'reviewing')`,
+      ).all(run.ruleId, run.repo, run.prNumber, run.headSha) as Row[]).map(rowToRun);
+    },
+
+    getCheckRunId(id: string): number | null {
+      const row = db.prepare(`SELECT check_run_id FROM runs WHERE id = ?`).get(id) as Row | undefined;
+      return typeof row?.check_run_id === "number" ? row.check_run_id : null;
+    },
+
+    setCheckRunId(id: string, checkRunId: number): void {
+      db.prepare(`UPDATE runs SET check_run_id = ? WHERE id = ?`).run(checkRunId, id);
+    },
+
+    latestSupersededRun(ruleId: string, repo: string, prNumber: number): Run | null {
+      const row = db.prepare(
+        `SELECT * FROM runs WHERE rule_id = ? AND repo = ? AND pr_number = ?
+         AND status IN ('cancelled', 'skipped') AND detail LIKE ? ORDER BY started_at DESC LIMIT 1`,
+      ).get(ruleId, repo, prNumber, `${SUPERSEDED_DETAIL}%`) as Row | undefined;
+      return row === undefined ? null : rowToRun(row);
     },
 
     updateRun(
@@ -455,11 +542,19 @@ export function createStore(db: Database) {
       const rows = db
         .prepare(
           `SELECT * FROM runs
-           WHERE finished_at IS NULL
+           WHERE finished_at IS NULL AND status != 'waiting'
            ORDER BY started_at`,
         )
         .all();
       return (rows as Row[]).map(rowToRun);
+    },
+
+    listReviewCleanupRuns(): Run[] {
+      return (db.prepare(
+        `SELECT * FROM runs WHERE finished_at IS NULL AND (
+           status = 'skipped' OR (status = 'cancelled' AND (detail LIKE ? OR detail = ?))
+         )`,
+      ).all(`${SUPERSEDED_DETAIL}%`, WAITING_CANCELLED_DETAIL) as Row[]).map(rowToRun);
     },
 
     findRunByThread(threadId: string): Run | null {
@@ -482,14 +577,14 @@ export function createStore(db: Database) {
               .prepare(
                 `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ?
-                   AND status NOT IN ('skipped', 'cancelled', 'failed') LIMIT 1`,
+                   AND status NOT IN ('waiting', 'skipped', 'cancelled', 'failed') LIMIT 1`,
               )
               .get(ruleId, repo, prNumber)
           : db
               .prepare(
                 `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha = ?
-                   AND status NOT IN ('skipped', 'cancelled', 'failed') LIMIT 1`,
+                   AND status NOT IN ('waiting', 'skipped', 'cancelled', 'failed') LIMIT 1`,
               )
               .get(ruleId, repo, prNumber, headSha);
       return row !== undefined;

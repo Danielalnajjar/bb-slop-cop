@@ -49,6 +49,7 @@ function makeRule(overrides: Partial<Rule> = {}): Rule {
     request: null,
     dedupe: "once_per_pr",
     reviewStrategy: "update",
+    settleMinutes: 0,
     visibility: "visible",
     createdAt: 0,
     updatedAt: 0,
@@ -909,7 +910,7 @@ describe("github checks", () => {
       output: {
         title: "Review cancelled",
         summary:
-          "SlopCop's review thread for `security-sweep` ended before it reached a verdict on PR #482; no findings recorded.\n\nthe review thread was archived before it reached a verdict",
+          "SlopCop did not reach a verdict for `security-sweep` on PR #482; no findings recorded.\n\nthe review thread was archived before it reached a verdict",
       },
     });
   });

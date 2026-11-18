@@ -41,7 +41,7 @@ bb slopcop rules add \
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --strategy
---trigger --live --shadow --disabled --hidden --visible`.
+--trigger --settle-minutes --live --shadow --disabled --hidden --visible`.
 
 `--hidden` spawns review threads with `visibility: "hidden"`: they stay out of
 sidebar organization and raise no unread or notification attention. Right for a
@@ -65,18 +65,19 @@ is no read-only mode, which is why the trust gate is the real protection.
 ```sh
 bb slopcop rules                       # list rules
 bb slopcop status                      # gh auth, watched repos, poll interval
-bb slopcop check <rule> <pr-number>    # dry run: match or the exact reason it did not
+bb slopcop check <rule> <pr-number>    # match, settle wait, and most recent superseded head
 bb slopcop runs [--rule <r>] [--json]  # recent runs and their status
 bb slopcop show [run-id]               # the review body a run produced
-bb slopcop runs cancel <run-id>        # fail an unfinished run and stop its thread
+bb slopcop runs cancel <run-id>        # cancel an unfinished run and stop its thread if started
 bb slopcop verify [run-id]             # re-check GitHub and complete the merge-box check
 bb slopcop dispatch <rule> <pr> [--force] [--include-draft]
 bb slopcop rules edit|enable|disable|rm <rule>
 ```
 
-`check` is the right tool for "why didn't SlopCop review my PR?" — it reports
-the single decisive reason (draft, trust gate, a specific condition). Polling
-never reviews a draft; `--include-draft` on `check` or `dispatch` lifts only that
+`check` explains why a rule did not match and shows waits or supersession.
+Use `--settle-minutes` to delay only commit-triggered reviews; readiness and
+explicit dispatch do not wait. Polling never reviews a draft;
+`--include-draft` on `check` or `dispatch` lifts only that
 gate, so trust and conditions still decide, while `--force` lifts all of them.
 A draft-time run counts for dedupe: under `once_per_pr` it is the PR's one
 review, and under `once_per_head_sha` marking the PR ready on the same head does
@@ -100,8 +101,9 @@ head to be observed; it does not select a historical PR version.
 `shadowed` (shadow review produced, nothing posted) · `commented` (verified on
 GitHub by marker) · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted but attribution degraded — the prompt contract
-slipped) · `no_comment` (thread finished without posting) · `skipped` (a rule
-matched nothing, e.g. blocked by the trust gate) · `cancelled` (the thread
+slipped) · `no_comment` (thread finished without posting) · `waiting` (no
+review thread has started) · `skipped` (the review did not dispatch, e.g.
+because the head was superseded) · `cancelled` (the thread
 ended, errored, was retired, or was cancelled before the review reached a
 verdict) · `failed` (the review ran and its own result or posting failed).
 
@@ -113,9 +115,8 @@ a later re-review of the same PR.
 A run stays at `reviewing` only while BB still says its thread is working. The
 watcher reconciles once on start, so a thread that errored, went idle, or was
 archived or deleted while the plugin was down is finished then — errored and
-retired threads are cancelled with the reason recorded. `runs cancel` is for
-the remainder: a run whose thread BB can no longer describe. It refuses a run
-that already reached a terminal status.
+retired threads are cancelled with the reason recorded. `runs cancel` accepts
+a waiting or active run and refuses a run that already reached a terminal status.
 
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker
