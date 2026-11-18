@@ -107,6 +107,7 @@ export const visibilitySchema = z.enum(["visible", "hidden"]);
 export type Visibility = z.infer<typeof visibilitySchema>;
 
 export const dedupeSchema = z.enum(["once_per_pr", "once_per_head_sha"]);
+export const settleMinutesSchema = z.number().int().nonnegative();
 export type Dedupe = z.infer<typeof dedupeSchema>;
 
 export const ruleSchema = z.object({
@@ -121,6 +122,7 @@ export const ruleSchema = z.object({
   prompt: z.string(),
   request: threadRequestSchema.nullable(),
   dedupe: dedupeSchema,
+  settleMinutes: settleMinutesSchema,
   reviewStrategy: reviewStrategySchema,
   visibility: visibilitySchema,
   createdAt: z.number().int(),
@@ -129,6 +131,7 @@ export const ruleSchema = z.object({
 export type Rule = z.infer<typeof ruleSchema>;
 
 export const runStatusSchema = z.enum([
+  "waiting",
   "dispatched",
   "reviewing",
   "commented",

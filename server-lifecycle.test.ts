@@ -93,7 +93,7 @@ function stubGh(options: {
       }
       response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
     } else if (args.includes("repos/acme/widgets/pulls/7")) {
-      capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? "sha-7";
+      capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? options.pollHead?.() ?? "sha-7";
       response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       capturedHead = options.pollHead?.() ?? "sha-7";
@@ -111,9 +111,10 @@ function stubGh(options: {
   }) as unknown as typeof execFile);
 }
 
-function stubCheckWrites(): Record<string, unknown>[] {
+function stubCheckWrites(distinctIds = false): Record<string, unknown>[] {
   const writes: Record<string, unknown>[] = [];
-  vi.mocked(spawn).mockImplementation((() => {
+  let nextId = 47;
+  vi.mocked(spawn).mockImplementation(((_bin: string, args: string[]) => {
     const child = new EventEmitter() as EventEmitter & {
       stdout: EventEmitter; stderr: EventEmitter;
       stdin: { on: () => void; end: (body: string) => void }; kill: () => void;
@@ -122,8 +123,9 @@ function stubCheckWrites(): Record<string, unknown>[] {
     child.stderr = new EventEmitter();
     child.kill = () => {};
     child.stdin = { on: () => {}, end: (body) => {
-      writes.push(JSON.parse(body));
-      child.stdout.emit("data", Buffer.from('{"id":47}'));
+      writes.push({ ...JSON.parse(body), endpoint: args[3] });
+      const id = distinctIds && args.includes("POST") ? nextId++ : 47;
+      child.stdout.emit("data", Buffer.from(JSON.stringify({ id })));
       child.emit("close", 0);
     } };
     return child as never;
@@ -1543,6 +1545,171 @@ it("reviews a ready PR without comparing an unrelated draft or idle poll", async
       service.controller.abort();
       await service.done;
     }
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+async function setupSettling(settleMinutes = 1) {
+  vi.useFakeTimers();
+  let head = "sha-7";
+  stubGh({ readyPullRequest: true, pollHead: () => head });
+  const writes = stubCheckWrites(true);
+  let spawned = 0;
+  const configure = ({ harness }: ReturnType<typeof createFakePluginHost>) => {
+    harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ status: "active" }));
+    harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+    harness.inspection.sdk.stub("threads.spawn", () => makeThreadResponse({ id: `thr_settle_${++spawned}` }));
+  };
+  const host = createFakePluginHost({ settings: { pollSeconds: 15, maxConcurrentReviews: 1 } });
+  configure(host);
+  await plugin(host.bb);
+  const { rule } = await host.harness.behavior.callRpc("saveRule", { id: null, rule: {
+    name: "settling-review", repo: "acme/widgets", dedupe: "once_per_head_sha",
+    triggers: ["ready_for_review", "new_commits"], mode: "live", settleMinutes,
+    request: { projectId: "project", providerId: "codex", model: "test" },
+  } }) as { rule: { id: string } };
+  return { ...host, rule, writes, configure, push: (sha: string) => { head = sha; } };
+}
+
+it("supersedes only unfinished runs of this rule, PR and older heads", async () => {
+  const { bb, harness, rule, writes, push } = await setupSettling(0);
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    const old = store.listRuns()[0]!;
+    store.insertRun(makeReviewRun({ id: "same", ruleId: rule.id, prNumber: 7, headSha: "sha-8", status: "dispatched", threadId: null, finishedAt: null }));
+    // Force admission later so the same-head run can coexist with the new one.
+    store.insertRun(makeReviewRun({ id: "finished", ruleId: rule.id, prNumber: 7, status: "commented", finishedAt: 1 }));
+    store.insertRun(makeReviewRun({ id: "other-rule", prNumber: 7, threadId: "thr_other_rule" }));
+    store.insertRun(makeReviewRun({ id: "other-pr", ruleId: rule.id, threadId: "thr_other_pr" }));
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(store.getRun(old.id)?.status).toBe("reviewing"); // A dedupe skip is not admission.
+    const result = await harness.behavior.runCli(["dispatch", "settling-review", "7", "--force"]);
+    expect(result.exitCode).toBe(0);
+    expect(store.getRun(old.id)).toMatchObject({ status: "cancelled", detail: expect.stringContaining("sha-8") });
+    expect(store.getRun("same")?.status).toBe("dispatched");
+    expect(store.getRun("finished")?.status).toBe("commented");
+    expect(store.getRun("other-rule")?.status).toBe("reviewing");
+    expect(store.getRun("other-pr")?.status).toBe("reviewing");
+    expect(harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(1);
+    expect(writes).toContainEqual(expect.objectContaining({
+      endpoint: "repos/acme/widgets/check-runs/47", status: "completed", conclusion: "cancelled",
+      output: expect.objectContaining({ summary: expect.stringContaining("sha-8") }),
+    }));
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("restarts a live settle wait on a push, retires its queued check, and dispatches the replacement once", async () => {
+  const { bb, harness, writes, push } = await setupSettling();
+  const store = createStore(bb.storage.database() as never);
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(writes).toContainEqual(expect.objectContaining({ head_sha: "sha-8", status: "queued" }));
+    const check = await harness.behavior.runCli(["check", "settling-review", "7"]);
+    expect(check.stdout).toContain("waiting to settle");
+    push("sha-9");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(store.listRuns()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ headSha: "sha-8", status: "skipped", detail: expect.stringContaining("sha-9") }),
+      expect.objectContaining({ headSha: "sha-9", status: "waiting" }),
+    ]));
+    const replaced = await harness.behavior.runCli(["check", "settling-review", "7"]);
+    expect(replaced.stdout).toContain("skipped");
+    expect(writes).toContainEqual(expect.objectContaining({
+      endpoint: "repos/acme/widgets/check-runs/48", status: "completed", conclusion: "cancelled",
+      output: expect.objectContaining({ summary: expect.stringContaining("sha-9") }),
+    }));
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    expect(store.listRuns().filter(run => run.headSha === "sha-9")).toMatchObject([{ status: "reviewing" }]);
+    expect(writes.filter(write => write.head_sha === "sha-9")).toMatchObject([{ status: "queued" }]);
+    expect(writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/49")).toMatchObject([{ status: "in_progress" }]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("promotes the same waiting run and check exactly once after plugin reload", async () => {
+  const first = await setupSettling();
+  let host: Pick<typeof first, "bb" | "harness"> = first;
+  try {
+    const service = host.harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+      first.push("sha-8");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(first.writes.filter(write => write.head_sha === "sha-8")).toMatchObject([{ status: "queued" }]);
+    } finally {
+      service.controller.abort();
+      await service.done;
+    }
+    host = await host.harness.lifecycle.reload(plugin);
+    first.configure(host);
+    const restarted = host.harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      expect(first.writes.filter(write => write.head_sha === "sha-8")).toMatchObject([{ status: "queued" }]);
+      expect(first.writes.filter(write => write.endpoint === "repos/acme/widgets/check-runs/48")).toMatchObject([{ status: "in_progress" }]);
+      expect(createStore(host.bb.storage.database() as never).listRuns().filter(run => run.headSha === "sha-8")).toMatchObject([{ status: "reviewing" }]);
+    } finally {
+      restarted.controller.abort();
+      await restarted.done;
+    }
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+it("dispatches readiness and an explicit manual dispatch without waiting", async () => {
+  const { harness, writes, push } = await setupSettling();
+  const service = harness.behavior.runService("watcher");
+  try {
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ head_sha: "sha-7", status: "in_progress" });
+    push("sha-8");
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(writes).toContainEqual(expect.objectContaining({ head_sha: "sha-8", status: "queued" }));
+    expect((await harness.behavior.runCli(["dispatch", "settling-review", "7"])).exitCode).toBe(0);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    expect(writes.filter(write => write.head_sha === "sha-8")).toMatchObject([{ status: "queued" }]);
+  } finally {
+    service.controller.abort();
+    await service.done;
+    await harness.lifecycle.dispose();
+  }
+});
+
+it("sets and lists settle minutes through the CLI without resetting them on a later edit", async () => {
+  const { harness } = await setupSettling(0);
+  try {
+    const list = () => harness.behavior.runCli(["rules", "--json"]);
+    expect(JSON.parse((await list()).stdout!)).toMatchObject([{ settleMinutes: 0 }]);
+    expect((await harness.behavior.runCli(["rules", "edit", "settling-review", "--settle-minutes", "3"])).exitCode).toBe(0);
+    expect((await harness.behavior.runCli(["rules", "edit", "settling-review", "--prompt", "Review the patch"])).exitCode).toBe(0);
+    expect(JSON.parse((await list()).stdout!)).toMatchObject([{ settleMinutes: 3 }]);
+    expect((await harness.behavior.runCli(["rules", "edit", "settling-review", "--settle-minutes", "1.5"])).exitCode).toBe(1);
   } finally {
     await harness.lifecycle.dispose();
   }
