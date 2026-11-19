@@ -20,6 +20,7 @@ it("validates numeric saves and exposes canonical legacy settings through status
     }
     for (const value of [0, 1.5, "3", true, NaN, Infinity]) {
       await expect(harness.behavior.setSettings({ maxConcurrentReviews: value })).rejects.toThrow();
+      await expect(harness.behavior.setSettings({ maxConcurrentProvisionsPerHost: value })).rejects.toThrow();
     }
     for (const [pollSeconds, maxConcurrentReviews] of [[15, 1], [120, 1000]]) {
       await harness.behavior.setSettings({ pollSeconds, maxConcurrentReviews });

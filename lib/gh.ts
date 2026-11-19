@@ -182,6 +182,7 @@ export function toPullRequest(raw: unknown): PullRequest {
     number: typeof row.number === "number" ? row.number : 0,
     title: typeof row.title === "string" ? row.title : "",
     isDraft: row.draft === true,
+    isClosed: row.state === "closed",
     headRefOid: typeof head.sha === "string" ? head.sha : "",
     headRefName: typeof head.ref === "string" ? head.ref : "",
     // Captured only for an admitted review, never from stale REST base.sha.

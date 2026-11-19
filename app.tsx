@@ -309,7 +309,9 @@ function RunOnPr({ rule }: { rule: RuleView }) {
         setBlocked(null);
         setPr("");
         toast.success(
-          force
+          result.threadId === null
+            ? `Queued ${rule.name} on #${prNumber}`
+            : force
             ? `Forced ${rule.name} on #${prNumber} — the rule would have skipped it`
             : `Running ${rule.name} on #${prNumber}`,
         );
