@@ -13,7 +13,7 @@ import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
-import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment } from "./lib/review-input";
 import {
   archiveReviewThread,
@@ -380,6 +380,7 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ runId: string; threadId: string | null }> {
     if (recoveringReviews !== undefined) await recoveringReviews;
     const { number: prNumber, headRefOid: headSha } = pullRequest;
+    const trigger = options.trigger ?? "manual";
     const scope = { ruleId: rule.id, repo: rule.repo, prNumber, headSha };
     const deferred = () => store.getDeferredReview(rule.id, rule.repo, prNumber);
     const values = await readSettings();
@@ -403,9 +404,23 @@ export default async function plugin(bb: BbPluginApi) {
         return { runId: skipped.id, threadId: null };
       }
     }
+    const previousVerifiedHead = store.latestVerifiedHead(rule.id, rule.repo, prNumber);
+    let incrementalBase: string | null = null;
+    if (trigger === "new_commits" && previousVerifiedHead !== null && previousVerifiedHead !== headSha) {
+      try {
+        const mergeBase = await waitForWork(() => gh.resolveMergeBase(rule.repo, previousVerifiedHead, headSha));
+        if (mergeBase === previousVerifiedHead) incrementalBase = previousVerifiedHead;
+      } catch {
+        // An unavailable comparison is not evidence that the older head is safe to exclude.
+        watcherSignal?.throwIfAborted();
+      }
+    }
+    const reviewScope = incrementalBase === null ? "full" : "incremental";
     const pending = deferred();
-    if (dispatchOptions.trigger !== "manual" && (
-      pending === null || store.getRule(rule.id)?.updatedAt !== rule.updatedAt
+    if (trigger !== "manual" && (
+      pending?.trigger !== trigger ||
+      (pending.headSha !== null && pending.headSha !== headSha) ||
+      store.getRule(rule.id)?.updatedAt !== rule.updatedAt
     )) return { runId: "", threadId: null };
     const waiting = pending?.waiting ?? null;
     const promoted = waiting?.headSha === headSha && waiting.mode === rule.mode;
@@ -419,7 +434,10 @@ export default async function plugin(bb: BbPluginApi) {
       const admitted = store.admitRun({
         ...newRun(rule, pullRequest, "dispatched", runId),
         detail: forcedReason === null ? null : `forced past the gate — ${forcedReason}`,
-      }, rule.dedupe, options.force, promoted);
+      }, {
+        dedupe: rule.dedupe, scope: reviewScope, trigger,
+        isDraft: pullRequest.isDraft, force: options.force, promoted,
+      });
       if (waiting !== null && !promoted) {
         store.discardDeferredReview(rule.id, rule.repo, prNumber,
           waiting.headSha !== headSha ? supersededBy(headSha) : "rule mode changed while waiting");
@@ -447,7 +465,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId, threadId: null };
     }
     await Promise.all(replaced.map(run => finalizeRun(run)));
-    return startReview(rule, pullRequest, reservation, dispatchOptions, values, promoted);
+    return startReview(rule, pullRequest, reservation, dispatchOptions, values, promoted, incrementalBase);
   }
 
   async function startReview(
@@ -457,9 +475,13 @@ export default async function plugin(bb: BbPluginApi) {
     options: ProvisionDispatchOptions,
     { botGhPath, defaultThreadSection, maxProvisionsPerHost }: Awaited<ReturnType<typeof readSettings>>,
     promoted: boolean,
+    incrementalBase: string | null = null,
   ): Promise<{ runId: string; threadId: string | null }> {
     const runId = reservation.id;
     const wasQueued = reservation.status === "waiting";
+    const { trigger } = options;
+    const previousVerifiedHead = store.latestVerifiedHead(rule.id, rule.repo, pullRequest.number);
+    const reviewScope = incrementalBase === null ? "full" : "incremental";
     const stillExpected = () => {
       const current = store.getRun(runId);
       return current !== null && (isReviewInProgress(current) ||
@@ -552,16 +574,19 @@ export default async function plugin(bb: BbPluginApi) {
       preparingInputs = true;
       const reviewPullRequest = {
         ...pullRequest,
-        baseRefOid: await waitForWork(() =>
+        baseRefOid: incrementalBase ?? await waitForWork(() =>
           gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, pullRequest.headRefOid),
         ),
       };
       const environment = await waitForWork(() =>
         buildReviewEnvironment(bb.sdk, rule.request!, reviewPullRequest),
       );
-      const context = {
+      const context: DispatchContext = {
         rule,
         pullRequest: reviewPullRequest,
+        trigger,
+        reviewScope,
+        previousVerifiedHead,
         runId,
         ghCommand: botGhPath,
         priorComments,
@@ -979,7 +1004,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
     if (trigger === "new_commits" && rule.settleMinutes > 0 &&
-        !store.hasRunFor(ruleId, rule.repo, prNumber, dedupeHead, headSha)) {
+        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, dedupeHead, headSha)) {
       let current = waiting;
       if (current === null || replaced || current.mode !== rule.mode) {
         const next = {

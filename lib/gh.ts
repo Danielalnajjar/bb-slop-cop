@@ -254,9 +254,9 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
 
     async resolveMergeBase(repo, baseRef, headSha) {
       if (!baseRef || !headSha) {
-        throw new Error("review base capture requires a base branch and head SHA");
+        throw new Error("review base capture requires a base ref and head SHA");
       }
-      // Resolve the current base branch against the immutable captured PR head.
+      // The base can be a branch for a full review or a pinned prior review SHA.
       const baseRefOid = (await run(
         ghPath,
         ["api", `repos/${repo}/compare/${encodeURIComponent(baseRef)}...${encodeURIComponent(headSha)}`,

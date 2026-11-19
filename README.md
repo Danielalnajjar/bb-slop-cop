@@ -82,8 +82,12 @@ Three decisions do most of the work.
 
 Each review requests a fresh BB `git-worktree` at the captured PR head. Managed
 repository setup runs there, so input preparation requires **write access**.
-The agent checks HEAD, tracked-file cleanliness, captured base SHA, and merge-base
-before reading the pinned diff and full head files. A failed check returns plain
+The agent checks HEAD, tracked-file cleanliness, and the selected comparison
+base before reading the pinned diff. A new-commit review uses only changes
+since the latest GitHub-verified head when GitHub confirms it is an ancestor,
+plus the files and rules those changes touch. Without confirmed ancestry,
+SlopCop reviews the full PR diff. Readiness and manual reviews are always full.
+A failed input check returns plain
 `Review incomplete: <reason>` and records a cancelled, unreviewed run, not a clean
 summary. Missing head objects fail provisioning rather than falling back to the
 owner's checkout. Setup hooks, include copying, and agent compliance remain limits;
@@ -215,7 +219,7 @@ Two consequences worth knowing:
 | `bb slopcop rules add\|edit <rule>` | Create or update (see flags below) |
 | `bb slopcop rules enable\|disable\|rm <rule>` | Toggle or delete |
 | `bb slopcop check <rule> <pr> [--include-draft]` | Dry run — match, or the exact reason it did not |
-| `bb slopcop dispatch <rule> <pr> [--force] [--include-draft] [--head <sha>]` | Run now; with `--head`, wait up to 60 seconds for GitHub to report that exact commit or refuse without creating a run. `--include-draft` lifts only the draft gate (trust and conditions still apply), where `--force` lifts every gate. A draft-time run counts for dedupe: under `once_per_pr` it is the PR's one review, and under `once_per_head_sha` marking the PR ready on the same head does not review it again |
+| `bb slopcop dispatch <rule> <pr> [--force] [--include-draft] [--head <sha>]` | Run now; with `--head`, wait up to 60 seconds for GitHub to report that exact commit or refuse without creating a run. `--include-draft` lifts only the draft gate; trust and conditions still apply. |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
 | `bb slopcop runs cancel <run-id>` | Cancel an unfinished run and stop its review thread if it started |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
@@ -278,8 +282,11 @@ start, so it completes its check as `cancelled` — and a cancelled run never
 dedupes away a later re-review of the same PR.
 
 Review admission is atomic in SQLite for polling, panel dispatch, and CLI
-dispatch. A duplicate attempt records a `skipped` run naming the run that
-already reserved or reviewed the tuple; it never starts a second thread.
+dispatch. Under `once_per_head_sha`, an incremental or draft review does not
+block a full review of the same non-draft head. A new-commit event for a head
+with a GitHub-verified review is skipped. Under `once_per_pr`, a draft-time run
+still counts as the PR's one review. A duplicate attempt records a `skipped`
+run naming the winner; it never starts a second thread.
 `--force` (or panel dispatch with `force`) bypasses dedupe as well as the rule
 matcher. Cancelled and failed runs do not prevent a later attempt.
 

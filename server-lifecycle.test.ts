@@ -63,9 +63,12 @@ function stubGh(options: {
   fork?: boolean;
   draft?: boolean;
   pollHead?: () => string;
+  pollDraft?: () => boolean;
   detailHead?: () => string;
   pollOpen?: () => boolean;
   pollFiles?: () => string[] | null;
+  priorComparison?: (base: string, head: string) => string | null;
+  reviewComments?: () => { id: number; body: string; path: string; line: number }[];
   existingChecks?: () => { id: number; status: string; external_id: string }[];
 } = {}): void {
   let polls = 0;
@@ -90,11 +93,16 @@ function stubGh(options: {
     let response = "[]";
     if (args.includes("user")) response = "test-user";
     else if (args.some((arg) => arg.includes("/compare/"))) {
-      if (!args.includes(`repos/acme/widgets/compare/main...${capturedHead}`)) {
-        callback(new Error("wrong captured comparison"), "", "");
+      const comparison = args[1]!.split("/compare/")[1]!;
+      const [base, head] = comparison.split("...") as [string, string];
+      const mergeBase = base === "main" && head === capturedHead
+        ? options.baseSha ?? "7777777777777777777777777777777777777777"
+        : options.priorComparison?.(base, head);
+      if (mergeBase === null || mergeBase === undefined) {
+        callback(new Error("could not compare those commits"), "", "");
         return undefined as never;
       }
-      response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
+      response = base === "main" && options.baseSha === null ? "" : mergeBase;
     } else if (args.includes("repos/acme/widgets/pulls/7")) {
       capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? options.detailHead?.() ?? options.pollHead?.() ?? "sha-7";
       response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
@@ -107,12 +115,14 @@ function stubGh(options: {
       response = JSON.stringify(files.map(filename => ({ filename })));
     } else if (options.existingChecks && args.some(arg => arg.includes("/check-runs?"))) {
       response = JSON.stringify({ check_runs: options.existingChecks() });
+    } else if (options.reviewComments && args.some(arg => arg.includes("/pulls/7/comments?"))) {
+      response = JSON.stringify(options.reviewComments());
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       capturedHead = options.pollHead?.() ?? "sha-7";
       response =
         options.readyPullRequest === true && options.pollOpen?.() !== false
           ? JSON.stringify([
-            { ...pullRequest, head: { ...pullRequest.head, sha: capturedHead }, draft: ++polls === 1 },
+            { ...pullRequest, head: { ...pullRequest.head, sha: capturedHead }, draft: options.pollDraft?.() ?? ++polls === 1 },
             ...(options.unrelatedDraft ? [{ ...pullRequest, number: 8, draft: true,
               base: { ref: "deleted-stack" }, head: { sha: "unrelated-head" } }] : []),
           ])
@@ -1272,7 +1282,7 @@ describe("watcher shutdown", () => {
       } else {
         expect(run).toMatchObject({ threadId: null, status: "cancelled", finishedAt: expect.any(Number),
           detail: count === 0 ? "dispatch recovery found no matching thread" : "dispatch recovery found multiple matching threads" });
-        expect(store.hasRunFor("rule_1", "acme/widgets", 42, "abc123")).toBe(false);
+        expect(store.hasSettlingDuplicate("rule_1", "acme/widgets", 42, "abc123")).toBe(false);
       }
       expect(harness.inspection.sdk.callsTo("threads.list")[0]).toEqual([
         { originPluginId: bb.pluginId, includeHidden: true, archived: false, limit: 100, offset: 0 },
@@ -1415,7 +1425,7 @@ describe("watcher shutdown", () => {
             status: "cancelled", threadId: null, finishedAt: null,
             detail: "plugin stopped before dispatch completed",
           });
-          expect(store.hasRunFor(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7")).toBe(false);
+          expect(store.hasSettlingDuplicate(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7")).toBe(false);
         }
         const callsAtStop = vi.mocked(execFile).mock.calls.length;
         release?.();
@@ -1621,6 +1631,229 @@ it("reviews a draft by hand only with --include-draft", async () => {
   } finally {
     await harness.lifecycle.dispose();
   }
+});
+
+describe("automatic review ranges", () => {
+  const priorHead = "a".repeat(40);
+  const pushedHead = "b".repeat(40);
+  const fullBase = "7".repeat(40);
+  const ruleName = "scoped-review";
+  const testPath = "test/full-pr-only.ts";
+
+  function reviewHost() {
+    const host = createFakePluginHost({ settings: { pollSeconds: 15 } });
+    const { sdk } = host.harness.inspection;
+    sdk.stub("threads.queue.list", () => []);
+    sdk.stub("threads.archive", () => ({ ok: true }));
+    sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_default", isDefault: true }] }));
+    let spawns = 0;
+    sdk.stub("threads.spawn", () => makeThreadResponse({ id: `thr_scoped_${++spawns}` }));
+    return host;
+  }
+
+  async function saveRule(harness: ReturnType<typeof reviewHost>["harness"], overrides: Record<string, unknown> = {}) {
+    const { rule } = await harness.behavior.callRpc("saveRule", { id: null, rule: {
+      name: ruleName, repo: "acme/widgets", dedupe: "once_per_head_sha",
+      triggers: ["new_commits", "ready_for_review"],
+      prompt: "Review the changes for this rule.",
+      request: { projectId: "project", providerId: "codex", model: "test" },
+      ...overrides,
+    } }) as { rule: { id: string } };
+    return rule.id;
+  }
+
+  function promptAt(harness: ReturnType<typeof reviewHost>["harness"], index: number): string {
+    return (harness.inspection.sdk.callsTo("threads.spawn")[index]?.[0] as { prompt: string }).prompt;
+  }
+
+  it.each([
+    { case: "confirmed ancestor of an already-observed commit", comparison: priorHead, verified: true, scope: "incremental" },
+    { case: "force-push", comparison: "f".repeat(40), verified: true, scope: "full" },
+    { case: "failed compare", comparison: null, verified: true, scope: "full" },
+    { case: "malformed compare", comparison: "not-a-sha", verified: true, scope: "full" },
+    { case: "no verified history", comparison: null, verified: false, scope: "full" },
+  ])("uses $scope review for $case", async ({ comparison, verified, scope }) => {
+    vi.useFakeTimers();
+    let head = priorHead;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => false,
+      priorComparison: (base, target) => base === priorHead && target === pushedHead ? comparison : null,
+      pollFiles: () => ["src/changed.ts", testPath],
+    });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      const store = createStore(bb.storage.database() as never);
+      const ruleId = await saveRule(harness, { conditions: [{ kind: "paths", globs: ["src/**"] }] });
+      if (verified) store.insertRun(makeReviewRun({
+        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
+        mode: "live", status: "commented_partial", threadId: null, finishedAt: 2,
+      }));
+      for (const [index, status] of (["cancelled", "failed", "skipped", "shadowed"] as const).entries()) {
+        store.insertRun(makeReviewRun({
+          id: `run_${status}`, ruleId, ruleName, prNumber: 7,
+          headSha: status === "cancelled" ? pushedHead : "c".repeat(40),
+          status, threadId: null, startedAt: 3 + index, finishedAt: 4 + index,
+        }));
+      }
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        head = pushedHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const prompt = promptAt(harness, 0);
+        expect(prompt).toContain("- Trigger: `new_commits`");
+        expect(prompt).toContain(`- Previous verified head: ${verified ? "`" + priorHead + "`" : "none"}`);
+        expect(prompt).toContain(`- Review scope: ${scope}`);
+        if (scope === "incremental") {
+          expect(prompt).toContain(`Inspect only \`git diff ${priorHead}..${pushedHead}\``);
+          expect(prompt).toContain(`git merge-base --is-ancestor ${priorHead} ${pushedHead}`);
+          expect(prompt).toContain("requirements that apply to those changes");
+          expect(prompt).not.toContain(testPath);
+          expect(prompt).not.toContain(`git diff ${fullBase}...${pushedHead}`);
+        } else {
+          expect(prompt).toContain(`Inspect \`git diff ${fullBase}...${pushedHead}\` and full files`);
+          expect(prompt).toContain(testPath);
+        }
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("runs a full readiness review after a same-head draft review", async () => {
+    vi.useFakeTimers();
+    let draft = true;
+    stubGh({ readyPullRequest: true, draft: true, pollHead: () => pushedHead, pollDraft: () => draft });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      await saveRule(harness);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--include-draft"])).exitCode).toBe(0);
+        const store = createStore(bb.storage.database() as never);
+        const [run] = store.listRuns();
+        await harness.behavior.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: run!.threadId!, status: "idle" }),
+          lastAssistantText: `🚨 \`slopcop/${ruleName}\` — No issues found.\n\n<!-- slopcop:rule=${ruleName} run=${run!.id} sha=${pushedHead} kind=summary -->`,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(store.getRun(run!.id)?.status).toBe("shadowed");
+        draft = false;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(promptAt(harness, 1)).toContain("- Trigger: `ready_for_review`");
+        expect(promptAt(harness, 1)).toContain(`- Review range: \`${fullBase}...${pushedHead}\``);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("skips a replayed verified incremental head but still runs readiness in full", async () => {
+    vi.useFakeTimers();
+    let head = priorHead;
+    let draft = false;
+    let verifiedRunId: string | null = null;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => draft,
+      priorComparison: (base, target) => base === priorHead && target === pushedHead ? priorHead : null,
+      reviewComments: () => verifiedRunId === null ? [] : [{
+        id: 1, path: "src/changed.ts", line: 4,
+        body: `🚨 \`slopcop/${ruleName}\` — **Unused write.**\n\nRemove the unused write.\n\n<!-- slopcop:rule=${ruleName} run=${verifiedRunId} sha=${pushedHead} kind=inline -->`,
+      }],
+    });
+    stubCheckWrites(true);
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      const store = createStore(bb.storage.database() as never);
+      const ruleId = await saveRule(harness, { mode: "live" });
+      store.insertRun(makeReviewRun({
+        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
+        mode: "live", status: "no_comment", threadId: null, finishedAt: 2,
+      }));
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        head = pushedHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const run = store.listRuns().find(run => run.headSha === pushedHead)!;
+        expect(promptAt(harness, 0)).toContain("- Review scope: incremental");
+        verifiedRunId = run.id;
+        await harness.behavior.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: run.threadId!, status: "idle" }), lastAssistantText: "One finding",
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(store.getRun(run.id)?.status).toBe("commented");
+        head = priorHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        head = pushedHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        expect(store.listRuns().find(run => run.headSha === pushedHead && run.status === "skipped")?.detail).toContain(run.id);
+
+        draft = true;
+        await vi.advanceTimersByTimeAsync(15_000);
+        draft = false;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const prompt = promptAt(harness, 1);
+        expect(prompt).toContain("- Trigger: `ready_for_review`");
+        expect(prompt).toContain("- Review scope: full");
+        expect(prompt).toContain(`- Review range: \`${fullBase}...${pushedHead}\``);
+        expect(prompt).toContain('"title":"Unused write.","summary":"Remove the unused write."');
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("does not let a push replace outstanding readiness work", async () => {
+    vi.useFakeTimers();
+    let draft = true;
+    let head = priorHead;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => draft,
+      pollFiles: () => head === priorHead ? null : ["src/changed.ts"],
+      priorComparison: () => priorHead,
+    });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { conditions: [{ kind: "paths", globs: ["src/**"] }] });
+      const store = createStore(bb.storage.database() as never);
+      store.insertRun(makeReviewRun({
+        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
+        mode: "live", status: "commented", threadId: null, finishedAt: 2,
+      }));
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        draft = false;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        head = pushedHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(promptAt(harness, 0)).toContain("- Trigger: `ready_for_review`");
+        expect(promptAt(harness, 0)).toContain(`- Review range: \`${fullBase}...${pushedHead}\``);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
 });
 
 it.each([

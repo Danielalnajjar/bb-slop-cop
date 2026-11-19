@@ -66,6 +66,7 @@ export const triggerSchema = z.enum([
   "manual",
 ]);
 export type Trigger = z.infer<typeof triggerSchema>;
+export type ReviewScope = "full" | "incremental";
 
 /**
  * The composer's resolved selections, stored verbatim and replayed at dispatch.
@@ -189,7 +190,7 @@ export interface PullRequest {
   isClosed?: boolean;
   headRefOid: string;
   headRefName: string;
-  /** Merge base of the head and current base-branch tip; empty until review preparation. */
+  /** Base of the pinned review range; empty until review preparation. */
   baseRefOid: string;
   baseRefName: string;
   author: { login: string } | null;
