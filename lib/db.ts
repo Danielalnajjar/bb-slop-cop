@@ -148,6 +148,13 @@ export const MIGRATIONS: string[] = [
 ];
 
 type Row = Record<string, unknown>;
+const REVIEW_DEDUPE_WINNER = `(
+  status NOT IN ('waiting', 'skipped', 'cancelled', 'failed')
+  OR (status = 'waiting' AND head_sha = ? AND EXISTS (
+    SELECT 1 FROM review_provisioning WHERE run_id = runs.id
+  ))
+)`;
+
 export interface ProvisionDispatchOptions {
   trigger: Trigger;
   force?: boolean;
@@ -270,15 +277,12 @@ export function createStore(db: Database) {
   }
 
   return {
-    canProvision(hostId: string, limit: number, runId: string): boolean {
-      // Earlier waiters get first claim on free slots on this host.
+    canProvision(hostId: string, limit: number): boolean {
+      // A waiting review owns no slot; the drain tries waiters in arrival order.
       const row = db.prepare(
-        `SELECT count(*) AS occupied FROM review_provisioning AS other
-         LEFT JOIN review_provisioning AS mine ON mine.run_id = ?
-         WHERE other.host_id = ? AND other.run_id != ? AND (
-           other.waiting_options IS NULL OR mine.run_id IS NULL OR other.rowid < mine.rowid
-         )`,
-      ).get(runId, hostId, runId) as Row;
+        `SELECT count(*) AS occupied FROM review_provisioning
+         WHERE host_id = ? AND waiting_options IS NULL`,
+      ).get(hostId) as Row;
       return num(row, "occupied") < limit;
     },
 
@@ -289,8 +293,9 @@ export function createStore(db: Database) {
       ).run(runId, hostId, waiting === null ? null : JSON.stringify(waiting));
     },
 
-    clearProvisioning(runId: string): void {
-      db.prepare(`DELETE FROM review_provisioning WHERE run_id = ?`).run(runId);
+    clearProvisioning(runId: string): boolean {
+      const result = db.prepare(`DELETE FROM review_provisioning WHERE run_id = ?`).run(runId) as { changes: number };
+      return result.changes > 0;
     },
 
     findProvisioningRun(threadId: string): string | null {
@@ -508,9 +513,7 @@ export function createStore(db: Database) {
            SELECT id FROM runs
            WHERE ? = 0 AND rule_id = ? AND repo = ? AND pr_number = ?
              AND (? IS NULL OR head_sha = ?)
-             AND (status NOT IN ('waiting', 'skipped', 'cancelled', 'failed')
-               OR (status = 'waiting' AND head_sha = ? AND id != ?
-                 AND EXISTS (SELECT 1 FROM review_provisioning WHERE run_id = runs.id)))
+             AND ${REVIEW_DEDUPE_WINNER} AND id != ?
            ORDER BY started_at, id LIMIT 1
          )
          INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
@@ -641,23 +644,13 @@ export function createStore(db: Database) {
       repo: string,
       prNumber: number,
       headSha: string | null,
+      pendingHeadSha = headSha,
     ): boolean {
-      const row =
-        headSha === null
-          ? db
-              .prepare(
-                `SELECT 1 AS hit FROM runs
-                 WHERE rule_id = ? AND repo = ? AND pr_number = ?
-                   AND status NOT IN ('waiting', 'skipped', 'cancelled', 'failed') LIMIT 1`,
-              )
-              .get(ruleId, repo, prNumber)
-          : db
-              .prepare(
-                `SELECT 1 AS hit FROM runs
-                 WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha = ?
-                   AND status NOT IN ('waiting', 'skipped', 'cancelled', 'failed') LIMIT 1`,
-              )
-              .get(ruleId, repo, prNumber, headSha);
+      const row = db.prepare(
+        `SELECT 1 FROM runs
+         WHERE rule_id = ? AND repo = ? AND pr_number = ?
+           AND (? IS NULL OR head_sha = ?) AND ${REVIEW_DEDUPE_WINNER} LIMIT 1`,
+      ).get(ruleId, repo, prNumber, headSha, headSha, pendingHeadSha);
       return row !== undefined;
     },
 

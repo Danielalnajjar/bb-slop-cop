@@ -38,8 +38,8 @@ until corrected through Settings or the CLI; the plugin never rewrites them.
 ### Review provisioning limit
 
 `maxConcurrentProvisionsPerHost` is an integer ≥1 (default 4). When a host
-reaches the limit, SlopCop saves additional reviews and dispatches them in
-order as provisioning finishes. This also applies to manual and forced
+reaches the limit, SlopCop saves additional reviews and retries eligible
+reviews in queue order as provisioning finishes. This applies to manual and forced
 reviews; any live check remains non-terminal while the review waits. The queue
 survives plugin reloads.
 

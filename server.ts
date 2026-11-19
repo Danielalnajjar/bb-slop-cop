@@ -569,7 +569,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!stillExpected()) return { runId, threadId: null };
       const hostId = environment.machine.type === "existing" ? environment.machine.hostId : null;
       const admitted = store.atomic(() => {
-        if (hostId !== null && !store.canProvision(hostId, maxProvisionsPerHost, runId)) {
+        if (hostId !== null && !store.canProvision(hostId, maxProvisionsPerHost)) {
           store.setProvisioning(runId, hostId, options);
           store.updateRun(runId, { status: "waiting", detail: PROVISION_CAPACITY_DETAIL });
           return false;
@@ -607,8 +607,13 @@ export default async function plugin(bb: BbPluginApi) {
       }).finally(() => spawning.delete(runId));
       preparingInputs = false;
       const threadId = (thread as { id: string }).id;
+      const pending = pendingFinish.get(threadId);
       // The terminal event may have arrived before spawn returned the ID.
-      if (hostId !== null) void observeProvisioningEnd(threadId);
+      if (hostId !== null) {
+        if (pending !== undefined || reviewThreadOutcome(thread).kind !== "running") releaseProvision(runId);
+        else void observeProvisioningEnd(threadId);
+      }
+      pendingFinish.delete(threadId);
       // `runs cancel` can finalize this run while it still has no thread. The
       // cancellation stays; writing `reviewing` over it here would leave the
       // agent running with no event able to close the run again.
@@ -631,15 +636,13 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
       );
-      const pending = pendingFinish.get(threadId);
       if (pending !== undefined) {
-        pendingFinish.delete(threadId);
         await finishRun(threadId, pending.finalMessage, pending.noVerdict);
       }
       return { runId, threadId };
     } catch (error) {
       throwIfDispatchAborted();
-      if (store.getRun(runId)?.threadId === null) store.clearProvisioning(runId);
+      if (store.getRun(runId)?.threadId === null) releaseProvision(runId);
       if (!stillExpected()) return { runId, threadId: null };
       store.updateRun(runId, {
         status: preparingInputs ? "cancelled" : "failed",
@@ -976,7 +979,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
     if (trigger === "new_commits" && rule.settleMinutes > 0 &&
-        !store.hasRunFor(ruleId, rule.repo, prNumber, dedupeHead)) {
+        !store.hasRunFor(ruleId, rule.repo, prNumber, dedupeHead, headSha)) {
       let current = waiting;
       if (current === null || replaced || current.mode !== rule.mode) {
         const next = {
@@ -1013,11 +1016,11 @@ export default async function plugin(bb: BbPluginApi) {
   async function drainProvisioningQueue(values: Awaited<ReturnType<typeof readSettings>>) {
     const provisions = store.listProvisioning();
     await Promise.all(provisions.flatMap(({ run, waiting }) =>
-      waiting === null && run.threadId !== null ? [observeProvisioningEnd(run.threadId)] : [],
+      waiting === null && run.threadId !== null ? [observeProvisioningEnd(run.threadId, true)] : [],
     ));
     for (const { run, hostId, waiting } of provisions) {
       if (waiting === null || !store.isWaitingForProvisioning(run.id)) continue;
-      if (!store.canProvision(hostId, values.maxProvisionsPerHost, run.id)) continue;
+      if (!store.canProvision(hostId, values.maxProvisionsPerHost)) continue;
       if (waiting.trigger !== "manual" && inFlight.size >= values.maxConcurrent) continue;
       try {
         const rule = store.getRule(run.ruleId);
@@ -1026,12 +1029,15 @@ export default async function plugin(bb: BbPluginApi) {
           continue;
         }
         const pullRequest = await waitForWork(() => gh.getPullRequest(run.repo, run.prNumber));
-        if (pullRequest.headRefOid !== run.headSha) {
-          await discardProvisionWait(run, supersededBy(pullRequest.headRefOid));
-          continue;
-        }
         if (pullRequest.isClosed) {
           await discardProvisionWait(run, "pull request closed while waiting for provisioning");
+          continue;
+        }
+        if (pullRequest.headRefOid !== run.headSha) {
+          const replacement = waiting.trigger !== "manual" && !pullRequest.isDraft
+            ? { headSha: pullRequest.headRefOid, trigger: waiting.trigger }
+            : undefined;
+          await discardProvisionWait(run, supersededBy(pullRequest.headRefOid), replacement);
           continue;
         }
         if (!waiting.force) {
@@ -1073,22 +1079,26 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function releaseProvision(runId: string): void {
-    store.clearProvisioning(runId);
+    if (!store.clearProvisioning(runId)) return;
     provisionDrainRequested = true;
     wakeProvisionDrain?.();
   }
 
-  async function discardProvisionWait(run: Run, detail: string) {
+  async function discardProvisionWait(run: Run, detail: string, replacement?: { headSha: string; trigger: Trigger }) {
     if (!store.isWaitingForProvisioning(run.id)) return;
     store.atomic(() => {
       store.clearProvisioning(run.id);
       store.updateRun(run.id, { status: "skipped", detail });
+      if (replacement !== undefined &&
+          store.getDeferredReview(run.ruleId, run.repo, run.prNumber)?.headSha !== replacement.headSha) {
+        store.deferReview(run.ruleId, run.repo, run.prNumber, replacement.trigger, replacement.headSha, Date.now());
+      }
     });
     announce();
     await finalizeRun({ ...run, status: "skipped", detail });
   }
 
-  async function observeProvisioningEnd(threadId: string): Promise<void> {
+  async function observeProvisioningEnd(threadId: string, reconcile = false): Promise<void> {
     if (watcherSignal?.aborted) return;
     const runId = store.findProvisioningRun(threadId);
     if (runId === null) return;
@@ -1097,7 +1107,10 @@ export default async function plugin(bb: BbPluginApi) {
         threadId, types: ["system/thread-provisioning"], order: "desc", limit: "1",
       }));
       if (event?.type === "system/thread-provisioning" && event.data.status !== "active") {
-        if (store.findProvisioningRun(threadId) === runId) releaseProvision(runId);
+        releaseProvision(runId);
+      } else if (reconcile) {
+        const thread = await waitForWork(() => bb.sdk.threads.get({ threadId }));
+        if (reviewThreadOutcome(thread).kind !== "running") releaseProvision(runId);
       }
     } catch (error) {
       if (watcherSignal?.aborted) return;
