@@ -13,8 +13,9 @@ import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
-import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment } from "./lib/review-input";
+import { reviewDeltaContract } from "./lib/review-delta";
 import {
   archiveReviewThread,
   reviewThreadOutcome,
@@ -30,6 +31,7 @@ import {
   describeTrust,
   evaluateRule,
   isDangerousCombination,
+  isTrustedAuthor,
 } from "./lib/matcher";
 import {
   incompleteReviewReason,
@@ -256,6 +258,7 @@ export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   const store: Store = createStore(db as never);
+  const reviewHost = bb.hosts.experimental_client({ contract: reviewDeltaContract });
 
   let gh: GhClient = createGhClient("gh");
   let ghLogin: string | null = null;
@@ -380,6 +383,7 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ runId: string; threadId: string | null }> {
     if (recoveringReviews !== undefined) await recoveringReviews;
     const { number: prNumber, headRefOid: headSha } = pullRequest;
+    const trigger = options.trigger ?? "manual";
     const scope = { ruleId: rule.id, repo: rule.repo, prNumber, headSha };
     const deferred = () => store.getDeferredReview(rule.id, rule.repo, prNumber);
     const values = await readSettings();
@@ -403,9 +407,34 @@ export default async function plugin(bb: BbPluginApi) {
         return { runId: skipped.id, threadId: null };
       }
     }
+    const previousVerifiedHead = store.latestVerifiedHead(rule.id, rule.repo, prNumber);
+    let baseRefOid: string | undefined;
+    let delta: z.infer<typeof reviewDeltaContract.reviewDelta.output> = null;
+    if (trigger === "new_commits" && previousVerifiedHead !== null && previousVerifiedHead !== headSha &&
+        rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
+      const projectId = rule.request.projectId;
+      try {
+        baseRefOid = await waitForWork(() => gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, headSha));
+        const project = await waitForWork(() => bb.sdk.projects.get({ projectId }));
+        const source = project.sources.find(source => source.isDefault);
+        if (source?.path && source.hostId) {
+          const timeout = AbortSignal.timeout(60_000);
+          delta = await reviewHost.call("reviewDelta", {
+            repo: rule.repo, sourcePath: source.path, prior: previousVerifiedHead, base: baseRefOid, head: headSha,
+          }, { hostId: source.hostId, signal: watcherSignal ? AbortSignal.any([watcherSignal, timeout]) : timeout });
+        }
+      } catch {
+        // An unavailable comparison cannot exclude any part of the full PR diff.
+        watcherSignal?.throwIfAborted();
+      }
+    }
+    const reviewScope = delta === null ? "full" : "incremental";
+    const noChanges = delta?.patchBase64 === "";
     const pending = deferred();
-    if (dispatchOptions.trigger !== "manual" && (
-      pending === null || store.getRule(rule.id)?.updatedAt !== rule.updatedAt
+    if (trigger !== "manual" && (
+      pending?.trigger !== trigger ||
+      (pending.headSha !== null && pending.headSha !== headSha) ||
+      store.getRule(rule.id)?.updatedAt !== rule.updatedAt
     )) return { runId: "", threadId: null };
     const waiting = pending?.waiting ?? null;
     const promoted = waiting?.headSha === headSha && waiting.mode === rule.mode;
@@ -415,11 +444,17 @@ export default async function plugin(bb: BbPluginApi) {
     // record why on the run itself — otherwise the activity feed shows a
     // perfectly ordinary review and the override is invisible in hindsight.
     const forcedReason = options.forcedReason ?? null;
+    const detail = noChanges
+      ? `${delta?.baseMerged ? "Base merge with no" : "No"} PR-owned change since reviewed head ${previousVerifiedHead}.`
+      : forcedReason === null ? null : `forced past the gate — ${forcedReason}`;
     const reservation = store.atomic(() => {
       const admitted = store.admitRun({
-        ...newRun(rule, pullRequest, "dispatched", runId),
-        detail: forcedReason === null ? null : `forced past the gate — ${forcedReason}`,
-      }, rule.dedupe, options.force, promoted);
+        ...newRun(rule, pullRequest, noChanges ? "no_pr_changes" : "dispatched", runId),
+        detail,
+      }, {
+        dedupe: rule.dedupe, scope: reviewScope, trigger,
+        isDraft: pullRequest.isDraft, force: options.force, promoted,
+      });
       if (waiting !== null && !promoted) {
         store.discardDeferredReview(rule.id, rule.repo, prNumber,
           waiting.headSha !== headSha ? supersededBy(headSha) : "rule mode changed while waiting");
@@ -447,7 +482,13 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId, threadId: null };
     }
     await Promise.all(replaced.map(run => finalizeRun(run)));
-    return startReview(rule, pullRequest, reservation, dispatchOptions, values, promoted);
+    if (reservation.status === "no_pr_changes") {
+      await finalizeRun(reservation);
+      return { runId, threadId: null };
+    }
+    return startReview(rule, pullRequest, reservation, dispatchOptions, values, promoted, {
+      baseRefOid, delta, previousVerifiedHead,
+    });
   }
 
   async function startReview(
@@ -457,9 +498,15 @@ export default async function plugin(bb: BbPluginApi) {
     options: ProvisionDispatchOptions,
     { botGhPath, defaultThreadSection, maxProvisionsPerHost }: Awaited<ReturnType<typeof readSettings>>,
     promoted: boolean,
+    prepared?: {
+      baseRefOid: string | undefined;
+      delta: z.infer<typeof reviewDeltaContract.reviewDelta.output>;
+      previousVerifiedHead: string | null;
+    },
   ): Promise<{ runId: string; threadId: string | null }> {
     const runId = reservation.id;
     const wasQueued = reservation.status === "waiting";
+    const { trigger } = options;
     const stillExpected = () => {
       const current = store.getRun(runId);
       return current !== null && (isReviewInProgress(current) ||
@@ -552,16 +599,34 @@ export default async function plugin(bb: BbPluginApi) {
       preparingInputs = true;
       const reviewPullRequest = {
         ...pullRequest,
-        baseRefOid: await waitForWork(() =>
+        baseRefOid: options.reviewInputs?.baseRefOid ?? prepared?.baseRefOid ?? await waitForWork(() =>
           gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, pullRequest.headRefOid),
         ),
       };
       const environment = await waitForWork(() =>
         buildReviewEnvironment(bb.sdk, rule.request!, reviewPullRequest),
       );
-      const context = {
+      const delta = prepared?.delta;
+      let incremental = options.reviewInputs?.incremental;
+      if (delta != null) {
+        const projectId = rule.request.projectId;
+        const patch = await waitForWork(() =>
+          bb.sdk.projects.attachments.upload({
+            projectId, filename: `slopcop-${runId}.patch`,
+            clientFile: Buffer.from(delta.patchBase64, "base64"), mimeType: "text/plain",
+          }),
+        );
+        incremental = { tree: delta.tree, patch, projectId };
+      }
+      const previousVerifiedHead = options.reviewInputs?.previousVerifiedHead ??
+        prepared?.previousVerifiedHead ?? store.latestVerifiedHead(rule.id, rule.repo, pullRequest.number);
+      const patch = incremental?.patch;
+      const context: DispatchContext = {
         rule,
         pullRequest: reviewPullRequest,
+        trigger,
+        incremental: incremental && { tree: incremental.tree, patchName: incremental.patch.name },
+        previousVerifiedHead,
         runId,
         ghCommand: botGhPath,
         priorComments,
@@ -570,7 +635,9 @@ export default async function plugin(bb: BbPluginApi) {
       const hostId = environment.machine.type === "existing" ? environment.machine.hostId : null;
       const admitted = store.atomic(() => {
         if (hostId !== null && !store.canProvision(hostId, maxProvisionsPerHost)) {
-          store.setProvisioning(runId, hostId, options);
+          store.setProvisioning(runId, hostId, {
+            ...options, reviewInputs: { baseRefOid: reviewPullRequest.baseRefOid, previousVerifiedHead, incremental },
+          });
           store.updateRun(runId, { status: "waiting", detail: PROVISION_CAPACITY_DETAIL });
           return false;
         }
@@ -593,7 +660,9 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await bb.sdk.threads.spawn({
           ...execution,
           environment,
-          prompt: buildPrompt(context),
+          ...(patch === undefined
+            ? { prompt: buildPrompt(context) }
+            : { input: [{ type: "text", text: buildPrompt(context) }, patch] }),
           title: buildThreadTitle(context),
           visibility: rule.visibility,
           ...(sectionId === undefined ? {} : { sectionId }),
@@ -979,7 +1048,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
     if (trigger === "new_commits" && rule.settleMinutes > 0 &&
-        !store.hasRunFor(ruleId, rule.repo, prNumber, dedupeHead, headSha)) {
+        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, dedupeHead, rule.mode, headSha)) {
       let current = waiting;
       if (current === null || replaced || current.mode !== rule.mode) {
         const next = {
@@ -1024,7 +1093,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (waiting.trigger !== "manual" && inFlight.size >= values.maxConcurrent) continue;
       try {
         const rule = store.getRule(run.ruleId);
-        if (rule === null || rule.repo !== run.repo || rule.mode !== run.mode || rule.name !== run.ruleName) {
+        if (rule === null || rule.repo !== run.repo || rule.mode !== run.mode || rule.name !== run.ruleName ||
+            (waiting.reviewInputs?.incremental && rule.request?.projectId !== waiting.reviewInputs.incremental.projectId)) {
           await discardProvisionWait(run, "rule changed while waiting for provisioning");
           continue;
         }
@@ -1292,7 +1362,8 @@ export default async function plugin(bb: BbPluginApi) {
   async function finalizeRunOnce(run: Run): Promise<void> {
     if (store.getRun(run.id)?.finishedAt !== null) return;
     const superseded = run.detail?.startsWith(SUPERSEDED_DETAIL) === true;
-    const awaitingCleanup = superseded || run.status === "skipped" || run.detail === WAITING_CANCELLED_DETAIL;
+    const awaitingCleanup = superseded || run.status === "skipped" ||
+      run.status === "no_pr_changes" || run.detail === WAITING_CANCELLED_DETAIL;
     let threadId = run.threadId;
     let stopped = true;
     if (superseded && threadId !== null) stopped = await stopReviewThread(threadId);

@@ -54,6 +54,7 @@ export function conclusionFor(status: RunStatus): CheckConclusion | null {
     case "commented":
     case "commented_partial":
     case "commented_unmarked":
+    case "no_pr_changes":
       return "success";
     case "no_comment":
     case "commented_unattributed":
@@ -93,6 +94,11 @@ export function outputFor(input: CompleteCheckInput): {
       return {
         title: "Review finished without a comment",
         summary: `SlopCop ran \`${ruleName}\` on PR #${prNumber} but posted nothing.${extra}`,
+      };
+    case "no_pr_changes":
+      return {
+        title: "No PR-owned changes",
+        summary: detail ?? "No PR-owned changes since the last verified review.",
       };
     case "commented_unattributed":
       return {

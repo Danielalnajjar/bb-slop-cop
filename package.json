@@ -20,6 +20,7 @@
       "icon": "./assets/icon.svg"
     },
     "server": "./server.ts",
+    "host": "./host.ts",
     "app": "./app.tsx"
   },
   "dependencies": {
