@@ -141,6 +141,7 @@ export const runStatusSchema = z.enum([
   "commented_unattributed",
   "shadowed",
   "no_comment",
+  "no_pr_changes",
   "skipped",
   // A review that never reached a verdict: its thread ended, errored, was
   // retired, or was cancelled first. `failed` is reserved for a review that
@@ -190,7 +191,7 @@ export interface PullRequest {
   isClosed?: boolean;
   headRefOid: string;
   headRefName: string;
-  /** Base of the pinned review range; empty until review preparation. */
+  /** Pinned PR merge base; empty until review preparation. */
   baseRefOid: string;
   baseRefName: string;
   author: { login: string } | null;

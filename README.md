@@ -82,11 +82,14 @@ Three decisions do most of the work.
 
 Each review requests a fresh BB `git-worktree` at the captured PR head. Managed
 repository setup runs there, so input preparation requires **write access**.
-The agent checks HEAD, tracked-file cleanliness, and the selected comparison
-base before reading the pinned diff. A new-commit review uses only changes
-since the latest GitHub-verified head when GitHub confirms it is an ancestor,
-plus the files and rules those changes touch. Without confirmed ancestry,
-SlopCop reviews the full PR diff. Readiness and manual reviews are always full.
+The agent checks HEAD and tracked-file cleanliness before reading its review
+inputs. For a new commit, SlopCop confirms that the latest GitHub-verified
+head is an ancestor, then merges the captured PR merge base into that older
+head to construct a comparison tree. The attached patch compares that tree
+with the new head. It excludes work imported from the base branch but includes
+any PR-owned changes or merge resolutions. An empty range completes the check
+without launching a reviewer. If SlopCop cannot compute the incremental patch,
+it reviews the full pinned PR diff. Readiness and manual reviews are always full.
 A failed input check returns plain
 `Review incomplete: <reason>` and records a cancelled, unreviewed run, not a clean
 summary. Missing head objects fail provisioning rather than falling back to the
@@ -267,7 +270,8 @@ reviews are untouched.
 
 `shadowed` · `commented` · `commented_partial` / `commented_unmarked` /
 `commented_unattributed` (posted, attribution degraded) · `no_comment` (finished
-without posting) · `waiting` (head is settling or waiting for capacity after
+without posting) · `no_pr_changes` (the pinned PR-owned patch was empty; no
+thread dispatched) · `waiting` (head is settling or waiting for capacity after
 settling) · `skipped` (not dispatched, e.g. blocked by the trust gate or
 superseded while waiting) ·
 `cancelled` (the thread ended, errored, was retired, or was cancelled before

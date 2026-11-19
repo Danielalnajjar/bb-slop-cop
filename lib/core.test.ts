@@ -133,7 +133,7 @@ describe("home-relative paths", () => {
   });
 });
 
-const fullReview = { trigger: "manual", reviewScope: "full", previousVerifiedHead: null } as const;
+const fullReview = { trigger: "manual", previousVerifiedHead: null } as const;
 
 describe("the pull request block", () => {
   const prompt = (files: { path: string }[]) =>

@@ -72,6 +72,9 @@ export function liveVerifyBlockReason(run: {
   if (run.status === "skipped") {
     return "skipped runs never dispatched a review";
   }
+  if (run.status === "no_pr_changes") {
+    return "no PR-owned changes required review, so there are no review comments to verify";
+  }
   // Verification would rewrite a cancellation as `no_comment`, which dedupes
   // the PR away from the re-review the cancelled status exists to allow.
   if (run.status === "cancelled") {

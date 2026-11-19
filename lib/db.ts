@@ -1,5 +1,6 @@
 // Persistence. Migrations are append-only by statement index — never reorder
 // or edit a shipped statement, only push new ones.
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type {
   GateCheck,
   GateRun,
@@ -163,6 +164,15 @@ export interface ProvisionDispatchOptions {
   force?: boolean;
   forcedReason?: string | null;
   includeDraft?: boolean;
+  reviewInputs?: {
+    baseRefOid: string;
+    previousVerifiedHead: string | null;
+    incremental?: {
+      tree: string;
+      patch: Awaited<ReturnType<BbPluginApi["sdk"]["projects"]["attachments"]["upload"]>>;
+      projectId: string;
+    };
+  };
 }
 
 export const SUPERSEDED_DETAIL = "superseded by newer head ";
@@ -171,6 +181,7 @@ export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
 const VERIFIED_REVIEW = `(mode = 'live' AND status IN ('commented', 'commented_partial',
   'commented_unmarked', 'commented_unattributed', 'no_comment'))`;
 const FULL_NON_DRAFT_REVIEW = `(review_scope = 'full' AND was_draft = 0)`;
+const COVERED_PUSH = `(${VERIFIED_REVIEW} OR (mode = ? AND status = 'no_pr_changes'))`;
 
 function text(row: Row, key: string, fallback = ""): string {
   const value = row[key];
@@ -534,7 +545,7 @@ export function createStore(db: Database) {
            WHERE ? = 0 AND rule_id = ? AND repo = ? AND pr_number = ?
              AND ${REVIEW_DEDUPE_WINNER} AND id != ?
              AND (? IS NULL OR (head_sha = ? AND (
-               (? = 'new_commits' AND ${VERIFIED_REVIEW})
+               (? = 'new_commits' AND ${COVERED_PUSH})
                OR ((mode = ? OR ${VERIFIED_REVIEW})
                  AND (review_scope = 'full' OR review_scope = ?) AND (was_draft = 0 OR ? = 1))
              )))
@@ -558,7 +569,7 @@ export function createStore(db: Database) {
          RETURNING *`,
       ).get(
         options.force ? 1 : 0, run.ruleId, run.repo, run.prNumber, run.headSha, run.id, headSha, headSha,
-        options.trigger, run.mode, options.scope, options.isDraft ? 1 : 0,
+        options.trigger, run.mode, run.mode, options.scope, options.isDraft ? 1 : 0,
         run.id, run.ruleId, run.ruleName, run.repo, run.prNumber, run.prTitle,
         run.prAuthor, run.headSha, run.status, run.mode, run.detail,
         run.threadId, run.commentCount, run.startedAt, options.promoted ? null : run.startedAt, run.finishedAt,
@@ -653,7 +664,7 @@ export function createStore(db: Database) {
     listReviewCleanupRuns(): Run[] {
       return (db.prepare(
         `SELECT * FROM runs WHERE finished_at IS NULL AND (
-           status = 'skipped' OR (status = 'cancelled' AND (detail LIKE ? OR detail = ?))
+           status IN ('skipped', 'no_pr_changes') OR (status = 'cancelled' AND (detail LIKE ? OR detail = ?))
          )`,
       ).all(`${SUPERSEDED_DETAIL}%`, WAITING_CANCELLED_DETAIL) as Row[]).map(rowToRun);
     },
@@ -678,8 +689,8 @@ export function createStore(db: Database) {
         `SELECT 1 FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ?
            AND (? IS NULL OR head_sha = ?) AND ${REVIEW_DEDUPE_WINNER}
-           AND (? IS NULL OR ${VERIFIED_REVIEW} OR (mode = ? AND ${FULL_NON_DRAFT_REVIEW})) LIMIT 1`,
-      ).get(ruleId, repo, prNumber, headSha, headSha, pendingHeadSha, headSha, mode);
+           AND (? IS NULL OR ${COVERED_PUSH} OR (mode = ? AND ${FULL_NON_DRAFT_REVIEW})) LIMIT 1`,
+      ).get(ruleId, repo, prNumber, headSha, headSha, pendingHeadSha, headSha, mode, mode);
       return row !== undefined;
     },
 
