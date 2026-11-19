@@ -166,9 +166,156 @@ async function startWatcher(
   await service.done;
 }
 
+function reviewProvisioningEvent(threadId: string, status: "active" | "completed" | "failed" | "cancelled") {
+  return {
+    id: `${threadId}-provision`,
+    threadId,
+    scope: { kind: "thread" },
+    type: "system/thread-provisioning",
+    seq: 1,
+    createdAt: 1,
+    data: { status, provisioningId: `provision-${threadId}`, environmentId: null, entries: [] },
+  } as const;
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.resetAllMocks();
+});
+
+it.each(["completed", "failed", "cancelled"] as const)(
+  "queues only the same host and releases its slot when provisioning is %s",
+  async (terminalStatus) => {
+    vi.useFakeTimers();
+    stubGh();
+    const writes = stubCheckWrites(true);
+    const { bb, harness } = createFakePluginHost({
+      settings: { pollSeconds: 15, maxConcurrentProvisionsPerHost: 1 },
+    });
+    let finishFirstSpawn!: () => void;
+    let firstStatus: "active" | typeof terminalStatus = "active";
+    harness.inspection.sdk.stub("threads.spawn", ({ title }) => {
+      if (title?.includes("first")) return new Promise(resolve => {
+        finishFirstSpawn = () => resolve(makeThreadResponse({ id: "thr_first", status: "starting" }));
+      });
+      const id = title?.includes("same-host") ? "thr_same_host" : "thr_other_host";
+      return makeThreadResponse({ id, status: "starting" });
+    });
+    harness.inspection.sdk.stub("threads.events.list", ({ threadId }) => [
+      reviewProvisioningEvent(threadId, threadId === "thr_first" ? firstStatus : "active"),
+    ]);
+    await plugin(bb);
+    const service = harness.behavior.runService("watcher");
+    try {
+      for (const [name, hostId, mode] of [
+        ["first", "host_a", "live"],
+        ["same-host", "host_a", "live"],
+        ["other-host", "host_b", "shadow"],
+      ]) {
+        await harness.behavior.callRpc("saveRule", { id: null, rule: {
+          name, repo: "acme/widgets", mode,
+          request: { projectId: "project", providerId: "codex", model: "test",
+            environment: { type: "host", hostId, workspace: { type: "project-checkout" } } },
+        } });
+      }
+      const first = harness.behavior.runCli(["dispatch", "first", "7"]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      const queued = await harness.behavior.runCli(["dispatch", "same-host", "7", "--force"]);
+      expect(queued).toMatchObject({ exitCode: 0, stdout: expect.stringContaining("Queued same-host") });
+      expect((await harness.behavior.runCli(["dispatch", "other-host", "7"])).stdout).toContain("thread=thr_other_host");
+      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+      expect(writes.map(write => write.status)).toEqual(["in_progress", "in_progress"]);
+      finishFirstSpawn();
+      expect((await first).stdout).toContain("thread=thr_first");
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+
+      firstStatus = terminalStatus;
+      await harness.behavior.emitThreadEvent("experimental_thread.events", {
+        thread: makeThreadResponse({ id: "thr_first", status: "starting", originPluginId: bb.pluginId }), sequence: 1,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(3);
+      expect(await harness.behavior.callRpc("listRuns", {})).toMatchObject({
+        runs: expect.arrayContaining([
+          expect.objectContaining({ ruleName: "first", status: "reviewing" }),
+          expect.objectContaining({ ruleName: "same-host", status: "reviewing", threadId: "thr_same_host" }),
+        ]),
+      });
+      expect(writes.map(write => write.status)).toEqual(["in_progress", "in_progress"]);
+    } finally {
+      finishFirstSpawn?.();
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  },
+);
+
+it("reuses a provisioning wait's run and check after reload without releasing the still-starting thread", async () => {
+  vi.useFakeTimers();
+  stubGh({ readyPullRequest: true });
+  const writes = stubCheckWrites(true);
+  let host = createFakePluginHost({
+    settings: { pollSeconds: 15, maxConcurrentProvisionsPerHost: 1 },
+  });
+  let firstReady = false;
+  const configure = () => {
+    host.harness.inspection.sdk.stub("projects.get", () => ({ sources: [{ hostId: "host_a", isDefault: true }] }));
+    host.harness.inspection.sdk.stub("threads.get", ({ threadId }) => makeThreadResponse({ id: threadId, status: "starting" }));
+    host.harness.inspection.sdk.stub("threads.spawn", ({ title }) =>
+      makeThreadResponse({ id: title?.includes("manual") ? "thr_manual" : "thr_automatic", status: "starting" }));
+    host.harness.inspection.sdk.stub("threads.events.list", ({ threadId }) => [
+      reviewProvisioningEvent(threadId, threadId === "thr_manual" && firstReady ? "completed" : "active"),
+    ]);
+  };
+  const runs = () => host.harness.behavior.callRpc("listRuns", {}) as Promise<{ runs: Run[] }>;
+  configure();
+  await plugin(host.bb);
+  const rule = { repo: "acme/widgets", request: { projectId: "project", providerId: "codex", model: "test" } };
+  try {
+    await host.harness.behavior.callRpc("saveRule", { id: null, rule: {
+      ...rule, name: "manual", triggers: ["new_commits"],
+    } });
+    await host.harness.behavior.callRpc("saveRule", { id: null, rule: {
+      ...rule, name: "automatic", mode: "live",
+    } });
+    expect((await host.harness.behavior.runCli(["dispatch", "manual", "7"])).stdout).toContain("thread=thr_manual");
+    const original = host.harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+    } finally {
+      original.controller.abort();
+      await original.done;
+    }
+    const queued = (await runs()).runs.find(run => run.ruleName === "automatic");
+    expect(queued).toMatchObject({ status: "waiting", threadId: null });
+    expect(writes).toMatchObject([{ status: "in_progress", external_id: queued?.id }]);
+
+    host = await host.harness.lifecycle.reload(plugin);
+    configure();
+    const restarted = host.harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      expect((await runs()).runs).toContainEqual(queued);
+
+      firstReady = true; // The persisted event is enough; no live callback.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      expect((await runs()).runs).toMatchObject(expect.arrayContaining([
+        expect.objectContaining({ id: queued?.id, status: "reviewing", threadId: "thr_automatic" }),
+        expect.objectContaining({ ruleName: "manual", status: "reviewing" }),
+      ]));
+      expect(writes).toMatchObject([{ status: "in_progress", external_id: queued?.id }]);
+    } finally {
+      restarted.controller.abort();
+      await restarted.done;
+    }
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
 });
 
 describe("reconciling runs a restart stranded", () => {
@@ -900,7 +1047,7 @@ describe("watcher shutdown", () => {
     }
   });
 
-  it("ignores a late spawn after cancellation is finalized and the service shuts down", async () => {
+  it("stops a late spawn after reload without reopening the cancelled run", async () => {
     vi.useFakeTimers();
     stubGh({ readyPullRequest: true });
     const { bb, harness } = createFakePluginHost({ settings: { pollSeconds: 15 } });
@@ -936,9 +1083,13 @@ describe("watcher shutdown", () => {
       replacement.harness.inspection.sdk.stub("threads.list", () => [
         makeThreadResponse({ id: THREAD_ID, title, originPluginId: bb.pluginId }),
       ]);
+      replacement.harness.inspection.sdk.stub("threads.stop", () => ({ ok: true }));
+      replacement.harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "idle" }));
       await startWatcher(replacement.harness);
-      expect(createStore(replacement.bb.storage.database() as never).getRun(reserved.id)).toEqual(finalized);
-      expect(replacement.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(0);
+      expect(createStore(replacement.bb.storage.database() as never).getRun(reserved.id)).toEqual({
+        ...finalized, threadId: THREAD_ID,
+      });
+      expect(replacement.harness.inspection.sdk.callsTo("threads.stop")).toEqual([[{ threadId: THREAD_ID }]]);
     } finally {
       service.controller.abort();
       await service.done;

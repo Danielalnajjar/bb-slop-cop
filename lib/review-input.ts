@@ -30,7 +30,9 @@ const environmentSchema = z.discriminatedUnion("type", [
   }).strict(),
 ]);
 
-type EnvironmentInput = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
+type EnvironmentInput = Extract<Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"], {
+  type: "provider";
+}> & { machine: z.infer<typeof machineSchema> };
 
 /** Pin a fresh built-in worktree, retaining machine placement but never a path. */
 export async function buildReviewEnvironment(

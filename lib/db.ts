@@ -138,9 +138,23 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE deferred_reviews ADD COLUMN first_observed_at INTEGER`,
   `ALTER TABLE runs ADD COLUMN check_run_id INTEGER`,
   `ALTER TABLE deferred_reviews ADD COLUMN head_sha TEXT`,
+  `CREATE TABLE review_provisioning (
+     run_id TEXT PRIMARY KEY REFERENCES runs(id),
+     host_id TEXT NOT NULL,
+     waiting_options TEXT
+   )`,
+  `CREATE INDEX idx_review_provisioning_host ON review_provisioning(host_id)`,
+  `CREATE INDEX idx_runs_thread ON runs(thread_id)`,
 ];
 
 type Row = Record<string, unknown>;
+export interface ProvisionDispatchOptions {
+  trigger: Trigger;
+  force?: boolean;
+  forcedReason?: string | null;
+  includeDraft?: boolean;
+}
+
 export const SUPERSEDED_DETAIL = "superseded by newer head ";
 export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
 
@@ -256,6 +270,55 @@ export function createStore(db: Database) {
   }
 
   return {
+    canProvision(hostId: string, limit: number, runId: string): boolean {
+      // Earlier waiters get first claim on free slots on this host.
+      const row = db.prepare(
+        `SELECT count(*) AS occupied FROM review_provisioning AS other
+         LEFT JOIN review_provisioning AS mine ON mine.run_id = ?
+         WHERE other.host_id = ? AND other.run_id != ? AND (
+           other.waiting_options IS NULL OR mine.run_id IS NULL OR other.rowid < mine.rowid
+         )`,
+      ).get(runId, hostId, runId) as Row;
+      return num(row, "occupied") < limit;
+    },
+
+    setProvisioning(runId: string, hostId: string, waiting: ProvisionDispatchOptions | null): void {
+      db.prepare(
+        `INSERT INTO review_provisioning (run_id, host_id, waiting_options) VALUES (?, ?, ?)
+         ON CONFLICT(run_id) DO UPDATE SET host_id = excluded.host_id, waiting_options = excluded.waiting_options`,
+      ).run(runId, hostId, waiting === null ? null : JSON.stringify(waiting));
+    },
+
+    clearProvisioning(runId: string): void {
+      db.prepare(`DELETE FROM review_provisioning WHERE run_id = ?`).run(runId);
+    },
+
+    findProvisioningRun(threadId: string): string | null {
+      const row = db.prepare(
+        `SELECT runs.id FROM runs JOIN review_provisioning AS provisions ON provisions.run_id = runs.id
+         WHERE runs.thread_id = ? AND provisions.waiting_options IS NULL`,
+      ).get(threadId) as Row | undefined;
+      return row === undefined ? null : text(row, "id");
+    },
+
+    listProvisioning(): { run: Run; hostId: string; waiting: ProvisionDispatchOptions | null }[] {
+      return (db.prepare(
+        `SELECT runs.*, provisions.host_id, provisions.waiting_options
+         FROM review_provisioning AS provisions JOIN runs ON runs.id = provisions.run_id
+         ORDER BY provisions.rowid`,
+      ).all() as Row[]).map(row => ({
+        run: rowToRun(row),
+        hostId: text(row, "host_id"),
+        waiting: parseJson<ProvisionDispatchOptions | null>(row.waiting_options, null),
+      }));
+    },
+
+    isWaitingForProvisioning(runId: string): boolean {
+      return db.prepare(
+        `SELECT 1 FROM review_provisioning WHERE run_id = ? AND waiting_options IS NOT NULL`,
+      ).get(runId) !== undefined;
+    },
+
     atomic<T>(work: () => T): T {
       return db.transaction(work)();
     },
@@ -445,7 +508,9 @@ export function createStore(db: Database) {
            SELECT id FROM runs
            WHERE ? = 0 AND rule_id = ? AND repo = ? AND pr_number = ?
              AND (? IS NULL OR head_sha = ?)
-             AND status NOT IN ('waiting', 'skipped', 'cancelled', 'failed')
+             AND (status NOT IN ('waiting', 'skipped', 'cancelled', 'failed')
+               OR (status = 'waiting' AND head_sha = ? AND id != ?
+                 AND EXISTS (SELECT 1 FROM review_provisioning WHERE run_id = runs.id)))
            ORDER BY started_at, id LIMIT 1
          )
          INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
@@ -464,7 +529,7 @@ export function createStore(db: Database) {
            pr_author = excluded.pr_author, started_at = excluded.started_at, finished_at = excluded.finished_at
          RETURNING *`,
       ).get(
-        force ? 1 : 0, run.ruleId, run.repo, run.prNumber, headSha, headSha,
+        force ? 1 : 0, run.ruleId, run.repo, run.prNumber, headSha, headSha, run.headSha, run.id,
         run.id, run.ruleId, run.ruleName, run.repo, run.prNumber, run.prTitle,
         run.prAuthor, run.headSha, run.status, run.mode, run.detail,
         run.threadId, run.commentCount, run.startedAt, promoted ? null : run.startedAt, run.finishedAt,
@@ -475,7 +540,10 @@ export function createStore(db: Database) {
     listOlderActiveRuns(run: Pick<Run, "ruleId" | "repo" | "prNumber" | "headSha">): Run[] {
       return (db.prepare(
         `SELECT * FROM runs WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha != ?
-         AND finished_at IS NULL AND status IN ('dispatched', 'reviewing')`,
+         AND finished_at IS NULL AND (
+           status IN ('dispatched', 'reviewing') OR
+           (status = 'waiting' AND EXISTS (SELECT 1 FROM review_provisioning WHERE run_id = runs.id))
+         )`,
       ).all(run.ruleId, run.repo, run.prNumber, run.headSha) as Row[]).map(rowToRun);
     },
 
@@ -542,7 +610,10 @@ export function createStore(db: Database) {
       const rows = db
         .prepare(
           `SELECT * FROM runs
-           WHERE finished_at IS NULL AND status != 'waiting'
+           WHERE (finished_at IS NULL AND status != 'waiting')
+             OR EXISTS (
+               SELECT 1 FROM review_provisioning WHERE run_id = runs.id AND waiting_options IS NULL
+             )
            ORDER BY started_at`,
         )
         .all();

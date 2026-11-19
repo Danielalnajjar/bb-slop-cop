@@ -12,7 +12,7 @@ import {
 import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
-import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type Store } from "./lib/db";
+import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
 import { buildReviewEnvironment } from "./lib/review-input";
 import {
@@ -65,6 +65,8 @@ import {
 
 const pollSecondsSchema = z.number().int().min(15);
 const maxConcurrentReviewsSchema = z.number().int().min(1);
+const maxConcurrentProvisionsPerHostSchema = z.number().int().min(1);
+const PROVISION_CAPACITY_DETAIL = "waiting for review provisioning capacity";
 
 const RUNS_CHANNEL = "runs-changed";
 
@@ -227,6 +229,13 @@ export default async function plugin(bb: BbPluginApi) {
       default: 3,
       experimental_schema: maxConcurrentReviewsSchema,
     },
+    maxConcurrentProvisionsPerHost: {
+      type: "number",
+      label: "Max concurrent review provisions per host",
+      description: "Review launches on the same host wait until a provisioning slot frees.",
+      default: 4,
+      experimental_schema: maxConcurrentProvisionsPerHostSchema,
+    },
     ghPath: { type: "string", label: "Path to the gh binary", default: "gh" },
     botGhPath: {
       type: "string",
@@ -254,6 +263,9 @@ export default async function plugin(bb: BbPluginApi) {
   const spawning = new Set<string>();
 
   let watcherSignal: AbortSignal | undefined;
+  let recoveringReviews: Promise<void> | undefined;
+  let provisionDrainRequested = false;
+  let wakeProvisionDrain: (() => void) | undefined;
   const waitForWork = <T>(work: () => Promise<T>): Promise<T> =>
     waitForAbort(work, watcherSignal);
 
@@ -268,6 +280,7 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       pollSeconds,
       maxConcurrent,
+      maxProvisionsPerHost: maxConcurrentProvisionsPerHostSchema.parse(values.maxConcurrentProvisionsPerHost),
       // One switch turns on bot mode. The backend client and the agent's write
       // command must resolve to the same identity, or `verifyLive`'s
       // account-based fallback would look for comments from the wrong login.
@@ -363,12 +376,14 @@ export default async function plugin(bb: BbPluginApi) {
   async function dispatch(
     rule: Rule,
     pullRequest: PullRequest,
-    options: { forcedReason?: string | null; force?: boolean; automatic?: boolean } = {},
+    options: Partial<ProvisionDispatchOptions> = {},
   ): Promise<{ runId: string; threadId: string | null }> {
+    if (recoveringReviews !== undefined) await recoveringReviews;
     const { number: prNumber, headRefOid: headSha } = pullRequest;
     const scope = { ruleId: rule.id, repo: rule.repo, prNumber, headSha };
     const deferred = () => store.getDeferredReview(rule.id, rule.repo, prNumber);
-    const { botGhPath, defaultThreadSection } = await readSettings();
+    const values = await readSettings();
+    const dispatchOptions: ProvisionDispatchOptions = { trigger: "manual", ...options };
     // A poll snapshot can age while a gate or path lookup runs. Recheck before
     // promoting a wait or cancelling work on what might really be a newer SHA.
     if (deferred()?.waiting || store.listOlderActiveRuns(scope).length > 0) {
@@ -389,7 +404,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const pending = deferred();
-    if (options.automatic && (
+    if (dispatchOptions.trigger !== "manual" && (
       pending === null || store.getRule(rule.id)?.updatedAt !== rule.updatedAt
     )) return { runId: "", threadId: null };
     const waiting = pending?.waiting ?? null;
@@ -418,6 +433,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (older.threadId !== null && finalizing.has(older.threadId)) continue;
           const cancelled = { ...older, status: "cancelled" as const, detail: supersededBy(headSha) };
           store.updateRun(older.id, { status: cancelled.status, detail: cancelled.detail });
+          if (older.status === "waiting") store.clearProvisioning(older.id);
           replaced.push(cancelled);
         }
       }
@@ -430,7 +446,25 @@ export default async function plugin(bb: BbPluginApi) {
       await Promise.all(replaced.map(run => finalizeRun(run)));
       return { runId, threadId: null };
     }
+    await Promise.all(replaced.map(run => finalizeRun(run)));
+    return startReview(rule, pullRequest, reservation, dispatchOptions, values, promoted);
+  }
 
+  async function startReview(
+    rule: Rule,
+    pullRequest: PullRequest,
+    reservation: Run,
+    options: ProvisionDispatchOptions,
+    { botGhPath, defaultThreadSection, maxProvisionsPerHost }: Awaited<ReturnType<typeof readSettings>>,
+    promoted: boolean,
+  ): Promise<{ runId: string; threadId: string | null }> {
+    const runId = reservation.id;
+    const wasQueued = reservation.status === "waiting";
+    const stillExpected = () => {
+      const current = store.getRun(runId);
+      return current !== null && (isReviewInProgress(current) ||
+        (wasQueued && current.status === "waiting"));
+    };
     const throwIfDispatchAborted = () => {
       if (!watcherSignal?.aborted) return;
       const reserved = store.getRun(runId);
@@ -445,17 +479,17 @@ export default async function plugin(bb: BbPluginApi) {
       watcherSignal.throwIfAborted();
     };
 
-    await Promise.all(replaced.map(run => finalizeRun(run)));
-    if (!isReviewInProgress(store.getRun(runId)!)) return { runId, threadId: null };
+    if (!stillExpected()) return { runId, threadId: null };
     if (rule.request === null) {
       const detail = "rule has no agent configuration — open it in the SlopCop panel and save it once";
       store.updateRun(runId, {
         status: "failed",
         detail,
-        finishedAt: promoted ? null : Date.now(),
+        finishedAt: promoted || wasQueued ? null : Date.now(),
       });
+      if (wasQueued) store.clearProvisioning(runId);
       announce();
-      if (promoted) await finalizeRun({ ...reservation, status: "failed", detail });
+      if (promoted || wasQueued) await finalizeRun({ ...reservation, status: "failed", detail });
       return { runId, threadId: null };
     }
 
@@ -513,8 +547,8 @@ export default async function plugin(bb: BbPluginApi) {
           : [],
       );
       // thread.idle / thread.failed already run finishRun concurrently.
-      if (!isReviewInProgress(store.getRun(runId)!)) return { runId, threadId: null };
-      await reportCheck("start", reservation, undefined, promoted);
+      if (!stillExpected()) return { runId, threadId: null };
+      if (!wasQueued) await reportCheck("start", reservation, undefined, promoted);
       preparingInputs = true;
       const reviewPullRequest = {
         ...pullRequest,
@@ -532,8 +566,24 @@ export default async function plugin(bb: BbPluginApi) {
         ghCommand: botGhPath,
         priorComments,
       };
-      const prepared = store.getRun(runId);
-      if (prepared !== null && !isReviewInProgress(prepared)) {
+      if (!stillExpected()) return { runId, threadId: null };
+      const hostId = environment.machine.type === "existing" ? environment.machine.hostId : null;
+      const admitted = store.atomic(() => {
+        if (hostId !== null && !store.canProvision(hostId, maxProvisionsPerHost, runId)) {
+          store.setProvisioning(runId, hostId, options);
+          store.updateRun(runId, { status: "waiting", detail: PROVISION_CAPACITY_DETAIL });
+          return false;
+        }
+        if (hostId !== null) store.setProvisioning(runId, hostId, null);
+        else if (wasQueued) store.clearProvisioning(runId);
+        if (wasQueued) store.updateRun(runId, {
+          status: "dispatched",
+          detail: options.forcedReason == null ? null : `forced past the gate — ${options.forcedReason}`,
+        });
+        return true;
+      });
+      if (!admitted) {
+        announce();
         return { runId, threadId: null };
       }
       const dispatchSignal = watcherSignal;
@@ -557,6 +607,8 @@ export default async function plugin(bb: BbPluginApi) {
       }).finally(() => spawning.delete(runId));
       preparingInputs = false;
       const threadId = (thread as { id: string }).id;
+      // The terminal event may have arrived before spawn returned the ID.
+      if (hostId !== null) void observeProvisioningEnd(threadId);
       // `runs cancel` can finalize this run while it still has no thread. The
       // cancellation stays; writing `reviewing` over it here would leave the
       // agent running with no event able to close the run again.
@@ -587,7 +639,8 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId, threadId };
     } catch (error) {
       throwIfDispatchAborted();
-      if (!isReviewInProgress(store.getRun(runId)!)) return { runId, threadId: null };
+      if (store.getRun(runId)?.threadId === null) store.clearProvisioning(runId);
+      if (!stillExpected()) return { runId, threadId: null };
       store.updateRun(runId, {
         status: preparingInputs ? "cancelled" : "failed",
         detail: error instanceof Error ? error.message : String(error),
@@ -954,8 +1007,114 @@ export default async function plugin(bb: BbPluginApi) {
         inFlight.has(run.id) && run.threadId !== null && !finalizing.has(run.threadId));
       if (!replacesInFlight) return;
     }
-    await dispatch(rule, pullRequest, { automatic: true });
+    await dispatch(rule, pullRequest, { trigger });
   }
+
+  async function drainProvisioningQueue(values: Awaited<ReturnType<typeof readSettings>>) {
+    const provisions = store.listProvisioning();
+    await Promise.all(provisions.flatMap(({ run, waiting }) =>
+      waiting === null && run.threadId !== null ? [observeProvisioningEnd(run.threadId)] : [],
+    ));
+    for (const { run, hostId, waiting } of provisions) {
+      if (waiting === null || !store.isWaitingForProvisioning(run.id)) continue;
+      if (!store.canProvision(hostId, values.maxProvisionsPerHost, run.id)) continue;
+      if (waiting.trigger !== "manual" && inFlight.size >= values.maxConcurrent) continue;
+      try {
+        const rule = store.getRule(run.ruleId);
+        if (rule === null || rule.repo !== run.repo || rule.mode !== run.mode || rule.name !== run.ruleName) {
+          await discardProvisionWait(run, "rule changed while waiting for provisioning");
+          continue;
+        }
+        const pullRequest = await waitForWork(() => gh.getPullRequest(run.repo, run.prNumber));
+        if (pullRequest.headRefOid !== run.headSha) {
+          await discardProvisionWait(run, supersededBy(pullRequest.headRefOid));
+          continue;
+        }
+        if (pullRequest.isClosed) {
+          await discardProvisionWait(run, "pull request closed while waiting for provisioning");
+          continue;
+        }
+        if (!waiting.force) {
+          if (!await hydrateFiles([rule], run.repo, pullRequest)) continue;
+          const match = evaluateRule(rule, pullRequest, waiting.trigger, waiting);
+          if (!match.matched) {
+            await discardProvisionWait(run, match.reason);
+            continue;
+          }
+        }
+        if (!store.isWaitingForProvisioning(run.id) || store.getRule(rule.id)?.updatedAt !== rule.updatedAt) continue;
+        await startReview(rule, pullRequest, run, waiting, values, false);
+      } catch (error) {
+        watcherSignal?.throwIfAborted();
+        bb.log.warn(`could not resume review ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  async function waitForNextPoll(pollSeconds: number): Promise<void> {
+    const pollAt = Date.now() + pollSeconds * 1_000;
+    while (Date.now() < pollAt) {
+      if (provisionDrainRequested) {
+        provisionDrainRequested = false;
+        await drainProvisioningQueue(await readSettings());
+      } else {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await waitForWork(() => new Promise<void>(resolve => {
+            wakeProvisionDrain = resolve;
+            timer = setTimeout(resolve, Math.max(0, pollAt - Date.now()));
+          }));
+        } finally {
+          clearTimeout(timer);
+          wakeProvisionDrain = undefined;
+        }
+      }
+    }
+  }
+
+  function releaseProvision(runId: string): void {
+    store.clearProvisioning(runId);
+    provisionDrainRequested = true;
+    wakeProvisionDrain?.();
+  }
+
+  async function discardProvisionWait(run: Run, detail: string) {
+    if (!store.isWaitingForProvisioning(run.id)) return;
+    store.atomic(() => {
+      store.clearProvisioning(run.id);
+      store.updateRun(run.id, { status: "skipped", detail });
+    });
+    announce();
+    await finalizeRun({ ...run, status: "skipped", detail });
+  }
+
+  async function observeProvisioningEnd(threadId: string): Promise<void> {
+    if (watcherSignal?.aborted) return;
+    const runId = store.findProvisioningRun(threadId);
+    if (runId === null) return;
+    try {
+      const [event] = await waitForWork(() => bb.sdk.threads.events.list({
+        threadId, types: ["system/thread-provisioning"], order: "desc", limit: "1",
+      }));
+      if (event?.type === "system/thread-provisioning" && event.data.status !== "active") {
+        if (store.findProvisioningRun(threadId) === runId) releaseProvision(runId);
+      }
+    } catch (error) {
+      if (watcherSignal?.aborted) return;
+      bb.log.warn(`could not read provisioning state of ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // A pre-start thread can fail or be stopped before BB writes a provisioning
+  // row. Its terminal lifecycle event still releases the reservation.
+  function releaseTerminatedProvision(threadId: string): void {
+    const runId = store.findProvisioningRun(threadId);
+    if (runId !== null) releaseProvision(runId);
+  }
+
+  bb.events.on("experimental_thread.events", ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) return observeProvisioningEnd(thread.id);
+  });
 
   // --- verification ------------------------------------------------------
 
@@ -1296,6 +1455,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    if (thread.originPluginId === bb.pluginId) releaseTerminatedProvision(thread.id);
     clearFailureCorrelation(thread.id);
     void finishRun(thread.id, lastAssistantText, null).catch(
       (error: unknown) => {
@@ -1346,6 +1506,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.events.on("thread.failed", async ({ thread, error }) => {
+    if (thread.originPluginId === bb.pluginId) releaseTerminatedProvision(thread.id);
     const requestId = failedRequestByThread.get(thread.id);
     if (
       requestId !== undefined &&
@@ -1382,11 +1543,13 @@ export default async function plugin(bb: BbPluginApi) {
    * still open.
    */
   bb.events.on("thread.archived", async ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) releaseTerminatedProvision(thread.id);
     if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_ARCHIVED_REASON);
   });
 
   bb.events.on("thread.deleted", async ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) releaseTerminatedProvision(thread.id);
     if (!hasReviewInProgress(thread.id)) return;
     await finishRun(thread.id, null, THREAD_DELETED_REASON);
   });
@@ -1457,19 +1620,27 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
     }
+    const reserved = new Set(store.listProvisioning().filter(provision => provision.waiting === null)
+      .map(provision => provision.run.id));
+    let runningHosts: Map<string, string | null> | undefined;
     for (let run of store.listUnfinishedRuns()) {
       let threadId = run.threadId;
       try {
-        if (threadId === null && run.status === "cancelled" && run.detail?.startsWith(SUPERSEDED_DETAIL)) {
+        const superseded = run.detail?.startsWith(SUPERSEDED_DETAIL) === true;
+        if (threadId === null && run.status === "cancelled" &&
+            (superseded || (reserved.has(run.id) && run.detail !== "plugin stopped before dispatch completed"))) {
           // The old loader may have been stopped before spawn returned its ID.
           const matches = await findDispatchedThreads(run);
           if (matches.length === 1) {
             threadId = matches[0]!;
             store.updateRun(run.id, { threadId });
             run = { ...run, threadId };
+            if (!superseded) await stopReviewThread(threadId);
           } else if (matches.length > 1) {
             bb.log.warn(`could not recover superseded run ${run.id}: multiple matching threads`);
             continue;
+          } else {
+            store.clearProvisioning(run.id);
           }
         }
         if (threadId === null && (isReviewInProgress(run) ||
@@ -1480,6 +1651,7 @@ export default async function plugin(bb: BbPluginApi) {
               ? "dispatch recovery found no matching thread"
               : "dispatch recovery found multiple matching threads" };
             store.updateRun(run.id, run);
+            if (matches.length === 0) store.clearProvisioning(run.id);
             await finalizeRun(run);
             continue;
           }
@@ -1490,7 +1662,13 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (!isReviewInProgress(run)) {
           if (threadId === null) await finalizeRun(run);
-          else await finishRun(threadId, null, null);
+          else {
+            if (reserved.has(run.id)) {
+              const thread = await waitForWork(() => bb.sdk.threads.get({ threadId: threadId! }));
+              if (reviewThreadOutcome(thread).kind !== "running") releaseTerminatedProvision(threadId);
+            }
+            await finishRun(threadId, null, null);
+          }
           continue;
         }
         if (threadId === null) continue;
@@ -1503,8 +1681,17 @@ export default async function plugin(bb: BbPluginApi) {
         const outcome = reviewThreadOutcome(thread);
         if (outcome.kind === "running") {
           inFlight.add(run.id);
+          if (thread.status === "starting" && !reserved.has(run.id)) {
+            // The first load after upgrading can inherit a start from the
+            // old plugin, before a reservation was recorded for its host.
+            runningHosts ??= new Map((await waitForWork(() => bb.sdk.threads.listRunning()))
+              .map(({ id, hostId }) => [id, hostId]));
+            const hostId = runningHosts.get(threadId);
+            if (hostId != null) store.setProvisioning(run.id, hostId, null);
+          }
           continue;
         }
+        releaseTerminatedProvision(threadId);
         bb.log.info(
           `reconciling ${run.id} (${run.ruleName} #${run.prNumber}): its thread is ${thread.status}`,
         );
@@ -1573,7 +1760,10 @@ export default async function plugin(bb: BbPluginApi) {
       const waiting = run.status === "waiting";
       const detail = waiting ? WAITING_CANCELLED_DETAIL : CANCELLED_DETAIL;
       store.atomic(() => {
-        if (waiting) store.clearDeferredReview(run.ruleId, run.repo, run.prNumber);
+        if (waiting) {
+          if (store.isWaitingForProvisioning(run.id)) store.clearProvisioning(run.id);
+          else store.clearDeferredReview(run.ruleId, run.repo, run.prNumber);
+        }
         store.updateRun(run.id, { status: "cancelled", detail, finishedAt: null });
       });
       announce();
@@ -2281,6 +2471,7 @@ export default async function plugin(bb: BbPluginApi) {
           const dispatched = await dispatch(rule, pullRequest, {
             forcedReason: result.matched ? null : result.reason,
             force: has("force"),
+            includeDraft,
           });
           const run = store.getRun(dispatched.runId);
           const skippedReason = run?.status === "skipped" ? run.detail : null;
@@ -2289,6 +2480,8 @@ export default async function plugin(bb: BbPluginApi) {
               ? JSON.stringify({ ...dispatched, headSha: pullRequest.headRefOid, skippedReason }, null, 2)
               : skippedReason !== null
                 ? `Skipped ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${skippedReason}`
+                : run?.status === "waiting"
+                  ? `Queued ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
                 : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }
@@ -2461,11 +2654,18 @@ export default async function plugin(bb: BbPluginApi) {
           return;
         }
         bb.log.info(`gh authenticated as ${ghLogin}`);
-        await reconcileUnfinishedRuns();
+        recoveringReviews = reconcileUnfinishedRuns();
+        try {
+          await recoveringReviews;
+        } finally {
+          recoveringReviews = undefined;
+        }
 
         while (!signal.aborted) {
           const values = await readSettings();
           try {
+            provisionDrainRequested = false;
+            await drainProvisioningQueue(values);
             await poll(values.maxConcurrent);
           } catch (error) {
             signal.throwIfAborted();
@@ -2473,7 +2673,7 @@ export default async function plugin(bb: BbPluginApi) {
               `poll pass failed: ${error instanceof Error ? error.message : String(error)}`,
             );
           }
-          await sleep(values.pollSeconds * 1_000, signal);
+          await waitForNextPoll(values.pollSeconds);
         }
       } catch (error) {
         if (!signal.aborted) throw error;

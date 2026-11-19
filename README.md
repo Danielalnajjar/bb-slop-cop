@@ -35,6 +35,18 @@ After upgrading, read back the numbers and verify `bb slopcop status` before
 enabling reviews. Invalid stored numeric values stop settings-dependent work
 until corrected through Settings or the CLI; the plugin never rewrites them.
 
+### Review provisioning limit
+
+`maxConcurrentProvisionsPerHost` is an integer ≥1 (default 4). When a host
+reaches the limit, SlopCop saves additional reviews and dispatches them in
+order as provisioning finishes. This also applies to manual and forced
+reviews; any live check remains non-terminal while the review waits. The queue
+survives plugin reloads.
+
+This is separate from `maxConcurrentReviews`, which limits running reviews
+from polling. A provision stops counting when the thread is ready to run, fails,
+or is cancelled; it does not hold a slot for the whole review.
+
 ## Quick start
 
 New rules start in **shadow mode**: they run the full review and store the body, but
