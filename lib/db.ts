@@ -167,8 +167,10 @@ export interface ProvisionDispatchOptions {
 
 export const SUPERSEDED_DETAIL = "superseded by newer head ";
 export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
-const VERIFIED_REVIEW = `status IN ('commented', 'commented_partial', 'commented_unmarked',
-  'commented_unattributed', 'no_comment')`;
+// Shadow verification can also return no_comment and degraded comment statuses.
+const VERIFIED_REVIEW = `(mode = 'live' AND status IN ('commented', 'commented_partial',
+  'commented_unmarked', 'commented_unattributed', 'no_comment'))`;
+const FULL_NON_DRAFT_REVIEW = `(review_scope = 'full' AND was_draft = 0)`;
 
 function text(row: Row, key: string, fallback = ""): string {
   const value = row[key];
@@ -523,6 +525,8 @@ export function createStore(db: Database) {
       // One write statement, not a read followed by a write: SQLite serializes
       // this decision even for separate connections. Materialize the winner
       // before inserting so every derived field uses the same prior run.
+      // A full non-draft run covers a narrower review, but not vice versa.
+      // Only a GitHub-verified run can cover a different mode.
       const headSha = options.dedupe === "once_per_head_sha" ? run.headSha : null;
       const row = db.prepare(
         `WITH winner AS MATERIALIZED (
@@ -531,7 +535,8 @@ export function createStore(db: Database) {
              AND ${REVIEW_DEDUPE_WINNER} AND id != ?
              AND (? IS NULL OR (head_sha = ? AND (
                (? = 'new_commits' AND ${VERIFIED_REVIEW})
-               OR (review_scope = ? AND (was_draft = 0 OR ? = 1))
+               OR ((mode = ? OR ${VERIFIED_REVIEW})
+                 AND (review_scope = 'full' OR review_scope = ?) AND (was_draft = 0 OR ? = 1))
              )))
            ORDER BY started_at, id LIMIT 1
          )
@@ -553,7 +558,7 @@ export function createStore(db: Database) {
          RETURNING *`,
       ).get(
         options.force ? 1 : 0, run.ruleId, run.repo, run.prNumber, run.headSha, run.id, headSha, headSha,
-        options.trigger, options.scope, options.isDraft ? 1 : 0,
+        options.trigger, run.mode, options.scope, options.isDraft ? 1 : 0,
         run.id, run.ruleId, run.ruleName, run.repo, run.prNumber, run.prTitle,
         run.prAuthor, run.headSha, run.status, run.mode, run.detail,
         run.threadId, run.commentCount, run.startedAt, options.promoted ? null : run.startedAt, run.finishedAt,
@@ -666,14 +671,15 @@ export function createStore(db: Database) {
       repo: string,
       prNumber: number,
       headSha: string | null,
+      mode: Rule["mode"],
       pendingHeadSha = headSha,
     ): boolean {
       const row = db.prepare(
         `SELECT 1 FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ?
            AND (? IS NULL OR head_sha = ?) AND ${REVIEW_DEDUPE_WINNER}
-           AND (? IS NULL OR ${VERIFIED_REVIEW}) LIMIT 1`,
-      ).get(ruleId, repo, prNumber, headSha, headSha, pendingHeadSha, headSha);
+           AND (? IS NULL OR ${VERIFIED_REVIEW} OR (mode = ? AND ${FULL_NON_DRAFT_REVIEW})) LIMIT 1`,
+      ).get(ruleId, repo, prNumber, headSha, headSha, pendingHeadSha, headSha, mode);
       return row !== undefined;
     },
 

@@ -1282,7 +1282,7 @@ describe("watcher shutdown", () => {
       } else {
         expect(run).toMatchObject({ threadId: null, status: "cancelled", finishedAt: expect.any(Number),
           detail: count === 0 ? "dispatch recovery found no matching thread" : "dispatch recovery found multiple matching threads" });
-        expect(store.hasSettlingDuplicate("rule_1", "acme/widgets", 42, "abc123")).toBe(false);
+        expect(store.hasSettlingDuplicate("rule_1", "acme/widgets", 42, "abc123", "shadow")).toBe(false);
       }
       expect(harness.inspection.sdk.callsTo("threads.list")[0]).toEqual([
         { originPluginId: bb.pluginId, includeHidden: true, archived: false, limit: 100, offset: 0 },
@@ -1425,7 +1425,7 @@ describe("watcher shutdown", () => {
             status: "cancelled", threadId: null, finishedAt: null,
             detail: "plugin stopped before dispatch completed",
           });
-          expect(store.hasSettlingDuplicate(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7")).toBe(false);
+          expect(store.hasSettlingDuplicate(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7", "shadow")).toBe(false);
         }
         const callsAtStop = vi.mocked(execFile).mock.calls.length;
         release?.();
@@ -1671,7 +1671,7 @@ describe("automatic review ranges", () => {
     { case: "force-push", comparison: "f".repeat(40), verified: true, scope: "full" },
     { case: "failed compare", comparison: null, verified: true, scope: "full" },
     { case: "malformed compare", comparison: "not-a-sha", verified: true, scope: "full" },
-    { case: "no verified history", comparison: null, verified: false, scope: "full" },
+    { case: "only shadow history", comparison: priorHead, verified: false, scope: "full" },
   ])("uses $scope review for $case", async ({ comparison, verified, scope }) => {
     vi.useFakeTimers();
     let head = priorHead;
@@ -1696,6 +1696,12 @@ describe("automatic review ranges", () => {
           status, threadId: null, startedAt: 3 + index, finishedAt: 4 + index,
         }));
       }
+      for (const status of ["no_comment", "commented_unmarked", "commented_unattributed"] as const) {
+        store.insertRun(makeReviewRun({
+          id: `run_shadow_${status}`, ruleId, ruleName, prNumber: 7, headSha: priorHead,
+          status, mode: "shadow", threadId: null, startedAt: 10, finishedAt: 11,
+        }));
+      }
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -1715,6 +1721,43 @@ describe("automatic review ranges", () => {
           expect(prompt).toContain(`Inspect \`git diff ${fullBase}...${pushedHead}\` and full files`);
           expect(prompt).toContain(testPath);
         }
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("does not settle or spawn a second review when a manual full review already covers the pushed head", async () => {
+    vi.useFakeTimers();
+    let head = priorHead;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => false,
+      priorComparison: (base, target) => base === priorHead && target === pushedHead ? priorHead : null,
+    });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { settleMinutes: 1 });
+      const store = createStore(bb.storage.database() as never);
+      store.insertRun(makeReviewRun({
+        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
+        mode: "live", status: "commented", threadId: null, finishedAt: 2,
+      }));
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        head = pushedHead;
+        expect(await harness.behavior.callRpc("dispatchNow", { ruleId, prNumber: 7 }))
+          .toMatchObject({ threadId: "thr_scoped_1", blockedReason: null });
+        await vi.advanceTimersByTimeAsync(15_000);
+        const runs = store.listRuns().filter(run => run.headSha === pushedHead);
+        const full = runs.find(run => run.status === "reviewing");
+        expect(runs).toHaveLength(2);
+        expect(runs.find(run => run.status === "skipped")?.detail).toContain(full!.id);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
       } finally {
         service.controller.abort();
         await service.done;
@@ -2128,9 +2171,9 @@ it("supersedes only unfinished runs of this rule, PR and older heads", async () 
   try {
     await vi.advanceTimersByTimeAsync(15_000);
     const old = store.listRuns()[0]!;
-    store.insertRun(makeReviewRun({ id: "same", ruleId: rule.id, prNumber: 7, headSha: "sha-8", status: "dispatched", threadId: null, finishedAt: null }));
+    store.insertRun(makeReviewRun({ id: "same", ruleId: rule.id, prNumber: 7, headSha: "sha-8", mode: "live", status: "dispatched", threadId: null, finishedAt: null }));
     // Force admission later so the same-head run can coexist with the new one.
-    store.insertRun(makeReviewRun({ id: "finished", ruleId: rule.id, prNumber: 7, status: "commented", finishedAt: 1 }));
+    store.insertRun(makeReviewRun({ id: "finished", ruleId: rule.id, prNumber: 7, mode: "live", status: "commented", finishedAt: 1 }));
     store.insertRun(makeReviewRun({ id: "other-rule", prNumber: 7, threadId: "thr_other_rule" }));
     store.insertRun(makeReviewRun({ id: "other-pr", ruleId: rule.id, threadId: "thr_other_pr" }));
     push("sha-8");

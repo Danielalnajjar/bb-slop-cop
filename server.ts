@@ -1004,7 +1004,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
     if (trigger === "new_commits" && rule.settleMinutes > 0 &&
-        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, dedupeHead, headSha)) {
+        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, dedupeHead, rule.mode, headSha)) {
       let current = waiting;
       if (current === null || replaced || current.mode !== rule.mode) {
         const next = {
