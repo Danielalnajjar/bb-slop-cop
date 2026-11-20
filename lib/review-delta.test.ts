@@ -24,7 +24,7 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
     git("config", "user.email", "fixture@example.invalid");
     git("remote", "add", "origin", "https://github.com/acme/widgets.git");
     write("conflict.txt", "initial");
-    commit("initial");
+    const priorBase = commit("initial");
     git("switch", "-c", "feature");
     write("conflict.txt", "from the PR");
     write("prior.txt", "already reviewed");
@@ -50,13 +50,15 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
     write("rewritten.txt", "new lineage");
     const divergentHead = commit("replace feature history");
 
-    const delta = (base: string, head: string) => harness.experimental_call("reviewDelta", {
-      repo: "acme/widgets", sourcePath, prior, base, head,
+    const delta = (base: string, head: string, reviewedBase = priorBase) => harness.experimental_call("reviewDelta", {
+      repo: "acme/widgets", sourcePath, prior, priorBase: reviewedBase, base, head,
     });
     const patch = (result: NonNullable<Awaited<ReturnType<typeof delta>>>) =>
       Buffer.from(result.patchBase64, "base64").toString("utf8");
     expect(git("diff", "--name-only", prior + ".." + cleanHead)).toBe("base-only.txt");
     expect(await delta(cleanBase, cleanHead)).toMatchObject({ patchBase64: "", baseMerged: true });
+    // Retargeted to an older base: the prior review never covered conflictBase's own commits.
+    expect(await delta(cleanBase, cleanHead, conflictBase)).toBeNull();
 
     const resolved = patch((await delta(conflictBase, resolvedHead))!);
     expect(resolved.match(/^diff --git .*$/gm)).toEqual(["diff --git a/conflict.txt b/conflict.txt"]);

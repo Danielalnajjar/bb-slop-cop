@@ -84,14 +84,15 @@ Each review requests a fresh BB `git-worktree` at the captured PR head. Managed
 repository setup runs there, so input preparation requires **write access**.
 The agent checks HEAD and tracked-file cleanliness before reading its review
 inputs. Whatever starts a review (a new commit, readiness, or a dispatch),
-SlopCop confirms that the latest GitHub-verified head is an ancestor, then
-merges the captured PR merge base into that older head to construct a
-comparison tree. The attached patch compares that tree
+SlopCop confirms that the latest GitHub-verified head (a live review whose
+check succeeded) is an ancestor and that the merge base that review used is an
+ancestor of the current one, then merges the captured PR merge base into that
+older head to construct a comparison tree. The attached patch compares that tree
 with the new head. It excludes work imported from the base branch but includes
 any PR-owned changes or merge resolutions. An empty range completes the check
 without launching a reviewer. If SlopCop cannot compute the incremental patch,
 it reviews the full pinned PR diff, as it does when no earlier head was
-verified or when a forced dispatch re-reviews the verified head itself.
+verified. A forced dispatch always reviews the full diff.
 A failed input check returns plain
 `Review incomplete: <reason>` and records a cancelled, unreviewed run, not a clean
 summary. Missing head objects fail provisioning rather than falling back to the

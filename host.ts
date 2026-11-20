@@ -5,7 +5,7 @@ import { reviewDeltaContract, reviewSha } from "./lib/review-delta";
 export default experimental_defineHostEntry({
   contract: reviewDeltaContract,
   handlers: {
-    async reviewDelta({ repo, sourcePath, prior, base, head }, context) {
+    async reviewDelta({ repo, sourcePath, prior, priorBase, base, head }, context) {
       const signal = AbortSignal.any([context.signal, context.lifecycle.signal]);
       const run = (args: string[], allowConflict = false) => new Promise<{ stdout: Buffer; conflicted: boolean }>((resolve, reject) => {
         execFile("git", ["--no-replace-objects", "-C", sourcePath, ...args], {
@@ -27,8 +27,11 @@ export default experimental_defineHostEntry({
         await run(["fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
           "--no-prune", "--no-recurse-submodules", "--refmap=", "origin", head]);
       }
+      // The prior review covered priorBase...prior. A base that moved backward or
+      // elsewhere puts uncovered commits in the PR diff, so only a full review fits.
       if (await read(["merge-base", prior, head]) !== prior ||
-          await read(["merge-base", base, head]) !== base) return null;
+          await read(["merge-base", base, head]) !== base ||
+          await read(["merge-base", priorBase, base]) !== priorBase) return null;
 
       const baseMerged = await read(["merge-base", prior, base]) !== base;
       // Status 1 also produces a tree, with the unresolved merge as its content.

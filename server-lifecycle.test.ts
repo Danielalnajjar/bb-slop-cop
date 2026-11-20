@@ -1644,15 +1644,17 @@ describe("automatic review ranges", () => {
     tree: baselineTree, patchBase64: Buffer.from(patch).toString("base64"), baseMerged,
   });
 
-  function reviewHost(delta: ReturnType<typeof patchResult> | null | Error = patchResult(), maxConcurrentProvisionsPerHost = 2) {
+  type Delta = ReturnType<typeof patchResult> | null | Error;
+  function reviewHost(delta: Delta | ((input: { head: string }) => Delta | Promise<Delta>) = patchResult(), maxConcurrentProvisionsPerHost = 2) {
     const host = createFakePluginHost({
       settings: { pollSeconds: 15, maxConcurrentProvisionsPerHost },
-      experimental_callHostRpc: ({ method, input, hostId }) => {
+      experimental_callHostRpc: async ({ method, input, hostId }) => {
         expect(method).toBe("reviewDelta");
         expect(hostId).toBe("host_default");
-        expect(input).toMatchObject({ repo: "acme/widgets", sourcePath: "/project/source", base: fullBase });
-        if (delta instanceof Error) throw delta;
-        return delta;
+        expect(input).toMatchObject({ repo: "acme/widgets", sourcePath: "/project/source", base: fullBase, priorBase: fullBase });
+        const result = typeof delta === "function" ? await delta(input as { head: string }) : delta;
+        if (result instanceof Error) throw result;
+        return result;
       },
     });
     const { sdk } = host.harness.inspection;
@@ -1679,6 +1681,14 @@ describe("automatic review ranges", () => {
     return rule.id;
   }
 
+  function insertBaseline(store: ReturnType<typeof createStore>, ruleId: string, overrides: Partial<Run> = {}, base: string | null = fullBase) {
+    store.insertRun(makeReviewRun({
+      id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
+      mode: "live", status: "commented", threadId: null, finishedAt: 2, ...overrides,
+    }));
+    if (base !== null) store.setReviewBase(overrides.id ?? "run_verified", base);
+  }
+
   function promptAt(harness: ReturnType<typeof reviewHost>["harness"], index: number): string {
     const spawn = harness.inspection.sdk.callsTo("threads.spawn")[index]?.[0] as
       { prompt?: string; input?: { text: string }[] };
@@ -1691,7 +1701,10 @@ describe("automatic review ranges", () => {
     { case: "failed comparison", delta: new Error("range unavailable"), verified: true, scope: "full" },
     { case: "malformed comparison", delta: { ...patchResult(), tree: "invalid" }, verified: true, scope: "full" },
     { case: "only shadow history", delta: patchResult(), verified: false, scope: "full" },
-  ])("uses $scope review for $case", async ({ delta, verified, scope }) => {
+    { case: "a verified head with no recorded base", delta: patchResult(), verified: true, recordBase: false, scope: "full" },
+    { case: "a live head with no comment", delta: patchResult(), verified: false, liveStatus: "no_comment", scope: "full" },
+    { case: "a live head with unattributed comments", delta: patchResult(), verified: false, liveStatus: "commented_unattributed", scope: "full" },
+  ] as const)("uses $scope review for $case", async ({ delta, verified, scope, ...baseline }) => {
     vi.useFakeTimers();
     let head = priorHead;
     stubGh({
@@ -1703,10 +1716,8 @@ describe("automatic review ranges", () => {
       await plugin(bb);
       const store = createStore(bb.storage.database() as never);
       const ruleId = await saveRule(harness, { conditions: [{ kind: "paths", globs: ["src/**"] }] });
-      if (verified) store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "commented_partial", threadId: null, finishedAt: 2,
-      }));
+      if (verified) insertBaseline(store, ruleId, { status: "commented_partial" }, "recordBase" in baseline ? null : fullBase);
+      if ("liveStatus" in baseline) insertBaseline(store, ruleId, { status: baseline.liveStatus });
       for (const [index, status] of (["cancelled", "failed", "skipped", "shadowed"] as const).entries()) {
         store.insertRun(makeReviewRun({
           id: `run_${status}`, ruleId, ruleName, prNumber: 7,
@@ -1768,10 +1779,7 @@ describe("automatic review ranges", () => {
       await plugin(bb);
       const ruleId = await saveRule(harness, { mode: "live" });
       const store = createStore(bb.storage.database() as never);
-      store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "commented", threadId: null, finishedAt: 2,
-      }));
+      insertBaseline(store, ruleId);
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -1821,10 +1829,7 @@ describe("automatic review ranges", () => {
       const ruleId = await saveRule(harness);
       await saveRule(harness, { name: "occupy-host", triggers: ["ready_for_review"] });
       const store = createStore(bb.storage.database() as never);
-      store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "commented", threadId: null, finishedAt: 2,
-      }));
+      insertBaseline(store, ruleId);
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -1854,7 +1859,7 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it("does not settle or spawn a second review when a manual full review already covers the pushed head", async () => {
+  it("does not settle or spawn a second review when a manual review already covers the pushed head", async () => {
     vi.useFakeTimers();
     let head = priorHead;
     stubGh({
@@ -1865,10 +1870,7 @@ describe("automatic review ranges", () => {
       await plugin(bb);
       const ruleId = await saveRule(harness, { settleMinutes: 1 });
       const store = createStore(bb.storage.database() as never);
-      store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "commented", threadId: null, finishedAt: 2,
-      }));
+      insertBaseline(store, ruleId);
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -1877,9 +1879,11 @@ describe("automatic review ranges", () => {
           .toMatchObject({ threadId: "thr_scoped_1", blockedReason: null });
         await vi.advanceTimersByTimeAsync(15_000);
         const runs = store.listRuns().filter(run => run.headSha === pushedHead);
-        const full = runs.find(run => run.status === "reviewing");
+        const manual = runs.find(run => run.status === "reviewing");
+        expect(promptAt(harness, 0)).toContain("- Trigger: `manual`");
+        expect(promptAt(harness, 0)).toContain("- Review scope: incremental");
         expect(runs).toHaveLength(2);
-        expect(runs.find(run => run.status === "skipped")?.detail).toContain(full!.id);
+        expect(runs.find(run => run.status === "skipped")?.detail).toContain(manual!.id);
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
       } finally {
         service.controller.abort();
@@ -1899,10 +1903,7 @@ describe("automatic review ranges", () => {
       await plugin(bb);
       const ruleId = await saveRule(harness, { mode: "live" });
       const store = createStore(bb.storage.database() as never);
-      store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "commented", threadId: null, finishedAt: 2,
-      }));
+      insertBaseline(store, ruleId);
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -1914,6 +1915,157 @@ describe("automatic review ranges", () => {
         expect(prompt).toContain("- Review scope: incremental");
         expect(prompt).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
         expect(harness.inspection.sdk.callsTo("projects.attachments.upload")).toHaveLength(1);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("reviews a forced dispatch in full even when the PR-owned delta is empty", async () => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false });
+    stubCheckWrites(true);
+    const { bb, harness } = reviewHost(patchResult("", true));
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)?.status).toBe("no_pr_changes");
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--force"])).exitCode).toBe(0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        expect(promptAt(harness, 0)).toContain("- Review scope: full");
+        expect(promptAt(harness, 0)).toContain(`Inspect \`git diff ${fullBase}...${pushedHead}\``);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("skips a manual dispatch whose head was replaced while its delta was computed", async () => {
+    vi.useFakeTimers();
+    const newerHead = "e".repeat(40);
+    let head = pushedHead;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    stubGh({ readyPullRequest: true, pollHead: () => head, pollDraft: () => false });
+    const { bb, harness } = reviewHost(async ({ head: reviewed }) => {
+      if (reviewed === pushedHead) await released;
+      return patchResult();
+    });
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness);
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        const stale = harness.behavior.runCli(["dispatch", ruleName, "7"]);
+        await vi.advanceTimersByTimeAsync(0);
+        head = newerHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const newer = store.listRuns().find(run => run.headSha === newerHead)!;
+        expect(newer.status).toBe("reviewing");
+        release();
+        expect((await stale).exitCode).toBe(0);
+        expect(store.getRun(newer.id)?.status).toBe("reviewing");
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "skipped", detail: `superseded by newer head ${newerHead}`,
+        });
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("reviews readiness of a new head from the verified draft head", async () => {
+    vi.useFakeTimers();
+    let draft = true;
+    let head = priorHead;
+    let reviewedRunId: string | null = null;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => draft, detailDraft: () => draft,
+      reviewComments: () => reviewedRunId === null ? [] : [{
+        id: 1, path: "src/changed.ts", line: 4,
+        body: `🚨 \`slopcop/${ruleName}\` — **Unused write.**\n\nRemove the unused write.\n\n<!-- slopcop:rule=${ruleName} run=${reviewedRunId} sha=${priorHead} kind=inline -->`,
+      }],
+    });
+    stubCheckWrites(true);
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--include-draft"])).exitCode).toBe(0);
+        const [run] = store.listRuns();
+        reviewedRunId = run!.id;
+        await harness.behavior.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: run!.threadId!, status: "idle" }), lastAssistantText: "One finding",
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(store.getRun(run!.id)?.status).toBe("commented");
+        head = pushedHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        draft = false;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const prompt = promptAt(harness, 1);
+        expect(prompt).toContain("- Trigger: `ready_for_review`");
+        expect(prompt).toContain(`- Previous verified head: \`${priorHead}\``);
+        expect(prompt).toContain("- Review scope: incremental");
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("admits one review when the ready event and a dispatch race for an unreviewed head", async () => {
+    vi.useFakeTimers();
+    let draft = true;
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => draft, detailDraft: () => draft });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      await saveRule(harness);
+      const store = createStore(bb.storage.database() as never);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(store.listRuns()).toEqual([]);
+        draft = false;
+        const [, dispatched] = await Promise.all([
+          vi.advanceTimersByTimeAsync(15_000),
+          harness.behavior.runCli(["dispatch", ruleName, "7"]),
+        ]);
+        expect(dispatched.exitCode).toBe(0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        const runs = store.listRuns();
+        const admitted = runs.filter(run => run.status !== "skipped");
+        expect(admitted).toHaveLength(1);
+        expect(runs.filter(run => run.status === "skipped").map(run => run.detail))
+          .toEqual([`already admitted by run ${admitted[0]!.id}`]);
       } finally {
         service.controller.abort();
         await service.done;
@@ -2029,10 +2181,7 @@ describe("automatic review ranges", () => {
       await plugin(bb);
       const store = createStore(bb.storage.database() as never);
       const ruleId = await saveRule(harness, { mode: "live" });
-      store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "no_comment", threadId: null, finishedAt: 2,
-      }));
+      insertBaseline(store, ruleId);
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -2082,10 +2231,7 @@ describe("automatic review ranges", () => {
       await plugin(bb);
       const ruleId = await saveRule(harness, { conditions: [{ kind: "paths", globs: ["src/**"] }] });
       const store = createStore(bb.storage.database() as never);
-      store.insertRun(makeReviewRun({
-        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
-        mode: "live", status: "commented", threadId: null, finishedAt: 2,
-      }));
+      insertBaseline(store, ruleId);
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
@@ -2095,7 +2241,7 @@ describe("automatic review ranges", () => {
         head = pushedHead;
         await vi.advanceTimersByTimeAsync(15_000);
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
-        expect(promptAt(harness, 0)).toContain("- Trigger: `new_commits`");
+        expect(promptAt(harness, 0)).toContain("- Trigger: `ready_for_review`");
         expect(promptAt(harness, 0)).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
       } finally {
         service.controller.abort();

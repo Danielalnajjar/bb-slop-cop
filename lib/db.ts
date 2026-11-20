@@ -151,6 +151,7 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE runs DROP COLUMN review_scope`,
   `ALTER TABLE runs DROP COLUMN was_draft`,
   `ALTER TABLE rules DROP COLUMN review_strategy`,
+  `ALTER TABLE runs ADD COLUMN review_base_sha TEXT`,
 ];
 
 type Row = Record<string, unknown>;
@@ -179,9 +180,11 @@ export interface ProvisionDispatchOptions {
 
 export const SUPERSEDED_DETAIL = "superseded by newer head ";
 export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
-// Shadow verification can also return no_comment and degraded comment statuses.
+// A live review GitHub shows as SlopCop's (a success check). Shadow verification
+// can also return these statuses; no_comment and commented_unattributed prove
+// no review.
 const VERIFIED_REVIEW = `(mode = 'live' AND status IN ('commented', 'commented_partial',
-  'commented_unmarked', 'commented_unattributed', 'no_comment'))`;
+  'commented_unmarked'))`;
 // Under once_per_head_sha, any review of the head covers it, whatever its
 // trigger, scope or draft state. Only a GitHub-verified run covers another mode.
 const COVERS_HEAD = `(? IS NULL OR (head_sha = ? AND (mode = ? OR ${VERIFIED_REVIEW})))`;
@@ -416,11 +419,16 @@ export function createStore(db: Database) {
     },
 
     deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger, headSha: string, firstObservedAt: number): void {
+      // A push advances the head of a queued readiness review but keeps it a
+      // readiness review, which does not wait to settle. Closing or drafting
+      // the PR clears it.
       db.prepare(
         `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger, head_sha, first_observed_at)
          VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(rule_id, repo, pr_number) DO UPDATE SET
-           trigger = excluded.trigger, head_sha = excluded.head_sha,
+           trigger = CASE WHEN deferred_reviews.trigger = 'ready_for_review' AND excluded.trigger = 'new_commits'
+             THEN deferred_reviews.trigger ELSE excluded.trigger END,
+           head_sha = excluded.head_sha,
            first_observed_at = CASE WHEN deferred_reviews.head_sha = excluded.head_sha
              THEN deferred_reviews.first_observed_at ELSE excluded.first_observed_at END`,
       ).run(ruleId, repo, prNumber, trigger, headSha, firstObservedAt);
@@ -674,14 +682,22 @@ export function createStore(db: Database) {
       return row !== undefined;
     },
 
-    latestVerifiedHead(ruleId: string, repo: string, prNumber: number): string | null {
+    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { headSha: string; baseSha: string | null } | null {
       const row = db.prepare(
-        `SELECT head_sha FROM runs
+        `SELECT head_sha, review_base_sha FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ? AND ${VERIFIED_REVIEW}
            AND head_sha != ''
          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
       ).get(ruleId, repo, prNumber) as Row | undefined;
-      return row === undefined ? null : text(row, "head_sha");
+      if (row === undefined) return null;
+      return {
+        headSha: text(row, "head_sha"),
+        baseSha: typeof row.review_base_sha === "string" ? row.review_base_sha : null,
+      };
+    },
+
+    setReviewBase(runId: string, baseSha: string): void {
+      db.prepare(`UPDATE runs SET review_base_sha = ? WHERE id = ?`).run(baseSha, runId);
     },
 
     listComments(runId: string): RunComment[] {

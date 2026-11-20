@@ -385,7 +385,32 @@ export default async function plugin(bb: BbPluginApi) {
     const deferred = () => store.getDeferredReview(rule.id, rule.repo, prNumber);
     const values = await readSettings();
     const dispatchOptions: ProvisionDispatchOptions = { trigger: "manual", ...options };
-    // A poll snapshot can age while a gate or path lookup runs. Recheck before
+    const prior = store.latestVerifiedReview(rule.id, rule.repo, prNumber);
+    const previousVerifiedHead = prior?.headSha ?? null;
+    let baseRefOid: string | undefined;
+    let delta: z.infer<typeof reviewDeltaContract.reviewDelta.output> = null;
+    // Every trigger reviews only what changed since the last verified head. A
+    // forced dispatch re-reviews the head in full.
+    if (options.force !== true && prior !== null && prior.baseSha !== null && prior.headSha !== headSha &&
+        rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
+      const projectId = rule.request.projectId;
+      try {
+        baseRefOid = await waitForWork(() => gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, headSha));
+        const project = await waitForWork(() => bb.sdk.projects.get({ projectId }));
+        const source = project.sources.find(source => source.isDefault);
+        if (source?.path && source.hostId) {
+          const timeout = AbortSignal.timeout(60_000);
+          delta = await reviewHost.call("reviewDelta", {
+            repo: rule.repo, sourcePath: source.path, prior: prior.headSha, priorBase: prior.baseSha,
+            base: baseRefOid, head: headSha,
+          }, { hostId: source.hostId, signal: watcherSignal ? AbortSignal.any([watcherSignal, timeout]) : timeout });
+        }
+      } catch {
+        // An unavailable comparison cannot exclude any part of the full PR diff.
+        watcherSignal?.throwIfAborted();
+      }
+    }
+    // A poll snapshot can age while a gate, path or delta lookup runs. Recheck before
     // promoting a wait or cancelling work on what might really be a newer SHA.
     if (deferred()?.waiting || store.listOlderActiveRuns(scope).length > 0) {
       const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
@@ -402,28 +427,6 @@ export default async function plugin(bb: BbPluginApi) {
         const skipped = recordSkip(rule, pullRequest, detail);
         announce();
         return { runId: skipped.id, threadId: null };
-      }
-    }
-    const previousVerifiedHead = store.latestVerifiedHead(rule.id, rule.repo, prNumber);
-    let baseRefOid: string | undefined;
-    let delta: z.infer<typeof reviewDeltaContract.reviewDelta.output> = null;
-    // Every trigger reviews only what changed since the last verified head.
-    if (previousVerifiedHead !== null && previousVerifiedHead !== headSha &&
-        rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
-      const projectId = rule.request.projectId;
-      try {
-        baseRefOid = await waitForWork(() => gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, headSha));
-        const project = await waitForWork(() => bb.sdk.projects.get({ projectId }));
-        const source = project.sources.find(source => source.isDefault);
-        if (source?.path && source.hostId) {
-          const timeout = AbortSignal.timeout(60_000);
-          delta = await reviewHost.call("reviewDelta", {
-            repo: rule.repo, sourcePath: source.path, prior: previousVerifiedHead, base: baseRefOid, head: headSha,
-          }, { hostId: source.hostId, signal: watcherSignal ? AbortSignal.any([watcherSignal, timeout]) : timeout });
-        }
-      } catch {
-        // An unavailable comparison cannot exclude any part of the full PR diff.
-        watcherSignal?.throwIfAborted();
       }
     }
     const noChanges = delta?.patchBase64 === "";
@@ -599,6 +602,8 @@ export default async function plugin(bb: BbPluginApi) {
           gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, pullRequest.headRefOid),
         ),
       };
+      // A later review may narrow to this one only while its base stays an ancestor.
+      store.setReviewBase(runId, reviewPullRequest.baseRefOid);
       const environment = await waitForWork(() =>
         buildReviewEnvironment(bb.sdk, rule.request!, reviewPullRequest),
       );
@@ -615,7 +620,7 @@ export default async function plugin(bb: BbPluginApi) {
         incremental = { tree: delta.tree, patch, projectId };
       }
       const previousVerifiedHead = options.reviewInputs?.previousVerifiedHead ??
-        prepared?.previousVerifiedHead ?? store.latestVerifiedHead(rule.id, rule.repo, pullRequest.number);
+        prepared?.previousVerifiedHead ?? store.latestVerifiedReview(rule.id, rule.repo, pullRequest.number)?.headSha ?? null;
       const patch = incremental?.patch;
       const context: DispatchContext = {
         rule,
