@@ -1924,7 +1924,7 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it.each(["cli", "panel"] as const)("reports an empty %s dispatch and reviews a forced one in full", async (surface) => {
+  it.each(["cli", "json", "panel"] as const)("reports an empty %s dispatch and reviews a forced one in full", async (surface) => {
     vi.useFakeTimers();
     stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false });
     stubCheckWrites(true);
@@ -1943,6 +1943,9 @@ describe("automatic review ranges", () => {
           expect(unforced.exitCode).toBe(0);
           expect(unforced.stdout).toContain(`Not reviewed ${ruleName} for #7. head=${pushedHead}`);
           expect(unforced.stdout).toContain(empty);
+        } else if (surface === "json") {
+          const unforced = await harness.behavior.runCli(["dispatch", ruleName, "7", "--json"]);
+          expect(JSON.parse(unforced.stdout!)).toMatchObject({ threadId: null, skippedReason: null, noChangesReason: empty });
         } else {
           expect(await harness.behavior.callRpc("dispatchNow", { ruleId, prNumber: 7 }))
             .toMatchObject({ threadId: null, blockedReason: empty });
@@ -1994,6 +1997,53 @@ describe("automatic review ranges", () => {
           status: "skipped", detail: `superseded by newer head ${newerHead}`,
         });
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("leaves a newer head's deferred review to the poll when a manual dispatch resumes after the push", async () => {
+    vi.useFakeTimers();
+    const newerHead = "e".repeat(40);
+    let head = pushedHead;
+    let filesDown = false;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => false,
+      pollFiles: () => filesDown ? null : ["src/changed.ts"],
+    });
+    const { bb, harness } = reviewHost(async ({ head: reviewed }) => {
+      if (reviewed === pushedHead) await released;
+      return patchResult();
+    });
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { conditions: [{ kind: "paths", globs: ["src/**"] }] });
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        const stale = harness.behavior.runCli(["dispatch", ruleName, "7"]);
+        await vi.advanceTimersByTimeAsync(0);
+        filesDown = true;
+        head = newerHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(store.getDeferredReview(ruleId, "acme/widgets", 7)).toMatchObject({ headSha: newerHead, waiting: null });
+        release();
+        expect((await stale).exitCode).toBe(0);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "skipped", detail: `superseded by newer head ${newerHead}`,
+        });
+        filesDown = false;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        expect(promptAt(harness, 0)).toContain(`- Head SHA: ${newerHead}`);
       } finally {
         service.controller.abort();
         await service.done;

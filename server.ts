@@ -411,8 +411,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     // A poll snapshot can age while a gate, path or delta lookup runs. Recheck before
-    // promoting a wait or cancelling work on what might really be a newer SHA.
-    if (deferred()?.waiting || store.listOlderActiveRuns(scope).length > 0) {
+    // promoting a wait, consuming another head's deferral, or cancelling work on
+    // what might really be a newer SHA. Admission consumes the deferral, so
+    // recheck again if the poll changed it meanwhile.
+    for (let before = deferred(); before?.waiting ||
+        (before !== null && before.headSha !== null && before.headSha !== headSha) ||
+        store.listOlderActiveRuns(scope).length > 0;) {
       const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
       if (latest.headRefOid !== headSha) {
         const detail = supersededBy(latest.headRefOid);
@@ -428,6 +432,9 @@ export default async function plugin(bb: BbPluginApi) {
         announce();
         return { runId: skipped.id, threadId: null };
       }
+      const after = deferred();
+      if (after?.headSha === before?.headSha && after?.waiting?.id === before?.waiting?.id) break;
+      before = after;
     }
     const noChanges = delta?.patchBase64 === "";
     const pending = deferred();
@@ -2560,7 +2567,10 @@ export default async function plugin(bb: BbPluginApi) {
           const skippedReason = run?.status === "skipped" ? run.detail : null;
           return ok(
             json
-              ? JSON.stringify({ ...dispatched, headSha: pullRequest.headRefOid, skippedReason }, null, 2)
+              ? JSON.stringify({
+                ...dispatched, headSha: pullRequest.headRefOid, skippedReason,
+                noChangesReason: run?.status === "no_pr_changes" ? run.detail : null,
+              }, null, 2)
               : skippedReason !== null
                 ? `Skipped ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${skippedReason}`
                 : run?.status === "waiting"
