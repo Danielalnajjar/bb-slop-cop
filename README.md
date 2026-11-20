@@ -90,9 +90,14 @@ ancestor of the current one, then merges the captured PR merge base into that
 older head to construct a comparison tree. The attached patch compares that tree
 with the new head. It excludes work imported from the base branch but includes
 any PR-owned changes or merge resolutions. An empty range completes the check
-without launching a reviewer. If SlopCop cannot compute the incremental patch,
-it reviews the full pinned PR diff, as it does when no earlier head was
-verified. A forced dispatch always reviews the full diff.
+without launching a reviewer. A patch over 2 MiB is not attached: the reviewer
+reads the same range with `git diff` in its pinned worktree, recomputing the
+comparison tree from the two commits if it is absent. If SlopCop cannot compute
+the incremental patch, it reviews the full pinned PR diff, as it does when no
+earlier head was verified. A forced dispatch always reviews the full diff.
+After a verified head, a run without an attached patch records why in its
+`scope` note and the plugin log: `oversize`, `host_unavailable`, `missing_base`,
+`git_error`, `history_changed`, `base_conflict`, `base_moved` or `forced`.
 A failed input check returns plain
 `Review incomplete: <reason>` and records a cancelled, unreviewed run, not a clean
 summary. Missing head objects fail provisioning rather than falling back to the

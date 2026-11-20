@@ -171,6 +171,8 @@ export interface Run {
   status: RunStatus;
   mode: RuleMode;
   detail: string | null;
+  /** Why a review after a verified head had no attached incremental patch. */
+  scopeNote: string | null;
   threadId: string | null;
   commentCount: number;
   startedAt: number;

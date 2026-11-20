@@ -1648,10 +1648,11 @@ describe("automatic review ranges", () => {
   const testPath = "test/full-pr-only.ts";
   const ownedPatch = "diff --git a/src/changed.ts b/src/changed.ts\n+new PR-owned line\n";
   const patchResult = (patch = ownedPatch, baseMerged = false) => ({
-    tree: baselineTree, patchBase64: Buffer.from(patch).toString("base64"), baseMerged,
+    kind: "patch" as const, tree: baselineTree, patchBase64: Buffer.from(patch).toString("base64"), baseMerged,
   });
 
-  type Delta = ReturnType<typeof patchResult> | null | Error;
+  type Delta = ReturnType<typeof patchResult> | { kind: "oversize"; tree: string } |
+    { kind: "miss"; reason: string; detail: string } | Error;
   function reviewHost(delta: Delta | ((input: { head: string }) => Delta | Promise<Delta>) = patchResult(), maxConcurrentProvisionsPerHost = 2) {
     const host = createFakePluginHost({
       settings: { pollSeconds: 15, maxConcurrentProvisionsPerHost },
@@ -1702,16 +1703,22 @@ describe("automatic review ranges", () => {
     return spawn.prompt ?? spawn.input![0]!.text;
   }
 
+  const rewritten = { kind: "miss", reason: "history_changed", detail: "reviewed head is not an ancestor" } as const;
   it.each([
-    { case: "confirmed ancestor of an already-observed commit", delta: patchResult(), verified: true, scope: "incremental" },
-    { case: "force-push", delta: null, verified: true, scope: "full" },
-    { case: "failed comparison", delta: new Error("range unavailable"), verified: true, scope: "full" },
-    { case: "malformed comparison", delta: { ...patchResult(), tree: "invalid" }, verified: true, scope: "full" },
-    { case: "only shadow history", delta: patchResult(), verified: false, scope: "full" },
-    { case: "a verified head with no recorded base", delta: patchResult(), verified: true, recordBase: false, scope: "full" },
-    { case: "a live head with no comment", delta: patchResult(), verified: false, liveStatus: "no_comment", scope: "full" },
-    { case: "a live head with unattributed comments", delta: patchResult(), verified: false, liveStatus: "commented_unattributed", scope: "full" },
-  ] as const)("uses $scope review for $case", async ({ delta, verified, scope, ...baseline }) => {
+    { case: "confirmed ancestor of an already-observed commit", delta: patchResult(), verified: true, scope: "incremental", note: null },
+    { case: "an oversize patch", delta: { kind: "oversize", tree: baselineTree }, verified: true, scope: "incremental",
+      note: `oversize: incremental diff exceeds ${2 * 1024 * 1024} bytes; the reviewer reads it from its worktree` },
+    { case: "force-push", delta: rewritten, verified: true, scope: "full", note: "history_changed: reviewed head is not an ancestor" },
+    { case: "a host git error", delta: { kind: "miss", reason: "git_error", detail: "git fetch failed" }, verified: true, scope: "full",
+      note: "git_error: git fetch failed" },
+    { case: "failed comparison", delta: new Error("range unavailable"), verified: true, scope: "full", note: "host_unavailable: range unavailable" },
+    { case: "malformed comparison", delta: { ...patchResult(), tree: "invalid" }, verified: true, scope: "full", note: /^host_unavailable: / },
+    { case: "only shadow history", delta: patchResult(), verified: false, scope: "full", note: null },
+    { case: "a verified head with no recorded base", delta: patchResult(), verified: true, recordBase: false, scope: "full",
+      note: `missing_base: verified head ${priorHead} has no recorded merge base` },
+    { case: "a live head with no comment", delta: patchResult(), verified: false, liveStatus: "no_comment", scope: "full", note: null },
+    { case: "a live head with unattributed comments", delta: patchResult(), verified: false, liveStatus: "commented_unattributed", scope: "full", note: null },
+  ] as const)("uses $scope review for $case", async ({ delta, verified, scope, note, ...baseline }) => {
     vi.useFakeTimers();
     let head = priorHead;
     stubGh({
@@ -1747,16 +1754,38 @@ describe("automatic review ranges", () => {
         expect(prompt).toContain("- Trigger: `new_commits`");
         expect(prompt).toContain(`- Previous verified head: ${verified ? "`" + priorHead + "`" : "none"}`);
         expect(prompt).toContain(`- Review scope: ${scope}`);
+        const run = store.listRuns().find(run => run.status === "reviewing");
+        const logged = harness.inspection.logEntries.filter(entry => entry.message.includes("review scope"));
+        if (note === null) {
+          expect(run?.scopeNote).toBeNull();
+          expect(logged).toEqual([]);
+        } else {
+          const expected = typeof note === "string" ? note : expect.stringMatching(note);
+          expect(run?.scopeNote).toEqual(expected);
+          expect(logged).toEqual([expect.objectContaining({
+            message: `run ${run!.id}: ${ruleName} for acme/widgets#7 at ${pushedHead} review scope ${run!.scopeNote}`,
+          })]);
+          expect((await harness.behavior.runCli(["show", run!.id])).stdout).toContain(`scope: ${run!.scopeNote}`);
+        }
         if (scope === "incremental") {
           expect(prompt).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
-          expect(prompt).toContain("Inspect only this patch, the files it touches, and their applicable rules.");
+          expect(prompt).toContain("Inspect only this patch");
           expect(prompt).not.toContain(`${priorHead}..${pushedHead}`);
           const uploads = harness.inspection.sdk.callsTo("projects.attachments.upload");
-          expect(uploads).toHaveLength(1);
-          expect((uploads[0]![0] as { clientFile: Uint8Array }).clientFile).toEqual(Buffer.from(ownedPatch));
-          expect(harness.inspection.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
-            input: [expect.objectContaining({ type: "text" }), expect.objectContaining({ type: "localFile", name: expect.stringMatching(/\.patch$/) })],
-          });
+          if (delta.kind === "oversize") {
+            expect(uploads).toEqual([]);
+            expect(harness.inspection.sdk.callsTo("threads.spawn")[0]![0]).not.toHaveProperty("input");
+            expect(prompt).toContain(`\`git cat-file -e ${baselineTree}^{tree}\` must succeed`);
+            expect(prompt).toContain(`\`git merge-tree --write-tree --no-messages ${priorHead} ${fullBase}\``);
+            expect(prompt).toContain(`\`git diff --no-ext-diff --no-textconv ${baselineTree} ${pushedHead} --\``);
+            expect(prompt).not.toContain("attached");
+          } else {
+            expect(uploads).toHaveLength(1);
+            expect((uploads[0]![0] as { clientFile: Uint8Array }).clientFile).toEqual(Buffer.from(ownedPatch));
+            expect(harness.inspection.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
+              input: [expect.objectContaining({ type: "text" }), expect.objectContaining({ type: "localFile", name: expect.stringMatching(/\.patch$/) })],
+            });
+          }
           expect(prompt).not.toContain(testPath);
           expect(prompt).not.toContain(`git diff ${fullBase}...${pushedHead}`);
         } else {
@@ -1905,6 +1934,8 @@ describe("automatic review ranges", () => {
         expect(sdk.callsTo("threads.spawn")).toHaveLength(2);
         expect(promptAt(harness, 1)).toContain("- Review scope: full");
         expect(promptAt(harness, 1)).toContain(`Inspect \`git diff ${retargetedBase}...${pushedHead}\``);
+        expect(store.listRuns().find(run => run.headSha === pushedHead && run.threadId !== null)?.scopeNote).toBe(
+          `base_moved: PR merge base moved from ${fullBase} to ${retargetedBase} while waiting for provisioning`);
       } finally {
         service.controller.abort();
         await service.done;
@@ -2011,6 +2042,8 @@ describe("automatic review ranges", () => {
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
         expect(promptAt(harness, 0)).toContain("- Review scope: full");
         expect(promptAt(harness, 0)).toContain(`Inspect \`git diff ${fullBase}...${pushedHead}\``);
+        expect(store.listRuns().find(run => run.status === "reviewing")?.scopeNote)
+          .toBe("forced: a forced dispatch reviews the full diff");
       } finally {
         service.controller.abort();
         await service.done;
