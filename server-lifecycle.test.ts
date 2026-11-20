@@ -66,6 +66,7 @@ function stubGh(options: {
   pollDraft?: () => boolean;
   detailDraft?: () => boolean;
   detailHead?: () => string;
+  holdDetail?: () => Promise<void> | undefined;
   pollOpen?: () => boolean;
   pollFiles?: () => string[] | null;
   reviewComments?: () => { id: number; body: string; path: string; line: number }[];
@@ -105,6 +106,11 @@ function stubGh(options: {
       response = JSON.stringify({
         ...pullRequest, draft: options.detailDraft?.() ?? pullRequest.draft, head: { ...pullRequest.head, sha: capturedHead },
       });
+      const held = options.holdDetail?.();
+      if (held !== undefined) {
+        void held.then(() => callback(null, response, ""));
+        return undefined as never;
+      }
     } else if (args.some(arg => arg.includes("/pulls/7/files?"))) {
       const files = options.pollFiles === undefined ? [] : options.pollFiles();
       if (files === null) {
@@ -2044,6 +2050,111 @@ describe("automatic review ranges", () => {
         await vi.advanceTimersByTimeAsync(15_000);
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
         expect(promptAt(harness, 0)).toContain(`- Head SHA: ${newerHead}`);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("does not let a delayed head check cancel a newer head admitted meanwhile", async () => {
+    vi.useFakeTimers();
+    const newerHead = "e".repeat(40);
+    let head = priorHead;
+    let detailReads = 0;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let armed = false;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => false,
+      holdDetail: () => armed && ++detailReads === 2 ? released : undefined,
+    });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      await saveRule(harness);
+      const store = createStore(bb.storage.database() as never);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        head = pushedHead;
+        armed = true;
+        const stale = harness.behavior.runCli(["dispatch", ruleName, "7"]);
+        await vi.advanceTimersByTimeAsync(0);
+        head = newerHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const newer = store.listRuns().find(run => run.headSha === newerHead)!;
+        expect(newer.status).toBe("reviewing");
+        release();
+        expect((await stale).exitCode).toBe(0);
+        expect(store.getRun(newer.id)?.status).toBe("reviewing");
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "skipped", detail: `superseded by newer head ${newerHead}`,
+        });
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("does not move a settling deferral back to a head a delayed check reported", async () => {
+    vi.useFakeTimers();
+    const middleHead = "e".repeat(40);
+    const latestHead = "f".repeat(40);
+    let head = priorHead;
+    let filesDown = false;
+    const detailHeads: string[] = [];
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let holdNext = false;
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => false,
+      detailHead: () => detailHeads.shift() ?? head,
+      pollFiles: () => filesDown ? null : ["src/changed.ts"],
+      holdDetail: () => {
+        if (!holdNext || detailHeads.length > 0) return undefined;
+        holdNext = false;
+        return released;
+      },
+    });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { settleMinutes: 1, conditions: [{ kind: "paths", globs: ["src/**"] }] });
+      const store = createStore(bb.storage.database() as never);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        head = pushedHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const settling = store.getDeferredReview(ruleId, "acme/widgets", 7)!;
+        expect(settling).toMatchObject({ headSha: pushedHead, waiting: { status: "waiting", headSha: pushedHead } });
+        detailHeads.push(pushedHead, middleHead);
+        holdNext = true;
+        const stale = harness.behavior.runCli(["dispatch", ruleName, "7"]);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(detailHeads).toEqual([]);
+        filesDown = true;
+        head = latestHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        const observed = store.getDeferredReview(ruleId, "acme/widgets", 7)!;
+        expect(observed.headSha).toBe(latestHead);
+        release();
+        expect((await stale).exitCode).toBe(0);
+        expect(store.getDeferredReview(ruleId, "acme/widgets", 7)).toMatchObject({
+          headSha: latestHead, firstObservedAt: observed.firstObservedAt,
+        });
+        expect(store.getRun(settling.waiting!.id)).toMatchObject({
+          status: "skipped", detail: `superseded by newer head ${latestHead}`,
+        });
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
       } finally {
         service.controller.abort();
         await service.done;

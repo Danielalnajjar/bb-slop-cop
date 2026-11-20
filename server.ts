@@ -412,29 +412,38 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // A poll snapshot can age while a gate, path or delta lookup runs. Recheck before
     // promoting a wait, consuming another head's deferral, or cancelling work on
-    // what might really be a newer SHA. Admission consumes the deferral, so
-    // recheck again if the poll changed it meanwhile.
-    for (let before = deferred(); before?.waiting ||
-        (before !== null && before.headSha !== null && before.headSha !== headSha) ||
-        store.listOlderActiveRuns(scope).length > 0;) {
+    // what might really be a newer SHA. A GitHub answer counts only if nothing
+    // the poll writes (deferral, observed head, other heads' active runs) changed
+    // while it was in flight; otherwise ask again.
+    const observe = () => {
+      const pending = deferred();
+      const others = store.listOlderActiveRuns(scope).map(run => run.id).sort();
+      return {
+        recheck: pending?.waiting != null || (pending?.headSha != null && pending.headSha !== headSha) || others.length > 0,
+        key: JSON.stringify([pending?.headSha ?? null, pending?.waiting?.id ?? null,
+          store.getSeen(rule.repo, prNumber)?.headSha ?? null, others]),
+      };
+    };
+    for (let before = observe(); before.recheck;) {
       const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
-      if (latest.headRefOid !== headSha) {
-        const detail = supersededBy(latest.headRefOid);
-        const pending = deferred();
-        if (pending?.waiting?.headSha === headSha) {
-          const skipped = { ...pending.waiting, status: "skipped" as const, detail };
-          store.replaceWaitingHead(pending.waiting, pending.trigger, latest.headRefOid, detail, Date.now());
-          announce();
-          await finalizeRun(skipped);
-          return { runId: skipped.id, threadId: null };
-        }
-        const skipped = recordSkip(rule, pullRequest, detail);
+      const after = observe();
+      if (after.key !== before.key) {
+        before = after;
+        continue;
+      }
+      if (latest.headRefOid === headSha) break;
+      const detail = supersededBy(latest.headRefOid);
+      const pending = deferred();
+      if (pending?.waiting?.headSha === headSha) {
+        const skipped = { ...pending.waiting, status: "skipped" as const, detail };
+        store.replaceWaitingHead(pending.waiting, pending.trigger, latest.headRefOid, detail, Date.now());
         announce();
+        await finalizeRun(skipped);
         return { runId: skipped.id, threadId: null };
       }
-      const after = deferred();
-      if (after?.headSha === before?.headSha && after?.waiting?.id === before?.waiting?.id) break;
-      before = after;
+      const skipped = recordSkip(rule, pullRequest, detail);
+      announce();
+      return { runId: skipped.id, threadId: null };
     }
     const noChanges = delta?.patchBase64 === "";
     const pending = deferred();
