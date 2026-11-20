@@ -1924,7 +1924,7 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it("reviews a forced dispatch in full even when the PR-owned delta is empty", async () => {
+  it.each(["cli", "panel"] as const)("reports an empty %s dispatch and reviews a forced one in full", async (surface) => {
     vi.useFakeTimers();
     stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false });
     stubCheckWrites(true);
@@ -1937,7 +1937,16 @@ describe("automatic review ranges", () => {
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
-        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        const empty = `Base merge with no PR-owned change since reviewed head ${priorHead}.`;
+        if (surface === "cli") {
+          const unforced = await harness.behavior.runCli(["dispatch", ruleName, "7"]);
+          expect(unforced.exitCode).toBe(0);
+          expect(unforced.stdout).toContain(`Not reviewed ${ruleName} for #7. head=${pushedHead}`);
+          expect(unforced.stdout).toContain(empty);
+        } else {
+          expect(await harness.behavior.callRpc("dispatchNow", { ruleId, prNumber: 7 }))
+            .toMatchObject({ threadId: null, blockedReason: empty });
+        }
         expect(store.listRuns().find(run => run.headSha === pushedHead)?.status).toBe("no_pr_changes");
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
         expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--force"])).exitCode).toBe(0);

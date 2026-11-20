@@ -2060,7 +2060,8 @@ export default async function plugin(bb: BbPluginApi) {
       });
       const run = store.getRun(dispatched.runId);
       const rejected = dispatched.threadId === null && run !== null &&
-        (run.status === "cancelled" || run.status === "failed" || run.status === "skipped");
+        (run.status === "cancelled" || run.status === "failed" || run.status === "skipped" ||
+          run.status === "no_pr_changes");
       return {
         ...dispatched,
         blockedReason: rejected ? run.detail ?? "review preparation was rejected" : null,
@@ -2564,6 +2565,8 @@ export default async function plugin(bb: BbPluginApi) {
                 ? `Skipped ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${skippedReason}`
                 : run?.status === "waiting"
                   ? `Queued ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
+                : run?.status === "no_pr_changes"
+                  ? `Not reviewed ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
                 : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }
