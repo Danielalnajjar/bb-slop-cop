@@ -3035,6 +3035,57 @@ it("sets and lists settle minutes through the CLI without resetting them on a la
   }
 });
 
+it("persists permission and reasoning as independent rule edits", async () => {
+  const { harness } = await setupSettling(0);
+  harness.inspection.sdk.stub("providers.catalog", () => ["codex", "acp-antigravity", "acp-cursor"].map(id => ({
+    id, info: {
+      id, capabilities: {
+        permissionModes: id === "codex" ? ["full", "accept-edits", "auto"] : ["full", "accept-edits"],
+      },
+      reasoningLevels: ["low", "medium", "high"].map(level => ({ id: level })),
+    },
+  })));
+  harness.inspection.sdk.stub("system.executionOptions", () => ({
+    models: [],
+    selectedOnlyModels: [{
+      model: "test", reasoningDiscovery: "known",
+      supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }],
+    }],
+  }));
+  try {
+    const edit = (...flags: string[]) => harness.behavior.runCli(["rules", "edit", "settling-review", ...flags]);
+    const read = async () => JSON.parse((await harness.behavior.runCli(["rules", "--json"])).stdout!)[0].request;
+    const original = await read();
+
+    expect((await edit("--permission", "accept-edits")).exitCode).toBe(0);
+    expect(await read()).toMatchObject({ ...original, permissionMode: "accept-edits" });
+    expect((await edit("--reasoning", "low")).exitCode).toBe(0);
+    expect(await read()).toMatchObject({ ...original, permissionMode: "accept-edits", reasoningLevel: "low" });
+
+    const invalidReasoning = await edit("--reasoning", "medium");
+    expect(invalidReasoning).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/low.*high/) });
+    expect(await read()).toMatchObject({ ...original, permissionMode: "accept-edits", reasoningLevel: "low" });
+    expect(harness.inspection.sdk.callsTo("system.executionOptions")[0]?.[0]).toMatchObject({
+      hostId: "host_default", projectId: "project", providerId: "codex", selectedModel: "test",
+    });
+
+    expect((await edit("--permission", "auto")).exitCode).toBe(0);
+    expect(await edit("--provider", "acp-antigravity")).toMatchObject({
+      exitCode: 1, stderr: expect.stringMatching(/full.*accept-edits/),
+    });
+    expect(await read()).toMatchObject({ ...original, permissionMode: "auto", reasoningLevel: "low" });
+    expect((await edit("--permission", "accept-edits")).exitCode).toBe(0);
+    for (const providerId of ["acp-antigravity", "acp-cursor"]) {
+      expect((await edit("--provider", providerId)).exitCode).toBe(0);
+      const incompatible = await edit("--permission", "auto");
+      expect(incompatible).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/full.*accept-edits/) });
+      expect(await read()).toMatchObject({ ...original, providerId, permissionMode: "accept-edits", reasoningLevel: "low" });
+    }
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
 it("retains a path-filtered wait when GitHub temporarily fails to list changed files", async () => {
   let files: string[] | null = ["src/feature.ts"];
   const { bb, harness, push, writes } = await setupSettling(1, { pollFiles: () => files });

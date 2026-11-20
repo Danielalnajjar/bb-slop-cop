@@ -10,6 +10,7 @@ import { execFile, spawn } from "node:child_process";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
 import { createStore } from "./lib/db";
+import { createGhClient } from "./lib/gh";
 import { decorateBody } from "./lib/marker";
 import type { Run } from "./lib/types";
 
@@ -118,6 +119,29 @@ beforeEach(() => {
       end: (body: string) => {
         const parsed: unknown = JSON.parse(body);
         writes.push({ endpoint, body: parsed });
+        if (endpoint.endsWith("/pulls/42/comments")) {
+          const finding = parsed as { path: string; line: number; body: string };
+          if (finding.path !== "src/changed.ts" || finding.line !== 10) {
+            const errors = finding.path === "src/changed.ts"
+              ? [{ code: "custom", field: "pull_request_review_thread.line", message: "could not be resolved" }]
+              : [
+                  { code: "invalid", field: "pull_request_review_thread.path" },
+                  { code: "missing_field", field: "pull_request_review_thread.diff_hunk" },
+                ];
+            child.stdout.emit("data", Buffer.from(JSON.stringify({
+              message: "Validation Failed",
+              errors: errors.map(error => ({ resource: "PullRequestReviewComment", ...error })),
+            })));
+            child.stderr.emit("data", Buffer.from("gh: Validation Failed (HTTP 422)"));
+            child.emit("close", 1);
+            return;
+          }
+          reviewComments.push({
+            id: 11, ...finding,
+            html_url: "https://github.com/acme/widgets/pull/42#discussion_r11",
+            user: { login: "slopcop-bot" }, created_at: new Date(2_000).toISOString(),
+          });
+        }
         if (endpoint.includes("/issues/42/comments")) {
           issueComments.push({
             id: 7,
@@ -171,6 +195,54 @@ it("posts the no-findings summary from the agent's final message", async () => {
 
     const check = writes.find((write) => write.endpoint.includes("check-runs"));
     expect(check?.body).toMatchObject({ conclusion: "success" });
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+it.each([true, false])("finishes a review with a body for GitHub-rejected anchors (has inline: %s)", async (hasInline) => {
+  const gh = createGhClient("fake-slopcop-gh");
+  const inlineEndpoint = "repos/acme/widgets/pulls/42/comments";
+  const inlineBody = decorateBody("**Fix the changed line.**", "inline", {
+    rule: "restraint-review", run: RUN_ID, sha: "abc123", kind: "inline",
+  });
+  if (hasInline) {
+    await gh.request("POST", inlineEndpoint, {
+      commit_id: "abc123", path: "src/changed.ts", line: 10, side: "RIGHT", body: inlineBody,
+    });
+  }
+  for (const [path, line] of [["src/reverted.ts", 32], ["src/changed.ts", 85]] as const) {
+    await expect(gh.request("POST", inlineEndpoint, {
+      commit_id: "abc123", path, line, side: "RIGHT", body: inlineBody,
+    })).rejects.toThrow("HTTP 422");
+  }
+
+  const body = decorateBody([
+    "### Findings outside the PR diff",
+    "",
+    "- `src/reverted.ts:32` — **Restore scroll state.**",
+    "- `src/changed.ts:85` — **Keep the fallback.**",
+  ].join("\n"), "summary", {
+    rule: "restraint-review", run: RUN_ID, sha: "abc123", kind: "summary",
+  });
+  const staleMarker = body.replace(`run=${RUN_ID} sha=abc123`, "run=run_typo sha=wrong");
+  const { store, harness } = await finishThreadWith(staleMarker);
+  try {
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([
+      { endpoint: "repos/acme/widgets/issues/42/comments", body: { body } },
+    ]);
+    expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: hasInline ? 2 : 1 });
+    expect(store.listComments(RUN_ID)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "summary", attribution: "marker", bodyExcerpt: expect.stringContaining("src/reverted.ts:32") }),
+    ]));
+    if (hasInline) {
+      expect(store.listComments(RUN_ID)).toContainEqual(
+        expect.objectContaining({ kind: "inline", path: "src/changed.ts", line: 10, attribution: "marker" }),
+      );
+    }
+    expect(writes.find(write => write.endpoint.includes("check-runs"))?.body).toMatchObject({
+      conclusion: "success",
+    });
   } finally {
     await harness.lifecycle.dispose();
   }

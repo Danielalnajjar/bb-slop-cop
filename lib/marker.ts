@@ -19,6 +19,7 @@ export interface Marker {
 }
 
 const MARKER_PATTERN = /<!--\s*slopcop:([^>]*?)\s*-->/;
+export const OFF_DIFF_FINDINGS_HEADING = "### Findings outside the PR diff";
 
 /** Values are constrained so a rule name can never break out of the marker. */
 function sanitize(value: string): string {
