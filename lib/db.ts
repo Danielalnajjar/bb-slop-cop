@@ -5,7 +5,6 @@ import type {
   GateCheck,
   GateRun,
   GateRunStatus,
-  ReviewScope,
   Rule,
   Run,
   RunComment,
@@ -149,6 +148,9 @@ export const MIGRATIONS: string[] = [
   `CREATE INDEX idx_runs_thread ON runs(thread_id)`,
   `ALTER TABLE runs ADD COLUMN review_scope TEXT NOT NULL DEFAULT 'full'`,
   `ALTER TABLE runs ADD COLUMN was_draft INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE runs DROP COLUMN review_scope`,
+  `ALTER TABLE runs DROP COLUMN was_draft`,
+  `ALTER TABLE rules DROP COLUMN review_strategy`,
 ];
 
 type Row = Record<string, unknown>;
@@ -180,8 +182,9 @@ export const WAITING_CANCELLED_DETAIL = "cancelled by operator while waiting";
 // Shadow verification can also return no_comment and degraded comment statuses.
 const VERIFIED_REVIEW = `(mode = 'live' AND status IN ('commented', 'commented_partial',
   'commented_unmarked', 'commented_unattributed', 'no_comment'))`;
-const FULL_NON_DRAFT_REVIEW = `(review_scope = 'full' AND was_draft = 0)`;
-const COVERED_PUSH = `(${VERIFIED_REVIEW} OR (mode = ? AND status = 'no_pr_changes'))`;
+// Under once_per_head_sha, any review of the head covers it, whatever its
+// trigger, scope or draft state. Only a GitHub-verified run covers another mode.
+const COVERS_HEAD = `(? IS NULL OR (head_sha = ? AND (mode = ? OR ${VERIFIED_REVIEW})))`;
 
 function text(row: Row, key: string, fallback = ""): string {
   const value = row[key];
@@ -214,11 +217,6 @@ export function rowToRule(row: Row): Rule {
     request: parseJson<ThreadRequest | null>(row.request, null),
     dedupe: text(row, "dedupe", "once_per_pr") as Rule["dedupe"],
     settleMinutes: num(row, "settle_minutes"),
-    reviewStrategy: text(
-      row,
-      "review_strategy",
-      "update",
-    ) as Rule["reviewStrategy"],
     visibility: text(row, "visibility", "visible") === "hidden"
       ? "hidden"
       : "visible",
@@ -369,15 +367,15 @@ export function createStore(db: Database) {
     upsertRule(rule: Rule): void {
       db.prepare(
         `INSERT INTO rules (id, name, repo, enabled, mode, triggers, conditions,
-           author_trust, prompt, request, dedupe, review_strategy, visibility,
+           author_trust, prompt, request, dedupe, visibility,
            created_at, updated_at, settle_minutes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, repo = excluded.repo, enabled = excluded.enabled,
            mode = excluded.mode, triggers = excluded.triggers,
            conditions = excluded.conditions, author_trust = excluded.author_trust,
            prompt = excluded.prompt, request = excluded.request,
-           dedupe = excluded.dedupe, review_strategy = excluded.review_strategy,
+           dedupe = excluded.dedupe,
            visibility = excluded.visibility, updated_at = excluded.updated_at,
            settle_minutes = excluded.settle_minutes`,
       ).run(
@@ -392,7 +390,6 @@ export function createStore(db: Database) {
         rule.prompt,
         rule.request === null ? null : JSON.stringify(rule.request),
         rule.dedupe,
-        rule.reviewStrategy,
         rule.visibility,
         rule.createdAt,
         rule.updatedAt,
@@ -419,15 +416,11 @@ export function createStore(db: Database) {
     },
 
     deferReview(ruleId: string, repo: string, prNumber: number, trigger: Trigger, headSha: string, firstObservedAt: number): void {
-      // A push can advance the head of a queued readiness review, not replace
-      // its obligation to run in full. Closing or drafting the PR clears it.
       db.prepare(
         `INSERT INTO deferred_reviews (rule_id, repo, pr_number, trigger, head_sha, first_observed_at)
          VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(rule_id, repo, pr_number) DO UPDATE SET
-           trigger = CASE WHEN deferred_reviews.trigger = 'ready_for_review' AND excluded.trigger = 'new_commits'
-             THEN deferred_reviews.trigger ELSE excluded.trigger END,
-           head_sha = excluded.head_sha,
+           trigger = excluded.trigger, head_sha = excluded.head_sha,
            first_observed_at = CASE WHEN deferred_reviews.head_sha = excluded.head_sha
              THEN deferred_reviews.first_observed_at ELSE excluded.first_observed_at END`,
       ).run(ruleId, repo, prNumber, trigger, headSha, firstObservedAt);
@@ -527,53 +520,40 @@ export function createStore(db: Database) {
     /** Atomically reserve a review or record a skip naming the winning run. */
     admitRun(run: Run, options: {
       dedupe: Rule["dedupe"];
-      scope: ReviewScope;
-      trigger: Trigger;
-      isDraft: boolean;
       force?: boolean;
       promoted: boolean;
     }): Run {
       // One write statement, not a read followed by a write: SQLite serializes
       // this decision even for separate connections. Materialize the winner
       // before inserting so every derived field uses the same prior run.
-      // A full non-draft run covers a narrower review, but not vice versa.
-      // Only a GitHub-verified run can cover a different mode.
       const headSha = options.dedupe === "once_per_head_sha" ? run.headSha : null;
       const row = db.prepare(
         `WITH winner AS MATERIALIZED (
            SELECT id FROM runs
            WHERE ? = 0 AND rule_id = ? AND repo = ? AND pr_number = ?
-             AND ${REVIEW_DEDUPE_WINNER} AND id != ?
-             AND (? IS NULL OR (head_sha = ? AND (
-               (? = 'new_commits' AND ${COVERED_PUSH})
-               OR ((mode = ? OR ${VERIFIED_REVIEW})
-                 AND (review_scope = 'full' OR review_scope = ?) AND (was_draft = 0 OR ? = 1))
-             )))
+             AND ${REVIEW_DEDUPE_WINNER} AND id != ? AND ${COVERS_HEAD}
            ORDER BY started_at, id LIMIT 1
          )
          INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
            pr_author, head_sha, status, mode, detail, thread_id, comment_count,
-           started_at, finished_at, review_scope, was_draft)
+           started_at, finished_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?,
            CASE WHEN EXISTS (SELECT 1 FROM winner) THEN 'skipped' ELSE ? END,
            ?,
            CASE WHEN EXISTS (SELECT 1 FROM winner)
              THEN 'already admitted by run ' || (SELECT id FROM winner) ELSE ? END,
            ?, ?, ?,
-           CASE WHEN EXISTS (SELECT 1 FROM winner) THEN ? ELSE ? END, ?, ?)
+           CASE WHEN EXISTS (SELECT 1 FROM winner) THEN ? ELSE ? END)
          ON CONFLICT(id) DO UPDATE SET
            status = excluded.status, detail = excluded.detail, pr_title = excluded.pr_title,
            rule_name = excluded.rule_name,
-           pr_author = excluded.pr_author, started_at = excluded.started_at, finished_at = excluded.finished_at,
-           review_scope = excluded.review_scope, was_draft = excluded.was_draft
+           pr_author = excluded.pr_author, started_at = excluded.started_at, finished_at = excluded.finished_at
          RETURNING *`,
       ).get(
-        options.force ? 1 : 0, run.ruleId, run.repo, run.prNumber, run.headSha, run.id, headSha, headSha,
-        options.trigger, run.mode, run.mode, options.scope, options.isDraft ? 1 : 0,
+        options.force ? 1 : 0, run.ruleId, run.repo, run.prNumber, run.headSha, run.id, headSha, headSha, run.mode,
         run.id, run.ruleId, run.ruleName, run.repo, run.prNumber, run.prTitle,
         run.prAuthor, run.headSha, run.status, run.mode, run.detail,
         run.threadId, run.commentCount, run.startedAt, options.promoted ? null : run.startedAt, run.finishedAt,
-        options.scope, options.isDraft ? 1 : 0,
       ) as Row;
       return rowToRun(row);
     },
@@ -681,16 +661,16 @@ export function createStore(db: Database) {
       ruleId: string,
       repo: string,
       prNumber: number,
-      headSha: string | null,
+      headSha: string,
+      dedupe: Rule["dedupe"],
       mode: Rule["mode"],
-      pendingHeadSha = headSha,
     ): boolean {
+      const dedupeHead = dedupe === "once_per_head_sha" ? headSha : null;
       const row = db.prepare(
         `SELECT 1 FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ?
-           AND (? IS NULL OR head_sha = ?) AND ${REVIEW_DEDUPE_WINNER}
-           AND (? IS NULL OR ${COVERED_PUSH} OR (mode = ? AND ${FULL_NON_DRAFT_REVIEW})) LIMIT 1`,
-      ).get(ruleId, repo, prNumber, headSha, headSha, pendingHeadSha, headSha, mode, mode);
+           AND ${REVIEW_DEDUPE_WINNER} AND ${COVERS_HEAD} LIMIT 1`,
+      ).get(ruleId, repo, prNumber, headSha, dedupeHead, dedupeHead, mode);
       return row !== undefined;
     },
 

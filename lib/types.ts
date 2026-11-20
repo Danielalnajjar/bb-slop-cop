@@ -66,7 +66,6 @@ export const triggerSchema = z.enum([
   "manual",
 ]);
 export type Trigger = z.infer<typeof triggerSchema>;
-export type ReviewScope = "full" | "incremental";
 
 /**
  * The composer's resolved selections, stored verbatim and replayed at dispatch.
@@ -95,10 +94,6 @@ export type ThreadRequest = z.infer<typeof threadRequestSchema>;
 export const ruleModeSchema = z.enum(["shadow", "live"]);
 export type RuleMode = z.infer<typeof ruleModeSchema>;
 
-/** How a re-review on new commits reconciles with the previous comment set. */
-export const reviewStrategySchema = z.enum(["update", "replace", "append"]);
-export type ReviewStrategy = z.infer<typeof reviewStrategySchema>;
-
 /**
  * Hidden review threads stay out of sidebar organization and raise no unread
  * or notification attention — right for a rule that fires often enough to be
@@ -124,7 +119,6 @@ export const ruleSchema = z.object({
   request: threadRequestSchema.nullable(),
   dedupe: dedupeSchema,
   settleMinutes: settleMinutesSchema,
-  reviewStrategy: reviewStrategySchema,
   visibility: visibilitySchema,
   createdAt: z.number().int(),
   updatedAt: z.number().int(),

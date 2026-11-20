@@ -64,6 +64,7 @@ function stubGh(options: {
   draft?: boolean;
   pollHead?: () => string;
   pollDraft?: () => boolean;
+  detailDraft?: () => boolean;
   detailHead?: () => string;
   pollOpen?: () => boolean;
   pollFiles?: () => string[] | null;
@@ -101,7 +102,9 @@ function stubGh(options: {
       response = options.baseSha === null ? "" : options.baseSha ?? "7777777777777777777777777777777777777777";
     } else if (args.includes("repos/acme/widgets/pulls/7")) {
       capturedHead = options.heads?.[Math.min(reads++, options.heads.length - 1)] ?? options.detailHead?.() ?? options.pollHead?.() ?? "sha-7";
-      response = JSON.stringify({ ...pullRequest, head: { ...pullRequest.head, sha: capturedHead } });
+      response = JSON.stringify({
+        ...pullRequest, draft: options.detailDraft?.() ?? pullRequest.draft, head: { ...pullRequest.head, sha: capturedHead },
+      });
     } else if (args.some(arg => arg.includes("/pulls/7/files?"))) {
       const files = options.pollFiles === undefined ? [] : options.pollFiles();
       if (files === null) {
@@ -1278,7 +1281,7 @@ describe("watcher shutdown", () => {
       } else {
         expect(run).toMatchObject({ threadId: null, status: "cancelled", finishedAt: expect.any(Number),
           detail: count === 0 ? "dispatch recovery found no matching thread" : "dispatch recovery found multiple matching threads" });
-        expect(store.hasSettlingDuplicate("rule_1", "acme/widgets", 42, "abc123", "shadow")).toBe(false);
+        expect(store.hasSettlingDuplicate("rule_1", "acme/widgets", 42, "abc123", "once_per_head_sha", "shadow")).toBe(false);
       }
       expect(harness.inspection.sdk.callsTo("threads.list")[0]).toEqual([
         { originPluginId: bb.pluginId, includeHidden: true, archived: false, limit: 100, offset: 0 },
@@ -1421,7 +1424,7 @@ describe("watcher shutdown", () => {
             status: "cancelled", threadId: null, finishedAt: null,
             detail: "plugin stopped before dispatch completed",
           });
-          expect(store.hasSettlingDuplicate(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7", "shadow")).toBe(false);
+          expect(store.hasSettlingDuplicate(runsAtStop[0]!.ruleId, "acme/widgets", 7, "sha-7", "once_per_head_sha", "shadow")).toBe(false);
         }
         const callsAtStop = vi.mocked(execFile).mock.calls.length;
         release?.();
@@ -1887,30 +1890,30 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it("runs a full readiness review after a same-head draft review", async () => {
+  it.each([{ draft: false }, { draft: true }])("reviews a manual dispatch from the last verified head (draft: $draft)", async ({ draft }) => {
     vi.useFakeTimers();
-    let draft = true;
-    stubGh({ readyPullRequest: true, draft: true, pollHead: () => pushedHead, pollDraft: () => draft });
+    stubGh({ readyPullRequest: true, draft, pollHead: () => pushedHead, pollDraft: () => draft });
+    stubCheckWrites(true);
     const { bb, harness } = reviewHost();
     try {
       await plugin(bb);
-      await saveRule(harness);
+      const ruleId = await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      store.insertRun(makeReviewRun({
+        id: "run_verified", ruleId, ruleName, prNumber: 7, headSha: priorHead,
+        mode: "live", status: "commented", threadId: null, finishedAt: 2,
+      }));
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
-        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--include-draft"])).exitCode).toBe(0);
-        const store = createStore(bb.storage.database() as never);
-        const [run] = store.listRuns();
-        await harness.behavior.emitThreadEvent("thread.idle", {
-          thread: makeThreadResponse({ id: run!.threadId!, status: "idle" }),
-          lastAssistantText: `🚨 \`slopcop/${ruleName}\` — No issues found.\n\n<!-- slopcop:rule=${ruleName} run=${run!.id} sha=${pushedHead} kind=summary -->`,
-        });
-        await vi.advanceTimersByTimeAsync(0);
-        expect(store.getRun(run!.id)?.status).toBe("shadowed");
-        draft = false;
-        await vi.advanceTimersByTimeAsync(15_000);
-        expect(promptAt(harness, 1)).toContain("- Trigger: `ready_for_review`");
-        expect(promptAt(harness, 1)).toContain(`- Review range: \`${fullBase}...${pushedHead}\``);
+        const flags = draft ? ["--include-draft"] : [];
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", ...flags])).exitCode).toBe(0);
+        const prompt = promptAt(harness, 0);
+        expect(prompt).toContain("- Trigger: `manual`");
+        expect(prompt).toContain(`- Previous verified head: \`${priorHead}\``);
+        expect(prompt).toContain("- Review scope: incremental");
+        expect(prompt).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
+        expect(harness.inspection.sdk.callsTo("projects.attachments.upload")).toHaveLength(1);
       } finally {
         service.controller.abort();
         await service.done;
@@ -1920,7 +1923,95 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it("skips a replayed verified incremental head but still runs readiness in full", async () => {
+  it("does not review a draft-reviewed head again when the PR becomes ready unless forced", async () => {
+    vi.useFakeTimers();
+    let draft = true;
+    let reviewedRunId: string | null = null;
+    stubGh({
+      readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => draft, detailDraft: () => draft,
+      reviewComments: () => reviewedRunId === null ? [] : [{
+        id: 1, path: "src/changed.ts", line: 4,
+        body: `🚨 \`slopcop/${ruleName}\` — **Unused write.**\n\nRemove the unused write.\n\n<!-- slopcop:rule=${ruleName} run=${reviewedRunId} sha=${pushedHead} kind=inline -->`,
+      }],
+    });
+    stubCheckWrites(true);
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--include-draft"])).exitCode).toBe(0);
+        const [run] = store.listRuns();
+        reviewedRunId = run!.id;
+        await harness.behavior.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: run!.threadId!, status: "idle" }), lastAssistantText: "One finding",
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(store.getRun(run!.id)?.status).toBe("commented");
+
+        draft = false;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        const skipped = store.listRuns().filter(other => other.status === "skipped");
+        expect(skipped).toHaveLength(2);
+        for (const other of skipped) {
+          expect(other).toMatchObject({ headSha: pushedHead, detail: `already admitted by run ${run!.id}` });
+        }
+
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--force"])).exitCode).toBe(0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+        expect(promptAt(harness, 1)).toContain(`- Previous verified head: \`${pushedHead}\``);
+        expect(promptAt(harness, 1)).toContain("- Review scope: full");
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("admits one review when dispatches and the ready event race a draft review of the same head", async () => {
+    vi.useFakeTimers();
+    let draft = true;
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => draft, detailDraft: () => draft });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      await saveRule(harness);
+      const store = createStore(bb.storage.database() as never);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        const draftDispatch = () => harness.behavior.runCli(["dispatch", ruleName, "7", "--include-draft"]);
+        for (const result of await Promise.all([draftDispatch(), draftDispatch()])) expect(result.exitCode).toBe(0);
+        draft = false;
+        const [, ready] = await Promise.all([
+          vi.advanceTimersByTimeAsync(15_000),
+          harness.behavior.runCli(["dispatch", ruleName, "7"]),
+        ]);
+        expect(ready.exitCode).toBe(0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        const runs = store.listRuns();
+        const admitted = runs.filter(run => run.status !== "skipped");
+        expect(admitted).toHaveLength(1);
+        expect(runs.filter(run => run.status === "skipped").map(run => run.detail))
+          .toEqual(Array(3).fill(`already admitted by run ${admitted[0]!.id}`));
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("skips a replayed verified incremental head and its readiness review", async () => {
     vi.useFakeTimers();
     let head = priorHead;
     let draft = false;
@@ -1966,11 +2057,9 @@ describe("automatic review ranges", () => {
         await vi.advanceTimersByTimeAsync(15_000);
         draft = false;
         await vi.advanceTimersByTimeAsync(15_000);
-        const prompt = promptAt(harness, 1);
-        expect(prompt).toContain("- Trigger: `ready_for_review`");
-        expect(prompt).toContain("- Review scope: full");
-        expect(prompt).toContain(`- Review range: \`${fullBase}...${pushedHead}\``);
-        expect(prompt).toContain('"title":"Unused write.","summary":"Remove the unused write."');
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        const skipped = store.listRuns().filter(other => other.headSha === pushedHead && other.status === "skipped");
+        expect(skipped.map(other => other.detail)).toEqual(Array(2).fill(`already admitted by run ${run.id}`));
       } finally {
         service.controller.abort();
         await service.done;
@@ -1980,7 +2069,7 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it("does not let a push replace outstanding readiness work", async () => {
+  it("reviews a readiness review overtaken by a push from the last verified head", async () => {
     vi.useFakeTimers();
     let draft = true;
     let head = priorHead;
@@ -2005,8 +2094,9 @@ describe("automatic review ranges", () => {
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
         head = pushedHead;
         await vi.advanceTimersByTimeAsync(15_000);
-        expect(promptAt(harness, 0)).toContain("- Trigger: `ready_for_review`");
-        expect(promptAt(harness, 0)).toContain(`- Review range: \`${fullBase}...${pushedHead}\``);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        expect(promptAt(harness, 0)).toContain("- Trigger: `new_commits`");
+        expect(promptAt(harness, 0)).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
       } finally {
         service.controller.abort();
         await service.done;

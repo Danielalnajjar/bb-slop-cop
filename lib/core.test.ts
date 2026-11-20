@@ -48,7 +48,6 @@ function makeRule(overrides: Partial<Rule> = {}): Rule {
     prompt: "Review it.",
     request: null,
     dedupe: "once_per_pr",
-    reviewStrategy: "update",
     settleMinutes: 0,
     visibility: "visible",
     createdAt: 0,

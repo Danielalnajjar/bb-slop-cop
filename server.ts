@@ -54,7 +54,6 @@ import {
   conditionSchema,
   dedupeSchema,
   gateNameSchema,
-  reviewStrategySchema,
   settleMinutesSchema,
   ruleModeSchema,
   threadRequestSchema,
@@ -84,7 +83,6 @@ const ruleInputSchema = z.object({
   request: threadRequestSchema.nullable().default(null),
   dedupe: dedupeSchema.default("once_per_pr"),
   settleMinutes: settleMinutesSchema.default(0),
-  reviewStrategy: reviewStrategySchema.default("update"),
   visibility: visibilitySchema.default("visible"),
 });
 
@@ -112,7 +110,6 @@ const ruleOutputSchema = z.object({
   request: z.unknown().nullable(),
   dedupe: z.string(),
   settleMinutes: z.number(),
-  reviewStrategy: z.string(),
   visibility: z.string(),
   createdAt: z.number(),
   updatedAt: z.number(),
@@ -410,7 +407,8 @@ export default async function plugin(bb: BbPluginApi) {
     const previousVerifiedHead = store.latestVerifiedHead(rule.id, rule.repo, prNumber);
     let baseRefOid: string | undefined;
     let delta: z.infer<typeof reviewDeltaContract.reviewDelta.output> = null;
-    if (trigger === "new_commits" && previousVerifiedHead !== null && previousVerifiedHead !== headSha &&
+    // Every trigger reviews only what changed since the last verified head.
+    if (previousVerifiedHead !== null && previousVerifiedHead !== headSha &&
         rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
       const projectId = rule.request.projectId;
       try {
@@ -428,7 +426,6 @@ export default async function plugin(bb: BbPluginApi) {
         watcherSignal?.throwIfAborted();
       }
     }
-    const reviewScope = delta === null ? "full" : "incremental";
     const noChanges = delta?.patchBase64 === "";
     const pending = deferred();
     if (trigger !== "manual" && (
@@ -452,8 +449,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...newRun(rule, pullRequest, noChanges ? "no_pr_changes" : "dispatched", runId),
         detail,
       }, {
-        dedupe: rule.dedupe, scope: reviewScope, trigger,
-        isDraft: pullRequest.isDraft, force: options.force, promoted,
+        dedupe: rule.dedupe, force: options.force, promoted,
       });
       if (waiting !== null && !promoted) {
         store.discardDeferredReview(rule.id, rule.repo, prNumber,
@@ -1046,9 +1042,8 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
 
-    const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
     if (trigger === "new_commits" && rule.settleMinutes > 0 &&
-        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, dedupeHead, rule.mode, headSha)) {
+        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, headSha, rule.dedupe, rule.mode)) {
       let current = waiting;
       if (current === null || replaced || current.mode !== rule.mode) {
         const next = {
@@ -2301,8 +2296,6 @@ export default async function plugin(bb: BbPluginApi) {
             request: existing?.request ?? null,
             dedupe: flag("dedupe") ?? existing?.dedupe ?? "once_per_pr",
             settleMinutes: settleMinutes === undefined ? existing?.settleMinutes : Number(settleMinutes),
-            reviewStrategy:
-              flag("strategy") ?? existing?.reviewStrategy ?? "update",
             visibility: has("hidden")
               ? "hidden"
               : has("visible")
