@@ -1647,6 +1647,9 @@ describe("automatic review ranges", () => {
   const ruleName = "scoped-review";
   const testPath = "test/full-pr-only.ts";
   const ownedPatch = "diff --git a/src/changed.ts b/src/changed.ts\n+new PR-owned line\n";
+  const reviewGit = "git --no-replace-objects -c merge.conflictStyle=merge -c merge.renames=true -c merge.directoryRenames=conflict";
+  const oversize = { kind: "oversize", tree: baselineTree } as const;
+  const oversizeNote = `oversize: incremental diff exceeds ${2 * 1024 * 1024} bytes; the reviewer reads it from its worktree`;
   const patchResult = (patch = ownedPatch, baseMerged = false) => ({
     kind: "patch" as const, tree: baselineTree, patchBase64: Buffer.from(patch).toString("base64"), baseMerged,
   });
@@ -1706,8 +1709,7 @@ describe("automatic review ranges", () => {
   const rewritten = { kind: "miss", reason: "history_changed", detail: "reviewed head is not an ancestor" } as const;
   it.each([
     { case: "confirmed ancestor of an already-observed commit", delta: patchResult(), verified: true, scope: "incremental", note: null },
-    { case: "an oversize patch", delta: { kind: "oversize", tree: baselineTree }, verified: true, scope: "incremental",
-      note: `oversize: incremental diff exceeds ${2 * 1024 * 1024} bytes; the reviewer reads it from its worktree` },
+    { case: "an oversize patch", delta: oversize, verified: true, scope: "incremental", note: oversizeNote },
     { case: "force-push", delta: rewritten, verified: true, scope: "full", note: "history_changed: reviewed head is not an ancestor" },
     { case: "a host git error", delta: { kind: "miss", reason: "git_error", detail: "git fetch failed" }, verified: true, scope: "full",
       note: "git_error: git fetch failed" },
@@ -1766,6 +1768,7 @@ describe("automatic review ranges", () => {
             message: `run ${run!.id}: ${ruleName} for acme/widgets#7 at ${pushedHead} review scope ${run!.scopeNote}`,
           })]);
           expect((await harness.behavior.runCli(["show", run!.id])).stdout).toContain(`scope: ${run!.scopeNote}`);
+          expect((await harness.behavior.runCli(["runs"])).stdout).toContain(`\n    scope: ${run!.scopeNote}`);
         }
         if (scope === "incremental") {
           expect(prompt).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
@@ -1775,9 +1778,10 @@ describe("automatic review ranges", () => {
           if (delta.kind === "oversize") {
             expect(uploads).toEqual([]);
             expect(harness.inspection.sdk.callsTo("threads.spawn")[0]![0]).not.toHaveProperty("input");
-            expect(prompt).toContain(`\`git cat-file -e ${baselineTree}^{tree}\` must succeed`);
-            expect(prompt).toContain(`\`git merge-tree --write-tree --no-messages ${priorHead} ${fullBase}\``);
-            expect(prompt).toContain(`\`git diff --no-ext-diff --no-textconv ${baselineTree} ${pushedHead} --\``);
+            expect(prompt).toContain(`\`${reviewGit} cat-file -e ${baselineTree}^{tree}\``);
+            expect(prompt).toContain(`\`${reviewGit} merge-tree --write-tree --no-messages ${priorHead} ${fullBase}\``);
+            expect(prompt).toContain(
+              `\`${reviewGit} diff --no-ext-diff --no-textconv --ignore-submodules=none ${baselineTree} ${pushedHead} --\``);
             expect(prompt).not.toContain("attached");
           } else {
             expect(uploads).toHaveLength(1);
@@ -1848,11 +1852,14 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it("retains a computed incremental patch while the target host is at its provisioning cap", async () => {
+  it.each([
+    { input: "an attached patch", delta: patchResult(), uploads: 1, note: null },
+    { input: "an oversize patch", delta: oversize, uploads: 0, note: oversizeNote },
+  ])("retains $input while the target host is at its provisioning cap", async ({ delta, uploads, note }) => {
     vi.useFakeTimers();
     let head = priorHead;
     stubGh({ readyPullRequest: true, pollHead: () => head, pollDraft: () => false });
-    const { bb, harness } = reviewHost(patchResult(), 1);
+    const { bb, harness } = reviewHost(delta, 1);
     const { sdk } = harness.inspection;
     sdk.stub("threads.get", ({ threadId }) => makeThreadResponse({ id: threadId, status: "starting" }));
     sdk.stub("threads.events.list", ({ threadId }) => [reviewProvisioningEvent(threadId, "active")]);
@@ -1882,10 +1889,12 @@ describe("automatic review ranges", () => {
           sequence: 1,
         });
         await vi.advanceTimersByTimeAsync(0);
-        expect(sdk.callsTo("projects.attachments.upload")).toHaveLength(1);
+        expect(sdk.callsTo("projects.attachments.upload")).toHaveLength(uploads);
         expect(sdk.callsTo("threads.spawn")).toHaveLength(2);
         expect(promptAt(harness, 1)).toContain(`- Review range: tree \`${baselineTree}\` to head \`${pushedHead}\``);
         expect(promptAt(harness, 1)).toContain("Inspect only this patch");
+        expect(promptAt(harness, 1).includes(`${reviewGit} diff`)).toBe(uploads === 0);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)?.scopeNote).toBe(note);
       } finally {
         service.controller.abort();
         await service.done;
@@ -2048,6 +2057,27 @@ describe("automatic review ranges", () => {
         service.controller.abort();
         await service.done;
       }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("records a forced re-review of the head that was already verified", async () => {
+    vi.useFakeTimers();
+    stubGh({ readyPullRequest: true, pollHead: () => priorHead, pollDraft: () => false });
+    const { bb, harness } = reviewHost();
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness);
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--force"])).exitCode).toBe(0);
+      expect(promptAt(harness, 0)).toContain("- Review scope: full");
+      const run = store.listRuns().find(run => run.status === "reviewing");
+      expect(run?.scopeNote).toBe("forced: a forced dispatch reviews the full diff");
+      expect(harness.inspection.logEntries.filter(entry => entry.message.includes("review scope"))).toEqual([
+        expect.objectContaining({ message: `run ${run!.id}: ${ruleName} for acme/widgets#7 at ${priorHead} review scope ${run!.scopeNote}` }),
+      ]);
     } finally {
       await harness.lifecycle.dispose();
     }

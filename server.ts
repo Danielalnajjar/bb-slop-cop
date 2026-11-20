@@ -394,11 +394,12 @@ export default async function plugin(bb: BbPluginApi) {
     // Every trigger reviews only what changed since the last verified head.
     // Anything else after a verified head is recorded with its reason.
     let scopeNote: string | null = null;
-    if (prior !== null && prior.headSha !== headSha &&
-        rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
+    if (prior !== null && rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
       const projectId = rule.request.projectId;
       if (options.force === true) {
         scopeNote = formatIncrementalMiss("forced", "a forced dispatch reviews the full diff");
+      } else if (prior.headSha === headSha) {
+        // Dedupe skips the head that review already verified.
       } else if (prior.baseSha === null) {
         scopeNote = formatIncrementalMiss("missing_base", `verified head ${prior.headSha} has no recorded merge base`);
       } else {

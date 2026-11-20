@@ -1,6 +1,6 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { execFile } from "node:child_process";
-import { MAX_ATTACHED_PATCH_BYTES, reviewDeltaContract, reviewSha } from "./lib/review-delta";
+import { MAX_ATTACHED_PATCH_BYTES, REVIEW_GIT_OPTIONS, reviewDeltaContract, reviewSha } from "./lib/review-delta";
 
 class GitFailure extends Error {
   constructor(command: string, readonly oversize: boolean) {
@@ -14,7 +14,7 @@ export default experimental_defineHostEntry({
     async reviewDelta({ repo, sourcePath, prior, priorBase, base, head }, context) {
       const signal = AbortSignal.any([context.signal, context.lifecycle.signal]);
       const run = (args: string[], allowConflict = false) => new Promise<{ stdout: Buffer; conflicted: boolean }>((resolve, reject) => {
-        execFile("git", ["--no-replace-objects", "-C", sourcePath, ...args], {
+        execFile("git", [...REVIEW_GIT_OPTIONS, "-C", sourcePath, ...args], {
           encoding: "buffer", timeout: 45_000, maxBuffer: MAX_ATTACHED_PATCH_BYTES, signal,
           env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
         }, (error, stdout) => {
@@ -24,6 +24,9 @@ export default experimental_defineHostEntry({
         });
       });
       const read = async (args: string[]) => (await run(args)).stdout.toString("utf8").trim();
+      // Exit 1 means not an ancestor, unrelated histories included.
+      const isAncestor = async (ancestor: string, descendant: string) =>
+        !(await run(["merge-base", "--is-ancestor", ancestor, descendant], true)).conflicted;
       try {
         const remote = await read(["remote", "get-url", "origin"]);
         const remoteRepo = /^(?:git@github\.com:|(?:ssh:\/\/git@github\.com|https:\/\/github(?:\.com|\.int\.exe\.xyz))\/)([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/i.exec(remote)?.[1];
@@ -39,13 +42,16 @@ export default experimental_defineHostEntry({
         }
         // The prior review covered priorBase...prior. A base that moved backward or
         // elsewhere puts uncovered commits in the PR diff, so only a full review fits.
-        if (await read(["merge-base", prior, head]) !== prior) {
+        // Fetching the head brings every ancestor, so a missing prior head was rewritten away.
+        const priorPresent = await run(["cat-file", "-e", prior + "^{commit}"]).then(() => true, () => false);
+        signal.throwIfAborted();
+        if (!priorPresent || !await isAncestor(prior, head)) {
           return { kind: "miss", reason: "history_changed", detail: `reviewed head ${prior} is not an ancestor of ${head}` };
         }
-        if (await read(["merge-base", base, head]) !== base) {
+        if (!await isAncestor(base, head)) {
           return { kind: "miss", reason: "history_changed", detail: `PR base ${base} is not an ancestor of ${head}` };
         }
-        if (await read(["merge-base", priorBase, base]) !== priorBase) {
+        if (!await isAncestor(priorBase, base)) {
           return { kind: "miss", reason: "history_changed", detail: `reviewed base ${priorBase} is not an ancestor of PR base ${base}` };
         }
 

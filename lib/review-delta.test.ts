@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import { expect, it } from "vitest";
 import reviewHost from "../host";
+import { REVIEW_GIT_OPTIONS } from "./review-delta";
 
 it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in a real repository", async () => {
   const sourcePath = mkdtempSync(join(tmpdir(), "slopcop-delta-"));
@@ -96,12 +97,15 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
   }
 });
 
-it("returns an oversize patch's tree for the reviewer to diff, and names git errors", async () => {
+it("returns an oversize patch's tree that another clone reproduces, and names other misses", async () => {
   const sourcePath = mkdtempSync(join(tmpdir(), "slopcop-delta-"));
+  const clonePath = mkdtempSync(join(tmpdir(), "slopcop-clone-"));
   const harness = experimental_createHostEntryHarness(reviewHost);
-  const git = (...args: string[]) => execFileSync("git", ["-C", sourcePath, ...args], {
+  const gitIn = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+  const git = (...args: string[]) => gitIn(sourcePath, ...args);
+  const write = (file: string, text: string) => writeFileSync(join(sourcePath, file), text + "\n");
   const commit = (message: string) => {
     git("add", "--all");
     git("commit", "-m", message);
@@ -112,23 +116,56 @@ it("returns an oversize patch's tree for the reviewer to diff, and names git err
     git("config", "user.name", "Review Fixture");
     git("config", "user.email", "fixture@example.invalid");
     git("remote", "add", "origin", "https://github.com/acme/widgets.git");
-    writeFileSync(join(sourcePath, "base.txt"), "initial\n");
-    const base = commit("initial");
-    writeFileSync(join(sourcePath, "prior.txt"), "already reviewed\n");
+    write("conflict.txt", "initial");
+    const priorBase = commit("initial");
+    git("switch", "-c", "feature");
+    write("conflict.txt", "from the PR");
     const prior = commit("prior reviewed head");
-    const lines = Array.from({ length: 60_000 }, (_, index) => `generated line ${index} ${"x".repeat(32)}`);
-    writeFileSync(join(sourcePath, "large.txt"), lines.join("\n") + "\n");
+    git("switch", "master");
+    write("conflict.txt", "from master");
+    const base = commit("master edits the same line");
+    git("switch", "feature");
+    expect(() => git("merge", "--no-ff", "--no-edit", base)).toThrow();
+    write("conflict.txt", "the resolution");
+    commit("resolve merge");
+    write("large.txt", Array.from({ length: 60_000 }, (_, index) => `generated line ${index} ${"x".repeat(32)}`).join("\n"));
     const head = commit("large push");
-    const input = { repo: "acme/widgets", sourcePath, prior, priorBase: base, base, head };
+    const input = { repo: "acme/widgets", sourcePath, prior, priorBase, base, head };
 
     const result = await harness.experimental_call("reviewDelta", input);
-    const tree = git("merge-tree", "--write-tree", "--no-messages", prior, base).split("\n", 1)[0];
-    expect(result).toEqual({ kind: "oversize", tree });
-    // The commands the prompt gives the reviewer reproduce the same range.
-    const diff = git("diff", "--no-ext-diff", "--no-textconv", tree!, head, "--");
-    expect(diff.length).toBeGreaterThan(2 * 1024 * 1024);
-    expect(diff.match(/^diff --git .*$/gm)).toEqual(["diff --git a/large.txt b/large.txt"]);
+    expect(result).toEqual({ kind: "oversize", tree: expect.stringMatching(/^[a-f0-9]{40}$/) });
+    const { tree } = result as { tree: string };
 
+    // The reviewer's checkout: no unreferenced merge tree, and a different conflict style.
+    execFileSync("git", ["clone", "--quiet", "--no-local", "--no-checkout", sourcePath, clonePath]);
+    gitIn(clonePath, "config", "merge.conflictStyle", "zdiff3");
+    gitIn(clonePath, "checkout", "--quiet", "--detach", head);
+    expect(() => gitIn(clonePath, ...REVIEW_GIT_OPTIONS, "cat-file", "-e", `${tree}^{tree}`)).toThrow();
+    const mergeTree = (options: readonly string[]) => {
+      const merged = spawnSync("git", ["-C", clonePath, ...options, "merge-tree", "--write-tree", "--no-messages", prior, base], {
+        encoding: "utf8",
+      });
+      expect(merged.status).toBe(1);
+      return merged.stdout.split("\n", 1)[0];
+    };
+    expect(mergeTree([])).not.toBe(tree);
+    expect(mergeTree(REVIEW_GIT_OPTIONS)).toBe(tree);
+    const diff = gitIn(clonePath, ...REVIEW_GIT_OPTIONS, "diff", "--no-ext-diff", "--no-textconv",
+      "--ignore-submodules=none", tree, head, "--");
+    expect(diff.length).toBeGreaterThan(2 * 1024 * 1024);
+    expect(diff.match(/^diff --git .*$/gm)).toEqual(["diff --git a/conflict.txt b/conflict.txt", "diff --git a/large.txt b/large.txt"]);
+    expect(diff).toContain("+the resolution");
+
+    git("switch", "--quiet", "--orphan", "unrelated");
+    write("unrelated.txt", "no shared history");
+    const unrelated = commit("unrelated root");
+    expect(await harness.experimental_call("reviewDelta", { ...input, head: unrelated })).toEqual({
+      kind: "miss", reason: "history_changed", detail: `reviewed head ${prior} is not an ancestor of ${unrelated}`,
+    });
+    const rewritten = "f".repeat(40);
+    expect(await harness.experimental_call("reviewDelta", { ...input, prior: rewritten })).toEqual({
+      kind: "miss", reason: "history_changed", detail: `reviewed head ${rewritten} is not an ancestor of ${head}`,
+    });
     expect(await harness.experimental_call("reviewDelta", { ...input, repo: "acme/other" })).toEqual({
       kind: "miss", reason: "git_error", detail: "project source origin does not match review repository",
     });
@@ -138,5 +175,6 @@ it("returns an oversize patch's tree for the reviewer to diff, and names git err
   } finally {
     await harness.experimental_dispose();
     rmSync(sourcePath, { recursive: true });
+    rmSync(clonePath, { recursive: true, force: true });
   }
 });
