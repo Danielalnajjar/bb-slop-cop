@@ -203,20 +203,21 @@ describe("bot posting command", () => {
     expect(prompt).toContain("The body flag is `-F`, not `-f`");
   });
 
-  it("tells live agents to pin findings on the line, not the review body", () => {
+  it("uses the Conversation body only for findings the PR diff cannot anchor", () => {
     const prompt = buildPrompt(context());
     expect(prompt).toContain("api repos/acme/checkout-api/pulls/482/comments");
     expect(prompt).toContain("-f commit_id=a1b2c3d");
-    expect(prompt).toContain("Do not put finding text in a");
-    expect(prompt).toContain("Conversation review body");
-    expect(prompt).toContain("only when there are zero findings");
+    expect(prompt).toContain("### Findings outside the PR diff");
+    expect(prompt).toContain("path:line");
+    expect(prompt).toContain("even if other findings were posted inline");
+    expect(prompt).toContain("an unresolved path or line is an\nanchor failure");
   });
 
   it("gives a live agent the findings and keeps the summary for SlopCop", () => {
     const prompt = buildPrompt(context());
     expect(prompt).toContain("LIVE MODE — POST EVERY FINDING");
     expect(prompt).toContain("This rule is live.");
-    expect(prompt).toContain("You do not post the no-findings summary");
+    expect(prompt).toContain("posts the Conversation body from your final message");
     expect(prompt).toContain("you never run `gh pr review`");
     expect(prompt).toContain("If you have no findings at all, post nothing.");
     expect(prompt).toContain("SlopCop posts that body to the PR.");
@@ -828,12 +829,12 @@ describe("the summary SlopCop posts", () => {
     });
 
   it("takes the final message when it carries this rule's summary marker", () => {
-    expect(post(marked("summary"))).toBe(marked("summary"));
+    expect(post(marked("summary"))).toEqual({ body: marked("summary"), hasOffDiffFindings: false });
   });
 
   it("stamps the canonical marker over a mistyped run id or sha", () => {
     // The agent transcribes both by hand; the server knows them exactly.
-    expect(post(marked("summary", "run_"))).toBe(marked("summary"));
+    expect(post(marked("summary", "run_"))?.body).toBe(marked("summary"));
     expect(
       post(
         decorateBody("a finding", "summary", {
@@ -842,7 +843,7 @@ describe("the summary SlopCop posts", () => {
           sha: "a1b2c3",
           kind: "summary",
         }),
-      ),
+      )?.body,
     ).toBe(marked("summary"));
   });
 

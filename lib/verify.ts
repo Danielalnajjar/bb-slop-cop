@@ -9,6 +9,7 @@ import {
   hasVisibleHeader,
   headerRuleName,
   markerBelongsToRule,
+  OFF_DIFF_FINDINGS_HEADING,
   parseMarker,
   restampMarker,
 } from "./marker";
@@ -207,32 +208,31 @@ export function incompleteReviewReason(finalMessage: string | null): string | nu
 }
 
 /**
- * The no-findings summary, which SlopCop posts rather than the agent.
- *
- * The agent owns findings — they are line comments needing a path and a line
- * only it knows — and ends a clean review with the summary as its final
- * message. What the agent has to get right is the rule and the kind; the run
- * id and head SHA are the server's own facts, so the returned body carries the
- * canonical marker rather than whatever the agent transcribed.
+ * The Conversation body SlopCop posts. The agent supplies its content and
+ * rule; SlopCop stamps the recorded run id and head before publishing.
  */
 export function summaryToPost(options: {
   rule: string;
   runId: string;
   sha: string;
   finalMessage: string | null;
-}): string | null {
+}): { body: string; hasOffDiffFindings: boolean } | null {
   if (incompleteReviewReason(options.finalMessage) !== null) return null;
   const body = (options.finalMessage ?? "").trim();
   const marker = parseMarker(body);
   if (marker === null) return null;
   if (!markerBelongsToRule(marker, options.rule)) return null;
   if (marker.kind !== "summary") return null;
-  return restampMarker(body, {
-    rule: options.rule,
-    run: options.runId,
-    sha: options.sha,
-    kind: "summary",
-  });
+  const firstContentLine = body.split(/\r?\n/).slice(1).find(line => line.trim() !== "");
+  return {
+    body: restampMarker(body, {
+      rule: options.rule,
+      run: options.runId,
+      sha: options.sha,
+      kind: "summary",
+    }),
+    hasOffDiffFindings: firstContentLine?.trim() === OFF_DIFF_FINDINGS_HEADING,
+  };
 }
 
 /**

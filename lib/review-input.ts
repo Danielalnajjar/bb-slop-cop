@@ -34,20 +34,10 @@ type EnvironmentInput = Extract<Parameters<BbPluginApi["sdk"]["threads"]["spawn"
   type: "provider";
 }> & { machine: z.infer<typeof machineSchema> };
 
-/** Pin a fresh built-in worktree, retaining machine placement but never a path. */
-export async function buildReviewEnvironment(
+export async function resolveReviewMachine(
   sdk: BbPluginApi["sdk"],
   request: ThreadRequest,
-  pullRequest: PullRequest,
-): Promise<EnvironmentInput> {
-  // Managed provisioning runs trusted repository setup. Force may bypass rule
-  // matching, but cannot authorize that execution for a drive-by fork author.
-  if (!isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
-    throw new Error("review input preparation requires a write-access trusted PR author");
-  }
-  if (!pullRequest.headRefOid || !pullRequest.baseRefOid) {
-    throw new Error("review input preparation requires captured head and base SHAs");
-  }
+): Promise<EnvironmentInput["machine"]> {
   const selection = environmentSchema.safeParse(
     request.environment === undefined ? { type: "project-default" } : request.environment,
   );
@@ -75,6 +65,24 @@ export async function buildReviewEnvironment(
     }
     machine = { type: "existing", hostId: defaults[0].hostId };
   }
+  return machine;
+}
+
+/** Pin a fresh built-in worktree, retaining machine placement but never a path. */
+export async function buildReviewEnvironment(
+  sdk: BbPluginApi["sdk"],
+  request: ThreadRequest,
+  pullRequest: PullRequest,
+): Promise<EnvironmentInput> {
+  // Managed provisioning runs trusted repository setup. Force may bypass rule
+  // matching, but cannot authorize that execution for a drive-by fork author.
+  if (!isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
+    throw new Error("review input preparation requires a write-access trusted PR author");
+  }
+  if (!pullRequest.headRefOid || !pullRequest.baseRefOid) {
+    throw new Error("review input preparation requires captured head and base SHAs");
+  }
+  const machine = await resolveReviewMachine(sdk, request);
   // The provider fetches a named `<remote>/<branch>` before `worktree add`,
   // but not a bare SHA, so a head pushed from another machine was an invalid
   // reference until something else fetched it. The prompt's input check still

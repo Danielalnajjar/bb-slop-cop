@@ -58,7 +58,7 @@ bb slopcop rules add \
   --repo owner/repo \
   --project my-project \
   --paths "src/auth/**,src/payments/**" \
-  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
+  --prompt "Review the diff for auth and payment issues."
 
 bb slopcop check security-sweep 482   # would it match? if not, exactly why not
 bb slopcop dispatch security-sweep 482
@@ -127,13 +127,13 @@ wrote it, plus a hidden marker so SlopCop can find its own comments later:
 <!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=inline -->
 ```
 
-Findings are line comments on the diff, and the agent posts them: only it knows
-the path and line each one belongs on. The no-findings summary (`kind=summary`)
-has one owner too, and it is not the agent — a clean review ends with that body
-as the thread's final message, and SlopCop posts it. A live agent is told never
-to run `gh pr review`, so its no-findings behavior is the same live and in
-shadow mode. A later run on a new commit is told which comments this rule
-already left, so it should not open a twin thread.
+The agent posts line comments where GitHub can anchor them. If a finding's
+file or line is outside the current PR diff, the agent returns it with its
+path and line in the final message. SlopCop posts those findings together in
+one Conversation comment (`kind=summary`), even when the review also posted
+inline. The same body format carries the clean summary when there are no
+findings. A live agent never runs `gh pr review`. Later reviews receive the
+rule's prior inline comments so they do not open duplicate threads.
 
 When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
 polls GitHub's three separate comment surfaces (issue comments, inline review comments,

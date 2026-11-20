@@ -4,7 +4,7 @@
 // marker every posted body must carry, because verification matches on them. In
 // shadow mode it forbids posting entirely and asks for the review as text, so
 // the same rule can be dry-run before it is ever visible on a PR.
-import { buildMarker, buildHeader } from "./marker";
+import { buildMarker, buildHeader, OFF_DIFF_FINDINGS_HEADING } from "./marker";
 import { formatPriorComments, type PriorComment } from "./prior";
 import { REVIEW_GIT_OPTIONS } from "./review-delta";
 import type { PullRequest, Rule, Trigger } from "./types";
@@ -45,23 +45,14 @@ try to read, print, or pass a token yourself.`;
   const repo = context.rule.repo;
   const pr = context.pullRequest.number;
   const sha = context.pullRequest.headRefOid;
-  // One owner per body. The agent posts findings, which need a path and a line
-  // only it knows; SlopCop posts the no-findings summary from the final
-  // message, so the agent's no-findings behavior is the same live and shadow.
   return `## LIVE MODE — POST EVERY FINDING
 
-This rule is live. A finding exists only once it is a line comment on the PR,
-so post each one with \`${ghCommand}\` before you end your turn.
-
-You do not post the no-findings summary and you never run \`gh pr review\`:
-SlopCop posts that body itself, from your final message.
+This rule is live. Post findings inline where GitHub can anchor them. SlopCop
+posts the Conversation body from your final message; you never run \`gh pr review\`.
 
 ## POSTING
 
 Post with \`${ghCommand}\`.
-
-Findings are line comments on the diff. Do not put finding text in a
-Conversation review body — it cannot attach to a file, and it is not yours.
 
 Write every body to its own file first, with a quoted heredoc delimiter so
 the text lands exactly as written, and pass the file to \`gh\`. Never pass a
@@ -85,7 +76,14 @@ For each finding, post one review comment on the line (commit is the head SHA):
 \`side=LEFT\` only for a deleted line. If a finding has no line, omit \`line\`
 and pass \`-f subject_type=file\`.
 
-Line comments publish immediately; that is the finding.
+The follow-up patch and GitHub's current PR diff can differ. If the current PR
+diff cannot anchor the finding, keep its original path and line and include
+it in the body described below. For an inline POST that fails with HTTP 422,
+read the JSON response as well as stderr: an unresolved path or line is an
+anchor failure. GitHub can identify it as \`pull_request_review_thread.path\`
+or \`pull_request_review_thread.line\`. Missing authorization, a changed head, and other posting
+failures are not anchor failures; end with \`Review incomplete: <posting error>\`
+in those cases. Do not use a different line as a substitute.
 
 If you have no findings at all, post nothing.${note}`;
 }
@@ -123,11 +121,20 @@ Ends with exactly:
 
     ${inlineMarker}
 
-No-findings review body (only when there are zero findings) — starts with:
+Conversation review body — starts with:
 
     ${buildHeader("summary", rule.name)}
 
-one sentence, and ends with exactly:
+For a clean review, use one sentence. In live mode, if any findings cannot
+attach to the PR diff, put this heading immediately after the header:
+
+    ${OFF_DIFF_FINDINGS_HEADING}
+
+Under it, list only those findings, starting each item with a repo-relative
+\`path:line\` (or just the path for a file-level finding), followed by its title
+and short explanation. For example: \`- src/scroll.ts:42 — Preserve the saved scroll position.\`
+
+End the body with exactly:
 
     ${summaryMarker}
 
@@ -247,13 +254,12 @@ ${
   shadow
     ? `End your turn with the full review text you would have posted, formatted
 exactly as specified above (header + body + marker). Nothing is posted.`
-    : `With findings, post every line comment first — ending the turn with an
-unposted finding is a failed run — then end your turn with a one-line summary
-and the URL of each comment you created.
+    : `If any finding could not attach to the PR diff, end with the Conversation
+body above, even if other findings were posted inline. Do not report the
+missing anchor as an incomplete review.
 
-With no findings, post nothing and end your turn with the no-findings review
-body, formatted exactly as specified above (header + one sentence + marker).
-SlopCop posts that body to the PR.`
+If all findings were posted inline, end with a one-line summary and their URLs.
+With no findings, end with the clean body above. SlopCop posts that body to the PR.`
 }`;
 }
 

@@ -9,12 +9,13 @@ import {
   type BbPluginApi,
   type PluginThreadEventPayloads,
 } from "@get-bb/plugin-sdk";
+import { isDeepStrictEqual } from "node:util";
 import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
-import { buildReviewEnvironment } from "./lib/review-input";
+import { buildReviewEnvironment, resolveReviewMachine } from "./lib/review-input";
 import {
   formatIncrementalMiss, MAX_ATTACHED_PATCH_BYTES, reviewDeltaContract, type ReviewDelta,
 } from "./lib/review-delta";
@@ -41,6 +42,7 @@ import {
   summaryToPost,
   verifyLive,
   verifyShadow,
+  type VerifyResult,
 } from "./lib/verify";
 import {
   completeCheckRun,
@@ -1511,10 +1513,11 @@ export default async function plugin(bb: BbPluginApi) {
         run.mode === "shadow"
           ? verifyShadow({ runId: run.id, finalMessage })
           : await (async () => {
-              // GitHub's list endpoints can lag a just-submitted review, so a
-              // bare no_comment gets one retry before it is believed.
-              const first = await waitForWork(() => runVerify());
-              if (recoverLiveOutput && !first.comments.some(comment => comment.kind === "summary" && comment.attribution === "marker")) {
+              const hasMarkedSummary = (result: VerifyResult) => result.comments.some(
+                comment => comment.kind === "summary" && comment.attribution === "marker",
+              );
+              let verified = await waitForWork(() => runVerify());
+              if (recoverLiveOutput && !hasMarkedSummary(verified)) {
                 try {
                   finalMessage = (await waitForWork(() => bb.sdk.threads.output({ threadId }))).output;
                 } catch (error) {
@@ -1528,29 +1531,26 @@ export default async function plugin(bb: BbPluginApi) {
                   return { status: "cancelled" as const, detail: incomplete, comments: await incompleteComments() };
                 }
               }
-              if (first.status !== "no_comment") return first;
-              await sleep(4_000, watcherSignal);
-              const second = await waitForWork(() => runVerify());
-              // SlopCop owns the no-findings summary: the agent posts findings
-              // as line comments and ends a clean review with the summary as
-              // its final message. Nothing on the PR plus that body means the
-              // review is clean, so post it — carrying this run's canonical
-              // marker, not the agent's transcription of it — and re-verify,
-              // because GitHub stays the source of truth for what landed.
-              if (second.comments.length > 0) return second;
-              const body = summaryToPost({
+              const summary = summaryToPost({
                 rule: run.ruleName,
                 runId: run.id,
                 sha: run.headSha,
                 finalMessage,
               });
-              if (body === null) return second;
+              // Reads can lag a newly posted comment. Recheck before treating
+              // an empty review as final or publishing a missing body.
+              if (verified.status === "no_comment" || (summary?.hasOffDiffFindings && !hasMarkedSummary(verified))) {
+                await sleep(4_000, watcherSignal);
+                verified = await waitForWork(() => runVerify());
+              }
+              if (summary === null || hasMarkedSummary(verified)) return verified;
+              if (!summary.hasOffDiffFindings && verified.comments.length > 0) return verified;
               await waitForWork(() => gh.request(
                 "POST",
                 `repos/${run.repo}/issues/${run.prNumber}/comments`,
-                { body },
+                { body: summary.body },
               ));
-              bb.log.info(`run ${run.id}: posted the no-findings summary`);
+              bb.log.info(`run ${run.id}: posted the ${summary.hasOffDiffFindings ? "off-diff findings" : "no-findings summary"}`);
               return waitForWork(() => runVerify());
             })();
 
@@ -2373,45 +2373,67 @@ export default async function plugin(bb: BbPluginApi) {
 
           // Agent configuration from the CLI, so another BB agent can create a
           // dispatchable rule without opening the panel.
-          const projectFlag = flag("project");
-          let request = existing?.request ?? null;
-          if (projectFlag !== undefined || flag("model") !== undefined) {
-            const projects = await bb.sdk.projects.list();
-            const project =
-              projectFlag === undefined
-                ? null
-                : (projects.find((entry) => entry.id === projectFlag) ??
-                  projects.find((entry) => entry.name === projectFlag) ??
-                  null);
-            if (projectFlag !== undefined && project === null) {
-              return fail(
-                `no project named '${projectFlag}'. Available: ${projects
-                  .map((entry) => entry.name)
-                  .join(", ")}`,
-              );
-            }
-            const previous = (request ?? {}) as Record<string, unknown>;
-            request = {
-              ...previous,
-              projectId: project?.id ?? (previous.projectId as string),
-              providerId: flag("provider") ?? previous.providerId ?? "claude-code",
-              model: flag("model") ?? previous.model ?? "claude-opus-5-5[1m]",
-              reasoningLevel:
-                flag("reasoning") ?? previous.reasoningLevel ?? "high",
-              // BB's permission modes are full | auto | accept-edits — there is
-              // no read-only tier, so `auto` is the narrowest sensible default.
-              permissionMode:
-                flag("permission") ?? previous.permissionMode ?? "auto",
-              executionInputSources: previous.executionInputSources ?? {
-                providerId: "explicit",
-                model: "explicit",
-                reasoningLevel: "explicit",
-                permissionMode: "explicit",
-              },
-              environment: previous.environment ?? { type: "project-default" },
-            } as never;
+          const executionFlags = ["project", "provider", "model", "permission", "reasoning"];
+          for (const name of executionFlags.filter(has)) {
+            const value = flag(name);
+            if (!value?.trim() || value.startsWith("--")) return fail(`--${name} requires a value`);
           }
-          parsed.request = request as never;
+          if (executionFlags.some(has)) {
+            const previous = parsed.request;
+            const projectFlag = flag("project");
+            let projectId = previous?.projectId;
+            if (projectFlag !== undefined) {
+              const projects = await bb.sdk.projects.list();
+              const project = projects.find(entry => entry.id === projectFlag)
+                ?? projects.find(entry => entry.name === projectFlag);
+              if (project === undefined) {
+                return fail(`no project named '${projectFlag}'. Available: ${projects.map(entry => entry.name).join(", ")}`);
+              }
+              projectId = project.id;
+            }
+            if (projectId === undefined) return fail("use --project to configure the rule's agent");
+
+            const request = {
+              ...previous,
+              projectId,
+              providerId: flag("provider") ?? previous?.providerId ?? "claude-code",
+              model: flag("model") ?? previous?.model ?? "claude-opus-5-5[1m]",
+              reasoningLevel: flag("reasoning") ?? (previous === null ? "high" : previous.reasoningLevel),
+              permissionMode: flag("permission") ?? (previous === null ? "auto" : previous.permissionMode),
+            };
+            const checkPermission = has("permission") || has("provider") || previous === null;
+            const checkReasoning = has("reasoning") || has("provider") || has("model") || previous === null;
+            if (checkPermission || checkReasoning) {
+              const providers = await bb.sdk.providers.catalog();
+              const provider = providers.find(entry => entry.id === request.providerId)?.info;
+              if (!provider) return fail(`no registered BB provider '${request.providerId}'`);
+              const permissionModes: readonly string[] = provider.capabilities.permissionModes;
+              if (checkPermission && request.permissionMode !== undefined && !permissionModes.includes(request.permissionMode)) {
+                return fail(`Provider ${provider.id} does not support permission '${request.permissionMode}'. Allowed: ${permissionModes.join(", ")}.`);
+              }
+              if (checkReasoning && typeof request.reasoningLevel === "string") {
+                const machine = await resolveReviewMachine(bb.sdk, request);
+                let levels = provider.reasoningLevels?.map(level => level.id) ?? [];
+                if (machine.type === "existing") {
+                  const options = await bb.sdk.system.executionOptions({
+                    hostId: machine.hostId, projectId, providerId: provider.id, selectedModel: request.model,
+                  });
+                  const model = [...options.models, ...options.selectedOnlyModels].find(entry => entry.model === request.model);
+                  if (model?.reasoningDiscovery === "known" && model.supportedReasoningEfforts.length > 0) {
+                    levels = model.supportedReasoningEfforts.map(effort => effort.reasoningEffort);
+                  }
+                }
+                if (levels.length > 0 && !levels.includes(request.reasoningLevel)) {
+                  return fail(`Provider ${provider.id} does not support reasoning '${request.reasoningLevel}' for ${request.model}. Allowed: ${levels.join(", ")}.`);
+                }
+              }
+            }
+            // Do not overwrite another edit made while the catalogs loaded.
+            if (existing !== null && !isDeepStrictEqual(store.getRule(existing.id), existing)) {
+              return fail(`rule '${existing.name}' changed during the edit; rerun the command`);
+            }
+            parsed.request = request;
+          }
 
           const rule = saveRule(existing?.id ?? null, parsed);
           announce();

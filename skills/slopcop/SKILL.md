@@ -36,7 +36,7 @@ bb slopcop rules add \
   --model "claude-opus-5-5[1m]" \
   --paths "src/auth/**,src/payments/**" \
   --base main \
-  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
+  --prompt "Review the diff for auth and payment issues."
 ```
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
@@ -122,13 +122,12 @@ a waiting or active run and refuses a run that already reached a terminal status
 
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker
-rather than trusting the agent's transcript. The two bodies have different
-owners: the agent posts each finding as a line comment, because only it knows
-the path and line, while the no-findings summary is the thread's final message
-and SlopCop posts it. A live agent never runs `gh pr review`. Later runs on the same PR are
-given this rule's existing comments and told not to post the same finding
-again. GitHub line comments are a title plus two sentences, not the full
-review memo.
+rather than trusting the agent's transcript. The agent posts anchored findings
+inline. SlopCop posts one Conversation body from the agent's final message for
+findings outside the current PR diff, or for a clean review. A live agent never
+runs `gh pr review`. Later runs on the same PR receive the rule's prior inline
+comments to avoid duplicates. GitHub line comments are a title plus two
+sentences, not the full review memo.
 
 Live runs also open a GitHub Check named `SlopCop` on the head SHA
 (in progress from dispatch, before the thread is spawned, then completed
