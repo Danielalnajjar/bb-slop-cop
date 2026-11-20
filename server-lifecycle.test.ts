@@ -2104,6 +2104,51 @@ describe("automatic review ranges", () => {
     }
   });
 
+  it("asks again when a delayed head check is overtaken by a push with no PR-owned changes", async () => {
+    vi.useFakeTimers();
+    const firstHead = "c".repeat(40);
+    const emptyHead = "e".repeat(40);
+    let head = firstHead;
+    let detailReads = 0;
+    let armed = false;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    stubGh({
+      readyPullRequest: true, pollHead: () => head, pollDraft: () => false,
+      holdDetail: () => armed && ++detailReads === 2 ? released : undefined,
+    });
+    const { bb, harness } = reviewHost(({ head: reviewed }) => patchResult(reviewed === emptyHead ? "" : ownedPatch, true));
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness);
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        head = pushedHead;
+        armed = true;
+        const stale = harness.behavior.runCli(["dispatch", ruleName, "7"]);
+        await vi.advanceTimersByTimeAsync(0);
+        head = emptyHead;
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(store.listRuns().find(run => run.headSha === emptyHead)?.status).toBe("no_pr_changes");
+        release();
+        expect((await stale).exitCode).toBe(0);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "skipped", detail: `superseded by newer head ${emptyHead}`,
+        });
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("does not move a settling deferral back to a head a delayed check reported", async () => {
     vi.useFakeTimers();
     const middleHead = "e".repeat(40);

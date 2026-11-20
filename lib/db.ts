@@ -152,6 +152,10 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE runs DROP COLUMN was_draft`,
   `ALTER TABLE rules DROP COLUMN review_strategy`,
   `ALTER TABLE runs ADD COLUMN review_base_sha TEXT`,
+  // Inputs queued before review bases were recorded may narrow from a review
+  // that no longer counts as verified; queued runs resume as full reviews.
+  `UPDATE review_provisioning SET waiting_options = json_remove(waiting_options, '$.reviewInputs')
+   WHERE waiting_options IS NOT NULL`,
 ];
 
 type Row = Record<string, unknown>;

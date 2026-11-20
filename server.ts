@@ -428,7 +428,8 @@ export default async function plugin(bb: BbPluginApi) {
       const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
       const after = observe();
       if (after.key !== before.key) {
-        before = after;
+        // Once started, a recheck ends only on an answer the poll did not overtake.
+        before = { ...after, recheck: true };
         continue;
       }
       if (latest.headRefOid === headSha) break;
