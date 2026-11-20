@@ -412,16 +412,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // A poll snapshot can age while a gate, path or delta lookup runs. Recheck before
     // promoting a wait, consuming another head's deferral, or cancelling work on
-    // what might really be a newer SHA. A GitHub answer counts only if nothing
+    // what might really be a newer SHA, and whenever the poll last saw another
+    // head. A GitHub answer counts only if nothing
     // the poll writes (deferral, observed head, other heads' active runs) changed
     // while it was in flight; otherwise ask again.
     const observe = () => {
       const pending = deferred();
+      const seenHead = store.getSeen(rule.repo, prNumber)?.headSha ?? null;
       const others = store.listOlderActiveRuns(scope).map(run => run.id).sort();
       return {
-        recheck: pending?.waiting != null || (pending?.headSha != null && pending.headSha !== headSha) || others.length > 0,
-        key: JSON.stringify([pending?.headSha ?? null, pending?.waiting?.id ?? null,
-          store.getSeen(rule.repo, prNumber)?.headSha ?? null, others]),
+        recheck: pending?.waiting != null || (pending?.headSha != null && pending.headSha !== headSha) ||
+          (seenHead !== null && seenHead !== headSha) || others.length > 0,
+        key: JSON.stringify([pending?.headSha ?? null, pending?.waiting?.id ?? null, seenHead, others]),
       };
     };
     for (let before = observe(); before.recheck;) {
@@ -1135,8 +1137,12 @@ export default async function plugin(bb: BbPluginApi) {
             continue;
           }
         }
+        // A retarget while queued moves the merge base; the cached range no longer fits.
+        const baseRefOid = waiting.reviewInputs === undefined ? null : await waitForWork(() =>
+          gh.resolveMergeBase(run.repo, pullRequest.baseRefName, pullRequest.headRefOid));
         if (!store.isWaitingForProvisioning(run.id) || store.getRule(rule.id)?.updatedAt !== rule.updatedAt) continue;
-        await startReview(rule, pullRequest, run, waiting, values, false);
+        await startReview(rule, pullRequest, run, baseRefOid === waiting.reviewInputs?.baseRefOid
+          ? waiting : { ...waiting, reviewInputs: undefined }, values, false);
       } catch (error) {
         watcherSignal?.throwIfAborted();
         bb.log.warn(`could not resume review ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
