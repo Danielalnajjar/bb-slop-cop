@@ -43,7 +43,6 @@ interface RuleView {
   prompt: string;
   request: unknown;
   dedupe: string;
-  reviewStrategy: string;
   settleMinutes: number;
   visibility: string;
   dangerous: boolean;
@@ -458,7 +457,6 @@ function RuleEditor({
           prompt: extractPromptText(input),
           request: request as never,
           dedupe: (rule?.dedupe ?? "once_per_pr") as "once_per_pr",
-          reviewStrategy: (rule?.reviewStrategy ?? "update") as "update",
           settleMinutes: rule?.settleMinutes ?? 0,
           visibility: visibility as "visible" | "hidden",
         },

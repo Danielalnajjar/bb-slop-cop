@@ -54,7 +54,6 @@ import {
   conditionSchema,
   dedupeSchema,
   gateNameSchema,
-  reviewStrategySchema,
   settleMinutesSchema,
   ruleModeSchema,
   threadRequestSchema,
@@ -84,7 +83,6 @@ const ruleInputSchema = z.object({
   request: threadRequestSchema.nullable().default(null),
   dedupe: dedupeSchema.default("once_per_pr"),
   settleMinutes: settleMinutesSchema.default(0),
-  reviewStrategy: reviewStrategySchema.default("update"),
   visibility: visibilitySchema.default("visible"),
 });
 
@@ -112,7 +110,6 @@ const ruleOutputSchema = z.object({
   request: z.unknown().nullable(),
   dedupe: z.string(),
   settleMinutes: z.number(),
-  reviewStrategy: z.string(),
   visibility: z.string(),
   createdAt: z.number(),
   updatedAt: z.number(),
@@ -388,29 +385,13 @@ export default async function plugin(bb: BbPluginApi) {
     const deferred = () => store.getDeferredReview(rule.id, rule.repo, prNumber);
     const values = await readSettings();
     const dispatchOptions: ProvisionDispatchOptions = { trigger: "manual", ...options };
-    // A poll snapshot can age while a gate or path lookup runs. Recheck before
-    // promoting a wait or cancelling work on what might really be a newer SHA.
-    if (deferred()?.waiting || store.listOlderActiveRuns(scope).length > 0) {
-      const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
-      if (latest.headRefOid !== headSha) {
-        const detail = supersededBy(latest.headRefOid);
-        const pending = deferred();
-        if (pending?.waiting?.headSha === headSha) {
-          const skipped = { ...pending.waiting, status: "skipped" as const, detail };
-          store.replaceWaitingHead(pending.waiting, pending.trigger, latest.headRefOid, detail, Date.now());
-          announce();
-          await finalizeRun(skipped);
-          return { runId: skipped.id, threadId: null };
-        }
-        const skipped = recordSkip(rule, pullRequest, detail);
-        announce();
-        return { runId: skipped.id, threadId: null };
-      }
-    }
-    const previousVerifiedHead = store.latestVerifiedHead(rule.id, rule.repo, prNumber);
+    const prior = store.latestVerifiedReview(rule.id, rule.repo, prNumber);
+    const previousVerifiedHead = prior?.headSha ?? null;
     let baseRefOid: string | undefined;
     let delta: z.infer<typeof reviewDeltaContract.reviewDelta.output> = null;
-    if (trigger === "new_commits" && previousVerifiedHead !== null && previousVerifiedHead !== headSha &&
+    // Every trigger reviews only what changed since the last verified head. A
+    // forced dispatch re-reviews the head in full.
+    if (options.force !== true && prior !== null && prior.baseSha !== null && prior.headSha !== headSha &&
         rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
       const projectId = rule.request.projectId;
       try {
@@ -420,7 +401,8 @@ export default async function plugin(bb: BbPluginApi) {
         if (source?.path && source.hostId) {
           const timeout = AbortSignal.timeout(60_000);
           delta = await reviewHost.call("reviewDelta", {
-            repo: rule.repo, sourcePath: source.path, prior: previousVerifiedHead, base: baseRefOid, head: headSha,
+            repo: rule.repo, sourcePath: source.path, prior: prior.headSha, priorBase: prior.baseSha,
+            base: baseRefOid, head: headSha,
           }, { hostId: source.hostId, signal: watcherSignal ? AbortSignal.any([watcherSignal, timeout]) : timeout });
         }
       } catch {
@@ -428,7 +410,44 @@ export default async function plugin(bb: BbPluginApi) {
         watcherSignal?.throwIfAborted();
       }
     }
-    const reviewScope = delta === null ? "full" : "incremental";
+    // A poll snapshot can age while a gate, path or delta lookup runs. Recheck before
+    // promoting a wait, consuming another head's deferral, or cancelling work on
+    // what might really be a newer SHA, and whenever the poll last saw another
+    // head. A GitHub answer counts only if nothing
+    // the poll writes (deferral, observed head, other heads' active runs) changed
+    // while it was in flight; otherwise ask again.
+    const observe = () => {
+      const pending = deferred();
+      const seenHead = store.getSeen(rule.repo, prNumber)?.headSha ?? null;
+      const others = store.listOlderActiveRuns(scope).map(run => run.id).sort();
+      return {
+        recheck: pending?.waiting != null || (pending?.headSha != null && pending.headSha !== headSha) ||
+          (seenHead !== null && seenHead !== headSha) || others.length > 0,
+        key: JSON.stringify([pending?.headSha ?? null, pending?.waiting?.id ?? null, seenHead, others]),
+      };
+    };
+    for (let before = observe(); before.recheck;) {
+      const latest = await waitForWork(() => gh.getPullRequest(rule.repo, prNumber));
+      const after = observe();
+      if (after.key !== before.key) {
+        // Once started, a recheck ends only on an answer the poll did not overtake.
+        before = { ...after, recheck: true };
+        continue;
+      }
+      if (latest.headRefOid === headSha) break;
+      const detail = supersededBy(latest.headRefOid);
+      const pending = deferred();
+      if (pending?.waiting?.headSha === headSha) {
+        const skipped = { ...pending.waiting, status: "skipped" as const, detail };
+        store.replaceWaitingHead(pending.waiting, pending.trigger, latest.headRefOid, detail, Date.now());
+        announce();
+        await finalizeRun(skipped);
+        return { runId: skipped.id, threadId: null };
+      }
+      const skipped = recordSkip(rule, pullRequest, detail);
+      announce();
+      return { runId: skipped.id, threadId: null };
+    }
     const noChanges = delta?.patchBase64 === "";
     const pending = deferred();
     if (trigger !== "manual" && (
@@ -452,8 +471,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...newRun(rule, pullRequest, noChanges ? "no_pr_changes" : "dispatched", runId),
         detail,
       }, {
-        dedupe: rule.dedupe, scope: reviewScope, trigger,
-        isDraft: pullRequest.isDraft, force: options.force, promoted,
+        dedupe: rule.dedupe, force: options.force, promoted,
       });
       if (waiting !== null && !promoted) {
         store.discardDeferredReview(rule.id, rule.repo, prNumber,
@@ -603,6 +621,8 @@ export default async function plugin(bb: BbPluginApi) {
           gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, pullRequest.headRefOid),
         ),
       };
+      // A later review may narrow to this one only while its base stays an ancestor.
+      store.setReviewBase(runId, reviewPullRequest.baseRefOid);
       const environment = await waitForWork(() =>
         buildReviewEnvironment(bb.sdk, rule.request!, reviewPullRequest),
       );
@@ -619,7 +639,7 @@ export default async function plugin(bb: BbPluginApi) {
         incremental = { tree: delta.tree, patch, projectId };
       }
       const previousVerifiedHead = options.reviewInputs?.previousVerifiedHead ??
-        prepared?.previousVerifiedHead ?? store.latestVerifiedHead(rule.id, rule.repo, pullRequest.number);
+        prepared?.previousVerifiedHead ?? store.latestVerifiedReview(rule.id, rule.repo, pullRequest.number)?.headSha ?? null;
       const patch = incremental?.patch;
       const context: DispatchContext = {
         rule,
@@ -1046,9 +1066,8 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
 
-    const dedupeHead = rule.dedupe === "once_per_head_sha" ? headSha : null;
     if (trigger === "new_commits" && rule.settleMinutes > 0 &&
-        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, dedupeHead, rule.mode, headSha)) {
+        !store.hasSettlingDuplicate(ruleId, rule.repo, prNumber, headSha, rule.dedupe, rule.mode)) {
       let current = waiting;
       if (current === null || replaced || current.mode !== rule.mode) {
         const next = {
@@ -1118,8 +1137,12 @@ export default async function plugin(bb: BbPluginApi) {
             continue;
           }
         }
+        // A retarget while queued moves the merge base; the cached range no longer fits.
+        const baseRefOid = waiting.reviewInputs === undefined ? null : await waitForWork(() =>
+          gh.resolveMergeBase(run.repo, pullRequest.baseRefName, pullRequest.headRefOid));
         if (!store.isWaitingForProvisioning(run.id) || store.getRule(rule.id)?.updatedAt !== rule.updatedAt) continue;
-        await startReview(rule, pullRequest, run, waiting, values, false);
+        await startReview(rule, pullRequest, run, baseRefOid === waiting.reviewInputs?.baseRefOid
+          ? waiting : { ...waiting, reviewInputs: undefined }, values, false);
       } catch (error) {
         watcherSignal?.throwIfAborted();
         bb.log.warn(`could not resume review ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -2060,7 +2083,8 @@ export default async function plugin(bb: BbPluginApi) {
       });
       const run = store.getRun(dispatched.runId);
       const rejected = dispatched.threadId === null && run !== null &&
-        (run.status === "cancelled" || run.status === "failed" || run.status === "skipped");
+        (run.status === "cancelled" || run.status === "failed" || run.status === "skipped" ||
+          run.status === "no_pr_changes");
       return {
         ...dispatched,
         blockedReason: rejected ? run.detail ?? "review preparation was rejected" : null,
@@ -2301,8 +2325,6 @@ export default async function plugin(bb: BbPluginApi) {
             request: existing?.request ?? null,
             dedupe: flag("dedupe") ?? existing?.dedupe ?? "once_per_pr",
             settleMinutes: settleMinutes === undefined ? existing?.settleMinutes : Number(settleMinutes),
-            reviewStrategy:
-              flag("strategy") ?? existing?.reviewStrategy ?? "update",
             visibility: has("hidden")
               ? "hidden"
               : has("visible")
@@ -2561,11 +2583,16 @@ export default async function plugin(bb: BbPluginApi) {
           const skippedReason = run?.status === "skipped" ? run.detail : null;
           return ok(
             json
-              ? JSON.stringify({ ...dispatched, headSha: pullRequest.headRefOid, skippedReason }, null, 2)
+              ? JSON.stringify({
+                ...dispatched, headSha: pullRequest.headRefOid, skippedReason,
+                noChangesReason: run?.status === "no_pr_changes" ? run.detail : null,
+              }, null, 2)
               : skippedReason !== null
                 ? `Skipped ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${skippedReason}`
                 : run?.status === "waiting"
                   ? `Queued ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
+                : run?.status === "no_pr_changes"
+                  ? `Not reviewed ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
                 : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }

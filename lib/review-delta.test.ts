@@ -24,7 +24,7 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
     git("config", "user.email", "fixture@example.invalid");
     git("remote", "add", "origin", "https://github.com/acme/widgets.git");
     write("conflict.txt", "initial");
-    commit("initial");
+    const priorBase = commit("initial");
     git("switch", "-c", "feature");
     write("conflict.txt", "from the PR");
     write("prior.txt", "already reviewed");
@@ -46,12 +46,24 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
     const resolvedHead = commit("resolve merge");
     write("new.txt", "new PR-owned work");
     const mixedHead = commit("new PR work after the merge");
+    // A head reviewed against conflictBase, then retargeted to the older cleanBase:
+    // conflictBase's own commit joins the PR diff, which that review never covered.
+    git("switch", "-c", "retargeted", conflictBase);
+    write("stacked.txt", "reviewed on the newer base");
+    const stackedPrior = commit("stacked head reviewed against conflictBase");
+    write("stacked.txt", "pushed after the retarget");
+    const stackedHead = commit("push after the retarget");
+    const retarget = (base: string) => harness.experimental_call("reviewDelta", {
+      repo: "acme/widgets", sourcePath, prior: stackedPrior, priorBase: conflictBase, base, head: stackedHead,
+    });
+    expect(await retarget(conflictBase)).toMatchObject({ patchBase64: expect.any(String) });
+    expect(await retarget(cleanBase)).toBeNull();
     git("switch", "-c", "diverged", conflictBase);
     write("rewritten.txt", "new lineage");
     const divergentHead = commit("replace feature history");
 
     const delta = (base: string, head: string) => harness.experimental_call("reviewDelta", {
-      repo: "acme/widgets", sourcePath, prior, base, head,
+      repo: "acme/widgets", sourcePath, prior, priorBase, base, head,
     });
     const patch = (result: NonNullable<Awaited<ReturnType<typeof delta>>>) =>
       Buffer.from(result.patchBase64, "base64").toString("utf8");

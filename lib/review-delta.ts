@@ -8,6 +8,7 @@ export const reviewDeltaContract = defineRpcContract({
       repo: z.string(),
       sourcePath: z.string(),
       prior: reviewSha,
+      priorBase: reviewSha,
       base: reviewSha,
       head: reviewSha,
     }),

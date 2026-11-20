@@ -83,13 +83,16 @@ Three decisions do most of the work.
 Each review requests a fresh BB `git-worktree` at the captured PR head. Managed
 repository setup runs there, so input preparation requires **write access**.
 The agent checks HEAD and tracked-file cleanliness before reading its review
-inputs. For a new commit, SlopCop confirms that the latest GitHub-verified
-head is an ancestor, then merges the captured PR merge base into that older
-head to construct a comparison tree. The attached patch compares that tree
+inputs. Whatever starts a review (a new commit, readiness, or a dispatch),
+SlopCop confirms that the latest GitHub-verified head (a live review whose
+check succeeded) is an ancestor and that the merge base that review used is an
+ancestor of the current one, then merges the captured PR merge base into that
+older head to construct a comparison tree. The attached patch compares that tree
 with the new head. It excludes work imported from the base branch but includes
 any PR-owned changes or merge resolutions. An empty range completes the check
 without launching a reviewer. If SlopCop cannot compute the incremental patch,
-it reviews the full pinned PR diff. Readiness and manual reviews are always full.
+it reviews the full pinned PR diff, as it does when no earlier head was
+verified. A forced dispatch always reviews the full diff.
 A failed input check returns plain
 `Review incomplete: <reason>` and records a cancelled, unreviewed run, not a clean
 summary. Missing head objects fail provisioning rather than falling back to the
@@ -234,7 +237,7 @@ SlopCop fails a run with a clear error if that section no longer exists. `botGhP
 switches every GitHub call to a bot identity — see above.
 
 Rule flags: `--name --repo --project --provider --model --reasoning --permission
---prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger --settle-minutes
+--prompt --paths --base --label --skip-label --trust --dedupe --trigger --settle-minutes
 --live --shadow --disabled --hidden --visible`. Add `--json` to any command.
 
 `check` explains the rule match and reports whether the head is waiting to settle
@@ -286,11 +289,14 @@ start, so it completes its check as `cancelled` — and a cancelled run never
 dedupes away a later re-review of the same PR.
 
 Review admission is atomic in SQLite for polling, panel dispatch, and CLI
-dispatch. Under `once_per_head_sha`, an incremental or draft review does not
-block a full review of the same non-draft head. A new-commit event for a head
-with a GitHub-verified review is skipped. Under `once_per_pr`, a draft-time run
-still counts as the PR's one review. A duplicate attempt records a `skipped`
-run naming the winner; it never starts a second thread.
+dispatch. Under `once_per_head_sha`, each head is reviewed once: a review of a
+head in the same mode, or a GitHub-verified one in any mode, covers every later
+attempt on that head, whether it came from a new commit, readiness, or a
+dispatch, and whatever its scope or draft state. A draft-time dispatch is that
+head's review, so marking the PR ready on the same head does not review it
+again. Under `once_per_pr`, any run counts as the PR's one review. A duplicate
+attempt records a `skipped` run naming the winner; it never starts a second
+thread.
 `--force` (or panel dispatch with `force`) bypasses dedupe as well as the rule
 matcher. Cancelled and failed runs do not prevent a later attempt.
 

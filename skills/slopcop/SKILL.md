@@ -40,7 +40,7 @@ bb slopcop rules add \
 ```
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
---prompt --paths --base --label --skip-label --trust --dedupe --strategy
+--prompt --paths --base --label --skip-label --trust --dedupe
 --trigger --settle-minutes --live --shadow --disabled --hidden --visible`.
 
 `--hidden` spawns review threads with `visibility: "hidden"`: they stay out of
@@ -81,7 +81,9 @@ explicit dispatch do not wait. Polling never reviews a draft;
 gate, so trust and conditions still decide, while `--force` lifts all of them.
 A draft-time run counts for dedupe: under `once_per_pr` it is the PR's one
 review, and under `once_per_head_sha` marking the PR ready on the same head does
-not review it again.
+not review it again. Every review after a GitHub-verified head, including a
+dispatch or the readiness review, covers only the changes since that head.
+`--force` re-reviews a head in full, even one that was already reviewed.
 
 ## Run statuses
 
