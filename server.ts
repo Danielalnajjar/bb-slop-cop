@@ -15,7 +15,9 @@ import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment } from "./lib/review-input";
-import { reviewDeltaContract } from "./lib/review-delta";
+import {
+  formatIncrementalMiss, MAX_ATTACHED_PATCH_BYTES, reviewDeltaContract, type ReviewDelta,
+} from "./lib/review-delta";
 import {
   archiveReviewThread,
   reviewThreadOutcome,
@@ -388,26 +390,50 @@ export default async function plugin(bb: BbPluginApi) {
     const prior = store.latestVerifiedReview(rule.id, rule.repo, prNumber);
     const previousVerifiedHead = prior?.headSha ?? null;
     let baseRefOid: string | undefined;
-    let delta: z.infer<typeof reviewDeltaContract.reviewDelta.output> = null;
-    // Every trigger reviews only what changed since the last verified head. A
-    // forced dispatch re-reviews the head in full.
-    if (options.force !== true && prior !== null && prior.baseSha !== null && prior.headSha !== headSha &&
-        rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
+    let delta: ReviewDelta | null = null;
+    // Every trigger reviews only what changed since the last verified head.
+    // Anything else after a verified head is recorded with its reason.
+    let scopeNote: string | null = null;
+    if (prior !== null && rule.request !== null && isTrustedAuthor(pullRequest.authorAssociation, "write_access")) {
       const projectId = rule.request.projectId;
-      try {
-        baseRefOid = await waitForWork(() => gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, headSha));
-        const project = await waitForWork(() => bb.sdk.projects.get({ projectId }));
-        const source = project.sources.find(source => source.isDefault);
-        if (source?.path && source.hostId) {
-          const timeout = AbortSignal.timeout(60_000);
-          delta = await reviewHost.call("reviewDelta", {
-            repo: rule.repo, sourcePath: source.path, prior: prior.headSha, priorBase: prior.baseSha,
-            base: baseRefOid, head: headSha,
-          }, { hostId: source.hostId, signal: watcherSignal ? AbortSignal.any([watcherSignal, timeout]) : timeout });
-        }
-      } catch {
+      if (options.force === true) {
+        scopeNote = formatIncrementalMiss("forced", "a forced dispatch reviews the full diff");
+      } else if (prior.headSha === headSha) {
+        // Dedupe skips the head that review already verified.
+      } else if (prior.baseSha === null) {
+        scopeNote = formatIncrementalMiss("missing_base", `verified head ${prior.headSha} has no recorded merge base`);
+      } else {
         // An unavailable comparison cannot exclude any part of the full PR diff.
-        watcherSignal?.throwIfAborted();
+        try {
+          baseRefOid = await waitForWork(() => gh.resolveMergeBase(rule.repo, pullRequest.baseRefName, headSha));
+        } catch (error) {
+          watcherSignal?.throwIfAborted();
+          scopeNote = formatIncrementalMiss("missing_base", `could not resolve the PR merge base: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (baseRefOid !== undefined) {
+          try {
+            const project = await waitForWork(() => bb.sdk.projects.get({ projectId }));
+            const source = project.sources.find(source => source.isDefault);
+            if (!source?.path || !source.hostId) {
+              scopeNote = formatIncrementalMiss("host_unavailable", "project has no default source on a host");
+            } else {
+              const timeout = AbortSignal.timeout(60_000);
+              const result = await reviewHost.call("reviewDelta", {
+                repo: rule.repo, sourcePath: source.path, prior: prior.headSha, priorBase: prior.baseSha,
+                base: baseRefOid, head: headSha,
+              }, { hostId: source.hostId, signal: watcherSignal ? AbortSignal.any([watcherSignal, timeout]) : timeout });
+              if (result.kind === "miss") scopeNote = formatIncrementalMiss(result.reason, result.detail);
+              else delta = result;
+            }
+          } catch (error) {
+            watcherSignal?.throwIfAborted();
+            scopeNote = formatIncrementalMiss("host_unavailable", error instanceof Error ? error.message : String(error));
+          }
+        }
+        if (delta?.kind === "oversize") {
+          scopeNote = formatIncrementalMiss("oversize",
+            `incremental diff exceeds ${MAX_ATTACHED_PATCH_BYTES} bytes; the reviewer reads it from its worktree`);
+        }
       }
     }
     // A poll snapshot can age while a gate, path or delta lookup runs. Recheck before
@@ -448,7 +474,7 @@ export default async function plugin(bb: BbPluginApi) {
       announce();
       return { runId: skipped.id, threadId: null };
     }
-    const noChanges = delta?.patchBase64 === "";
+    const noChanges = delta?.kind === "patch" && delta.patchBase64 === "";
     const pending = deferred();
     if (trigger !== "manual" && (
       pending?.trigger !== trigger ||
@@ -464,7 +490,7 @@ export default async function plugin(bb: BbPluginApi) {
     // perfectly ordinary review and the override is invisible in hindsight.
     const forcedReason = options.forcedReason ?? null;
     const detail = noChanges
-      ? `${delta?.baseMerged ? "Base merge with no" : "No"} PR-owned change since reviewed head ${previousVerifiedHead}.`
+      ? `${delta?.kind === "patch" && delta.baseMerged ? "Base merge with no" : "No"} PR-owned change since reviewed head ${previousVerifiedHead}.`
       : forcedReason === null ? null : `forced past the gate — ${forcedReason}`;
     const reservation = store.atomic(() => {
       const admitted = store.admitRun({
@@ -473,6 +499,7 @@ export default async function plugin(bb: BbPluginApi) {
       }, {
         dedupe: rule.dedupe, force: options.force, promoted,
       });
+      if (admitted.status !== "skipped") store.setScopeNote(runId, scopeNote);
       if (waiting !== null && !promoted) {
         store.discardDeferredReview(rule.id, rule.repo, prNumber,
           waiting.headSha !== headSha ? supersededBy(headSha) : "rule mode changed while waiting");
@@ -494,6 +521,9 @@ export default async function plugin(bb: BbPluginApi) {
     });
     for (const run of replaced) inFlight.delete(run.id);
     announce();
+    if (scopeNote !== null && reservation.status !== "skipped") {
+      bb.log.info(`run ${runId}: ${rule.name} for ${rule.repo}#${prNumber} at ${headSha} review scope ${scopeNote}`);
+    }
     if (reservation.status === "skipped") {
       if (promoted) replaced.push(reservation);
       await Promise.all(replaced.map(run => finalizeRun(run)));
@@ -518,7 +548,7 @@ export default async function plugin(bb: BbPluginApi) {
     promoted: boolean,
     prepared?: {
       baseRefOid: string | undefined;
-      delta: z.infer<typeof reviewDeltaContract.reviewDelta.output>;
+      delta: ReviewDelta | null;
       previousVerifiedHead: string | null;
     },
   ): Promise<{ runId: string; threadId: string | null }> {
@@ -628,7 +658,9 @@ export default async function plugin(bb: BbPluginApi) {
       );
       const delta = prepared?.delta;
       let incremental = options.reviewInputs?.incremental;
-      if (delta != null) {
+      if (delta?.kind === "oversize") {
+        incremental = { tree: delta.tree, projectId: rule.request.projectId };
+      } else if (delta != null) {
         const projectId = rule.request.projectId;
         const patch = await waitForWork(() =>
           bb.sdk.projects.attachments.upload({
@@ -645,7 +677,7 @@ export default async function plugin(bb: BbPluginApi) {
         rule,
         pullRequest: reviewPullRequest,
         trigger,
-        incremental: incremental && { tree: incremental.tree, patchName: incremental.patch.name },
+        incremental: incremental && { tree: incremental.tree, patchName: incremental.patch?.name ?? null },
         previousVerifiedHead,
         runId,
         ghCommand: botGhPath,
@@ -757,6 +789,7 @@ export default async function plugin(bb: BbPluginApi) {
       status,
       mode: rule.mode,
       detail: null,
+      scopeNote: null,
       threadId: null,
       commentCount: 0,
       startedAt: Date.now(),
@@ -1141,8 +1174,14 @@ export default async function plugin(bb: BbPluginApi) {
         const baseRefOid = waiting.reviewInputs === undefined ? null : await waitForWork(() =>
           gh.resolveMergeBase(run.repo, pullRequest.baseRefName, pullRequest.headRefOid));
         if (!store.isWaitingForProvisioning(run.id) || store.getRule(rule.id)?.updatedAt !== rule.updatedAt) continue;
-        await startReview(rule, pullRequest, run, baseRefOid === waiting.reviewInputs?.baseRefOid
-          ? waiting : { ...waiting, reviewInputs: undefined }, values, false);
+        const baseMoved = baseRefOid !== waiting.reviewInputs?.baseRefOid;
+        if (baseMoved && waiting.reviewInputs?.incremental) {
+          const scopeNote = formatIncrementalMiss("base_moved",
+            `PR merge base moved from ${waiting.reviewInputs.baseRefOid} to ${baseRefOid} while waiting for provisioning`);
+          store.setScopeNote(run.id, scopeNote);
+          bb.log.info(`run ${run.id}: ${rule.name} for ${run.repo}#${run.prNumber} at ${run.headSha} review scope ${scopeNote}`);
+        }
+        await startReview(rule, pullRequest, run, baseMoved ? { ...waiting, reviewInputs: undefined } : waiting, values, false);
       } catch (error) {
         watcherSignal?.throwIfAborted();
         bb.log.warn(`could not resume review ${run.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -2454,7 +2493,8 @@ export default async function plugin(bb: BbPluginApi) {
                   (run.commentCount > 0
                     ? `  (${run.commentCount} comment(s))`
                     : "") +
-                  (run.detail === null ? "" : `\n    ${run.detail}`),
+                  (run.detail === null ? "" : `\n    ${run.detail}`) +
+                  (run.scopeNote === null ? "" : `\n    scope: ${run.scopeNote}`),
               )
               .join("\n"),
           );
@@ -2509,7 +2549,8 @@ export default async function plugin(bb: BbPluginApi) {
           const header =
             `${run.ruleName} — ${run.repo}#${run.prNumber} ${run.prTitle}\n` +
             `status: ${run.status}${run.mode === "shadow" ? " (shadow — nothing was posted)" : ""}` +
-            (run.detail === null ? "" : `\ndetail: ${run.detail}`);
+            (run.detail === null ? "" : `\ndetail: ${run.detail}`) +
+            (run.scopeNote === null ? "" : `\nscope: ${run.scopeNote}`);
           const bodies = comments
             .map(
               (comment) =>

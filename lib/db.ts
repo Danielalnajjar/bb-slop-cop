@@ -156,6 +156,7 @@ export const MIGRATIONS: string[] = [
   // that no longer counts as verified; queued runs resume as full reviews.
   `UPDATE review_provisioning SET waiting_options = json_remove(waiting_options, '$.reviewInputs')
    WHERE waiting_options IS NOT NULL`,
+  `ALTER TABLE runs ADD COLUMN scope_note TEXT`,
 ];
 
 type Row = Record<string, unknown>;
@@ -176,7 +177,8 @@ export interface ProvisionDispatchOptions {
     previousVerifiedHead: string | null;
     incremental?: {
       tree: string;
-      patch: Awaited<ReturnType<BbPluginApi["sdk"]["projects"]["attachments"]["upload"]>>;
+      /** Absent when the patch was too large to attach; the reviewer reads it. */
+      patch?: Awaited<ReturnType<BbPluginApi["sdk"]["projects"]["attachments"]["upload"]>>;
       projectId: string;
     };
   };
@@ -245,6 +247,7 @@ export function rowToRun(row: Row): Run {
     status: text(row, "status", "dispatched") as RunStatus,
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     detail: typeof row.detail === "string" ? row.detail : null,
+    scopeNote: typeof row.scope_note === "string" ? row.scope_note : null,
     threadId: typeof row.thread_id === "string" ? row.thread_id : null,
     commentCount: num(row, "comment_count"),
     startedAt: num(row, "started_at"),
@@ -702,6 +705,10 @@ export function createStore(db: Database) {
 
     setReviewBase(runId: string, baseSha: string): void {
       db.prepare(`UPDATE runs SET review_base_sha = ? WHERE id = ?`).run(baseSha, runId);
+    },
+
+    setScopeNote(runId: string, note: string | null): void {
+      db.prepare(`UPDATE runs SET scope_note = ? WHERE id = ?`).run(note, runId);
     },
 
     listComments(runId: string): RunComment[] {

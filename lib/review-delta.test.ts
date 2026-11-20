@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import { expect, it } from "vitest";
 import reviewHost from "../host";
+import { REVIEW_GIT_OPTIONS } from "./review-delta";
 
 it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in a real repository", async () => {
   const sourcePath = mkdtempSync(join(tmpdir(), "slopcop-delta-"));
@@ -56,8 +57,11 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
     const retarget = (base: string) => harness.experimental_call("reviewDelta", {
       repo: "acme/widgets", sourcePath, prior: stackedPrior, priorBase: conflictBase, base, head: stackedHead,
     });
-    expect(await retarget(conflictBase)).toMatchObject({ patchBase64: expect.any(String) });
-    expect(await retarget(cleanBase)).toBeNull();
+    expect(await retarget(conflictBase)).toMatchObject({ kind: "patch", patchBase64: expect.any(String) });
+    expect(await retarget(cleanBase)).toEqual({
+      kind: "miss", reason: "history_changed",
+      detail: `reviewed base ${conflictBase} is not an ancestor of PR base ${cleanBase}`,
+    });
     git("switch", "-c", "diverged", conflictBase);
     write("rewritten.txt", "new lineage");
     const divergentHead = commit("replace feature history");
@@ -65,26 +69,112 @@ it("computes PR-owned patches for clean, resolved, mixed and divergent pushes in
     const delta = (base: string, head: string) => harness.experimental_call("reviewDelta", {
       repo: "acme/widgets", sourcePath, prior, priorBase, base, head,
     });
-    const patch = (result: NonNullable<Awaited<ReturnType<typeof delta>>>) =>
-      Buffer.from(result.patchBase64, "base64").toString("utf8");
+    const patch = (result: Awaited<ReturnType<typeof delta>>) => {
+      if (result.kind !== "patch") throw new Error(`expected a patch, got ${result.kind}`);
+      return Buffer.from(result.patchBase64, "base64").toString("utf8");
+    };
     expect(git("diff", "--name-only", prior + ".." + cleanHead)).toBe("base-only.txt");
-    expect(await delta(cleanBase, cleanHead)).toMatchObject({ patchBase64: "", baseMerged: true });
+    expect(await delta(cleanBase, cleanHead)).toMatchObject({ kind: "patch", patchBase64: "", baseMerged: true });
 
-    const resolved = patch((await delta(conflictBase, resolvedHead))!);
+    const resolved = patch(await delta(conflictBase, resolvedHead));
     expect(resolved.match(/^diff --git .*$/gm)).toEqual(["diff --git a/conflict.txt b/conflict.txt"]);
     expect(resolved).toContain("+the resolution");
-    const mixed = patch((await delta(conflictBase, mixedHead))!);
+    const mixed = patch(await delta(conflictBase, mixedHead));
     expect(mixed.match(/^diff --git .*$/gm)).toEqual([
       "diff --git a/conflict.txt b/conflict.txt", "diff --git a/new.txt b/new.txt",
     ]);
     expect(mixed).toContain("+the resolution");
     expect(mixed).toContain("+new PR-owned work");
-    expect(await delta(conflictBase, divergentHead)).toBeNull();
+    expect(await delta(conflictBase, divergentHead)).toEqual({
+      kind: "miss", reason: "history_changed", detail: `reviewed head ${prior} is not an ancestor of ${divergentHead}`,
+    });
     expect(git("diff", "--name-only", conflictBase + "..." + divergentHead)).toBe("rewritten.txt");
     expect(git("rev-parse", "HEAD")).toBe(divergentHead);
     expect(git("status", "--porcelain")).toBe("");
   } finally {
     await harness.experimental_dispose();
     rmSync(sourcePath, { recursive: true });
+  }
+});
+
+it("returns an oversize patch's tree that another clone reproduces, and names other misses", async () => {
+  const sourcePath = mkdtempSync(join(tmpdir(), "slopcop-delta-"));
+  const clonePath = mkdtempSync(join(tmpdir(), "slopcop-clone-"));
+  const harness = experimental_createHostEntryHarness(reviewHost);
+  const gitIn = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const git = (...args: string[]) => gitIn(sourcePath, ...args);
+  const write = (file: string, text: string) => writeFileSync(join(sourcePath, file), text + "\n");
+  const commit = (message: string) => {
+    git("add", "--all");
+    git("commit", "-m", message);
+    return git("rev-parse", "HEAD");
+  };
+  try {
+    git("init", "--initial-branch=master");
+    git("config", "user.name", "Review Fixture");
+    git("config", "user.email", "fixture@example.invalid");
+    git("remote", "add", "origin", "https://github.com/acme/widgets.git");
+    write("conflict.txt", "initial");
+    const priorBase = commit("initial");
+    git("switch", "-c", "feature");
+    write("conflict.txt", "from the PR");
+    const prior = commit("prior reviewed head");
+    git("switch", "master");
+    write("conflict.txt", "from master");
+    const base = commit("master edits the same line");
+    git("switch", "feature");
+    expect(() => git("merge", "--no-ff", "--no-edit", base)).toThrow();
+    write("conflict.txt", "the resolution");
+    commit("resolve merge");
+    write("large.txt", Array.from({ length: 60_000 }, (_, index) => `generated line ${index} ${"x".repeat(32)}`).join("\n"));
+    const head = commit("large push");
+    const input = { repo: "acme/widgets", sourcePath, prior, priorBase, base, head };
+
+    const result = await harness.experimental_call("reviewDelta", input);
+    expect(result).toEqual({ kind: "oversize", tree: expect.stringMatching(/^[a-f0-9]{40}$/) });
+    const { tree } = result as { tree: string };
+
+    // The reviewer's checkout: no unreferenced merge tree, and a different conflict style.
+    execFileSync("git", ["clone", "--quiet", "--no-local", "--no-checkout", sourcePath, clonePath]);
+    gitIn(clonePath, "config", "merge.conflictStyle", "zdiff3");
+    gitIn(clonePath, "checkout", "--quiet", "--detach", head);
+    expect(() => gitIn(clonePath, ...REVIEW_GIT_OPTIONS, "cat-file", "-e", `${tree}^{tree}`)).toThrow();
+    const mergeTree = (options: readonly string[]) => {
+      const merged = spawnSync("git", ["-C", clonePath, ...options, "merge-tree", "--write-tree", "--no-messages", prior, base], {
+        encoding: "utf8",
+      });
+      expect(merged.status).toBe(1);
+      return merged.stdout.split("\n", 1)[0];
+    };
+    expect(mergeTree([])).not.toBe(tree);
+    expect(mergeTree(REVIEW_GIT_OPTIONS)).toBe(tree);
+    const diff = gitIn(clonePath, ...REVIEW_GIT_OPTIONS, "diff", "--no-ext-diff", "--no-textconv",
+      "--ignore-submodules=none", tree, head, "--");
+    expect(diff.length).toBeGreaterThan(2 * 1024 * 1024);
+    expect(diff.match(/^diff --git .*$/gm)).toEqual(["diff --git a/conflict.txt b/conflict.txt", "diff --git a/large.txt b/large.txt"]);
+    expect(diff).toContain("+the resolution");
+
+    git("switch", "--quiet", "--orphan", "unrelated");
+    write("unrelated.txt", "no shared history");
+    const unrelated = commit("unrelated root");
+    expect(await harness.experimental_call("reviewDelta", { ...input, head: unrelated })).toEqual({
+      kind: "miss", reason: "history_changed", detail: `reviewed head ${prior} is not an ancestor of ${unrelated}`,
+    });
+    const rewritten = "f".repeat(40);
+    expect(await harness.experimental_call("reviewDelta", { ...input, prior: rewritten })).toEqual({
+      kind: "miss", reason: "history_changed", detail: `reviewed head ${rewritten} is not an ancestor of ${head}`,
+    });
+    expect(await harness.experimental_call("reviewDelta", { ...input, repo: "acme/other" })).toEqual({
+      kind: "miss", reason: "git_error", detail: "project source origin does not match review repository",
+    });
+    expect(await harness.experimental_call("reviewDelta", { ...input, sourcePath: join(sourcePath, "missing") })).toEqual({
+      kind: "miss", reason: "git_error", detail: "git remote failed",
+    });
+  } finally {
+    await harness.experimental_dispose();
+    rmSync(sourcePath, { recursive: true });
+    rmSync(clonePath, { recursive: true, force: true });
   }
 });
