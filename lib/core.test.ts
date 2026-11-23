@@ -861,6 +861,32 @@ describe("the summary SlopCop posts", () => {
     expect(post(marked("inline"))).toBeNull();
   });
 
+  it("flags an off-diff heading anywhere before the marker and normalizes the layout", () => {
+    const fields = { rule: "security-sweep", run: "run_1", sha: "a1b2c3d", kind: "summary" } as const;
+    const prefaced = decorateBody(
+      "Wrapper text.\n\n### Findings outside the PR diff\n\n- `src/a.ts:1` — **Fix it.**\n\n**Follow-up notes**\n\n- A note.",
+      "summary",
+      fields,
+    );
+    expect(post(prefaced)).toEqual({
+      body: decorateBody(
+        "### Findings outside the PR diff\n\n- `src/a.ts:1` — **Fix it.**\n\n**Follow-up notes**\n\n- A note.\n\nWrapper text.",
+        "summary",
+        fields,
+      ),
+      hasOffDiffFindings: true,
+    });
+  });
+
+  it("does not flag a heading that only appears after the marker or mid-line", () => {
+    expect(post(`${marked("summary")}\n\n### Findings outside the PR diff`)?.hasOffDiffFindings).toBe(false);
+    expect(
+      post(decorateBody("See ### Findings outside the PR diff for details.", "summary", {
+        rule: "security-sweep", run: "run_1", sha: "a1b2c3d", kind: "summary",
+      }))?.hasOffDiffFindings,
+    ).toBe(false);
+  });
+
   it("refuses a body with no marker at all", () => {
     expect(post("🚨 **SLOP COP** 🚨 · `r`\n\nclean, but no marker")).toBeNull();
   });

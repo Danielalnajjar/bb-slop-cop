@@ -6,6 +6,7 @@
 // instead. Both paths converge on the same status vocabulary.
 import {
   attributeBody,
+  buildMarker,
   hasVisibleHeader,
   headerRuleName,
   markerBelongsToRule,
@@ -223,15 +224,45 @@ export function summaryToPost(options: {
   if (marker === null) return null;
   if (!markerBelongsToRule(marker, options.rule)) return null;
   if (marker.kind !== "summary") return null;
-  const firstContentLine = body.split(/\r?\n/).slice(1).find(line => line.trim() !== "");
+  const canonicalMarker = {
+    rule: options.rule,
+    run: options.runId,
+    sha: options.sha,
+    kind: "summary" as const,
+  };
+  const stamped = restampMarker(body, canonicalMarker);
+  const markerText = buildMarker(canonicalMarker);
+  const markerIndex = stamped.indexOf(markerText);
+  if (markerIndex === -1) return { body: stamped, hasOffDiffFindings: false };
+  // A must-fix off-diff summary must never be lost to layout drift: the
+  // heading counts as its own line anywhere before the marker, whatever
+  // wrapper text the model put above it.
+  const lines = stamped.slice(0, markerIndex).split(/\r?\n/);
+  const headingIndex = lines.findIndex(line => line.trim() === OFF_DIFF_FINDINGS_HEADING);
+  if (headingIndex === -1) return { body: stamped, hasOffDiffFindings: false };
+  // Normalize to one layout every consumer can parse: branding header,
+  // heading with its findings and notes, any preface moved below them (kept,
+  // not dropped, so no model-written text is lost), then the marker.
+  const headerIndex = lines
+    .slice(0, headingIndex)
+    .findIndex(line => hasVisibleHeader(line));
+  const preface = lines
+    .filter((_, index) => index < headingIndex && index !== headerIndex)
+    .join("\n")
+    .trim();
+  const rest = [OFF_DIFF_FINDINGS_HEADING, ...lines.slice(headingIndex + 1)]
+    .join("\n")
+    .trim();
+  const trailing = stamped.slice(markerIndex + markerText.length).trim();
+  const sections = [
+    ...(headerIndex === -1 ? [] : [lines[headerIndex]!.trim()]),
+    rest,
+    ...(preface === "" ? [] : [preface]),
+    ...(trailing === "" ? [] : [trailing]),
+  ];
   return {
-    body: restampMarker(body, {
-      rule: options.rule,
-      run: options.runId,
-      sha: options.sha,
-      kind: "summary",
-    }),
-    hasOffDiffFindings: firstContentLine?.trim() === OFF_DIFF_FINDINGS_HEADING,
+    body: `${sections.join("\n\n")}\n\n${markerText}`,
+    hasOffDiffFindings: true,
   };
 }
 

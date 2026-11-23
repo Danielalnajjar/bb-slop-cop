@@ -248,6 +248,61 @@ it.each([true, false])("finishes a review with a body for GitHub-rejected anchor
   }
 });
 
+it.each([true, false])("posts a prefaced off-diff summary in normalized layout (has inline: %s)", async (hasInline) => {
+  const gh = createGhClient("fake-slopcop-gh");
+  const inlineEndpoint = "repos/acme/widgets/pulls/42/comments";
+  const inlineBody = decorateBody("**Fix the changed line.**", "inline", {
+    rule: "restraint-review", run: RUN_ID, sha: "abc123", kind: "inline",
+  });
+  if (hasInline) {
+    await gh.request("POST", inlineEndpoint, {
+      commit_id: "abc123", path: "src/changed.ts", line: 10, side: "RIGHT", body: inlineBody,
+    });
+  }
+
+  const markerFields = { rule: "restraint-review", run: RUN_ID, sha: "abc123", kind: "summary" } as const;
+  const body = decorateBody([
+    "Review complete.",
+    "",
+    "### Findings outside the PR diff",
+    "",
+    "- `src/reverted.ts:32` — **Restore the access restriction.**",
+    "",
+    "**Follow-up notes**",
+    "",
+    "- `src/changed.ts:85`: The label can be shorter.",
+  ].join("\n"), "summary", markerFields);
+  // The heading becomes the first content line after the header; the preface
+  // moves below the notes so no model-written text is lost.
+  const normalized = decorateBody([
+    "### Findings outside the PR diff",
+    "",
+    "- `src/reverted.ts:32` — **Restore the access restriction.**",
+    "",
+    "**Follow-up notes**",
+    "",
+    "- `src/changed.ts:85`: The label can be shorter.",
+    "",
+    "Review complete.",
+  ].join("\n"), "summary", markerFields);
+  const staleMarker = body.replace(`run=${RUN_ID} sha=abc123`, "run=run_typo sha=wrong");
+  const { store, harness } = await finishThreadWith(staleMarker);
+  try {
+    expect(writes.filter(write => write.endpoint.includes("/issues/42/comments"))).toEqual([
+      { endpoint: "repos/acme/widgets/issues/42/comments", body: { body: normalized } },
+    ]);
+    expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: hasInline ? 2 : 1 });
+    expect(store.listComments(RUN_ID)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "summary", attribution: "marker", bodyExcerpt: expect.stringMatching(/Restore the access restriction[\s\S]*Follow-up notes/) }),
+    ]));
+    expect(writes.find(write => write.endpoint.includes("check-runs"))?.body).toMatchObject({
+      conclusion: "success",
+    });
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
 it.each(["live", "shadow"] as const)("keeps an incomplete %s input check unreviewed even if it contains a summary marker", async (mode) => {
   const { store, harness } = await finishThreadWith(`Review incomplete: tracked files differ from captured head.\n${summaryBody()}`, mode);
   try {
