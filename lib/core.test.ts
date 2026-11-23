@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   attributeBody,
+  buildHeader,
   buildMarker,
   decorateBody,
   hasVisibleHeader,
@@ -879,12 +880,40 @@ describe("the summary SlopCop posts", () => {
   });
 
   it("does not flag a heading that only appears after the marker or mid-line", () => {
+    const fields = { rule: "security-sweep", run: "run_1", sha: "a1b2c3d", kind: "summary" } as const;
     expect(post(`${marked("summary")}\n\n### Findings outside the PR diff`)?.hasOffDiffFindings).toBe(false);
     expect(
-      post(decorateBody("See ### Findings outside the PR diff for details.", "summary", {
-        rule: "security-sweep", run: "run_1", sha: "a1b2c3d", kind: "summary",
-      }))?.hasOffDiffFindings,
+      post(decorateBody("See ### Findings outside the PR diff for details.", "summary", fields))?.hasOffDiffFindings,
     ).toBe(false);
+    // Quoted in a fence, or sharing the marker's line: not the section itself.
+    expect(
+      post(decorateBody("Example:\n\n```\n### Findings outside the PR diff\n```", "summary", fields))?.hasOffDiffFindings,
+    ).toBe(false);
+    expect(
+      post(decorateBody("a finding", "summary", fields).replace("\n\n<!--", " ### Findings outside the PR diff <!--"))?.hasOffDiffFindings,
+    ).toBe(false);
+  });
+
+  it("keeps the stamped marker first and a standalone banner on a normalized body", () => {
+    const fields = { rule: "security-sweep", run: "run_1", sha: "a1b2c3d", kind: "summary" } as const;
+    const older = buildMarker({ rule: "security-sweep", run: "run_old", sha: "0000000", kind: "summary" });
+    const body = [
+      "Example banner: 🚨 **SLOP COP** 🚨",
+      "",
+      "### Findings outside the PR diff",
+      "",
+      "- `src/a.ts:1` — **Fix it.**",
+      "",
+      buildMarker(fields),
+      "",
+      older,
+    ].join("\n");
+    const result = post(body);
+    expect(result?.hasOffDiffFindings).toBe(true);
+    expect(parseMarker(result!.body)).toEqual(fields);
+    expect(result!.body.indexOf(buildMarker(fields))).toBeLessThan(result!.body.indexOf(older));
+    expect(result!.body.split("\n")[0]).toBe(buildHeader("summary", "security-sweep"));
+    expect(result!.body).toContain("Example banner:");
   });
 
   it("refuses a body with no marker at all", () => {
