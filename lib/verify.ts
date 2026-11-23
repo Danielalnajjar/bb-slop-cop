@@ -6,6 +6,8 @@
 // instead. Both paths converge on the same status vocabulary.
 import {
   attributeBody,
+  buildHeader,
+  buildMarker,
   hasVisibleHeader,
   headerRuleName,
   markerBelongsToRule,
@@ -223,15 +225,69 @@ export function summaryToPost(options: {
   if (marker === null) return null;
   if (!markerBelongsToRule(marker, options.rule)) return null;
   if (marker.kind !== "summary") return null;
-  const firstContentLine = body.split(/\r?\n/).slice(1).find(line => line.trim() !== "");
+  const canonicalMarker = {
+    rule: options.rule,
+    run: options.runId,
+    sha: options.sha,
+    kind: "summary" as const,
+  };
+  const stamped = restampMarker(body, canonicalMarker);
+  const markerText = buildMarker(canonicalMarker);
+  const lines = stamped.split(/\r?\n/);
+  const markerLineIndex = lines.findIndex(line => line.includes(markerText));
+  if (markerLineIndex === -1) return { body: stamped, hasOffDiffFindings: false };
+  // A must-fix off-diff summary must never be lost to layout drift: the
+  // heading counts as its own complete line anywhere before the marker's
+  // line, whatever wrapper text the model put above it. A heading quoted
+  // inside a fenced block is an example, not the section itself.
+  let headingIndex = -1;
+  let fenceChar: string | null = null;
+  for (let index = 0; index < markerLineIndex; index += 1) {
+    const trimmed = lines[index]!.trim();
+    const fence = /^(`{3,}|~{3,})/.exec(trimmed)?.[1]?.[0];
+    if (fence !== undefined) {
+      if (fenceChar === null) fenceChar = fence;
+      else if (fenceChar === fence) fenceChar = null;
+      continue;
+    }
+    if (fenceChar === null && trimmed === OFF_DIFF_FINDINGS_HEADING) {
+      headingIndex = index;
+      break;
+    }
+  }
+  if (headingIndex === -1) return { body: stamped, hasOffDiffFindings: false };
+  // Normalize to one layout every consumer can parse: branding header,
+  // heading with its findings and notes, any preface moved below them (kept,
+  // not dropped, so no model-written text is lost), then the marker.
+  const headerIndex = lines
+    .slice(0, headingIndex)
+    .findIndex(line => line.trim().startsWith("🚨") && hasVisibleHeader(line));
+  const header = headerIndex === -1
+    ? buildHeader("summary", options.rule)
+    : lines[headerIndex]!.trim();
+  const preface = lines
+    .filter((_, index) => index < headingIndex && index !== headerIndex)
+    .join("\n")
+    .trim();
+  const markerLine = lines[markerLineIndex]!;
+  const markerStart = markerLine.indexOf(markerText);
+  const beforeMarker = markerLine.slice(0, markerStart).trim();
+  const rest = [
+    OFF_DIFF_FINDINGS_HEADING,
+    ...lines.slice(headingIndex + 1, markerLineIndex),
+    ...(beforeMarker === "" ? [] : [beforeMarker]),
+  ].join("\n").trim();
+  const sections = [header, rest, ...(preface === "" ? [] : [preface])];
+  // Anything after the marker stays after it: attribution reads the first
+  // marker in a body, so moving a copied older marker ahead of the stamped
+  // one would hand this summary to that older run.
+  const trailing = [
+    markerLine.slice(markerStart + markerText.length),
+    ...lines.slice(markerLineIndex + 1),
+  ].join("\n").trim();
   return {
-    body: restampMarker(body, {
-      rule: options.rule,
-      run: options.runId,
-      sha: options.sha,
-      kind: "summary",
-    }),
-    hasOffDiffFindings: firstContentLine?.trim() === OFF_DIFF_FINDINGS_HEADING,
+    body: `${sections.join("\n\n")}\n\n${markerText}${trailing === "" ? "" : `\n\n${trailing}`}`,
+    hasOffDiffFindings: true,
   };
 }
 
