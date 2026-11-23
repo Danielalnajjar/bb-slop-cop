@@ -739,6 +739,30 @@ describe("carrying open off-diff findings", () => {
     }
   });
 
+  it("posts its own summary when only another account copied this run's marker", async () => {
+    vi.useFakeTimers();
+    priorSummary();
+    issueComments.push({ id: 9, body: summaryBody(), html_url: "https://github.com/acme/widgets/pull/42#x", user: { login: "mallory" }, created_at: new Date(0).toISOString() });
+    const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    harness.inspection.sdk.stub("threads.get", () => makeThreadResponse({ id: THREAD_ID, status: "idle" }));
+    harness.inspection.sdk.stub("threads.output", () => ({ output: summaryBody() }));
+    await plugin(bb);
+    createStore(bb.storage.database() as never).insertRun(liveRun());
+    // The watcher learns SlopCop's login before it recovers the run.
+    const service = harness.behavior.runService("watcher");
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(methods.filter(method => !method.includes("check-runs"))).toEqual(["POST repos/acme/widgets/issues/42/comments"]);
+      expect(posted()[0]!.body).toEqual({ body: expect.stringContaining(`${ACCESS} ${SUFFIX}`) });
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("moves the heading first in a prefaced summary the reviewer posted, even with nothing to append", async () => {
     priorSummary();
     const prefaced = decorateBody(`Review complete.\n\n${offDiff("- `src/access.ts:40` — **Restore the access check.** Still gone.")}`, "summary", fields);

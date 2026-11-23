@@ -1564,7 +1564,8 @@ export default async function plugin(bb: BbPluginApi) {
               }
               if (hasMarkedSummary(verified)) {
                 if (read.carried.length === 0) return verified;
-                return amendPostedSummary(run, read, verified, () => waitForWork(() => runVerify()));
+                const amended = await amendPostedSummary(run, read, verified, () => waitForWork(() => runVerify()));
+                if (amended !== null) return amended;
               }
               if (summary === null) return verified;
               if (!mustPost() && verified.comments.length > 0) return verified;
@@ -1651,14 +1652,18 @@ export default async function plugin(bb: BbPluginApi) {
     read: CarryRead,
     verified: VerifyResult,
     reverify: () => Promise<VerifyResult>,
-  ): Promise<VerifyResult> {
-    const ownSummary = (comment: GhComment) => {
+  ): Promise<VerifyResult | null> {
+    const marked = (comment: GhComment) => {
       const marker = parseMarker(comment.body);
       return marker?.kind === "summary" && marker.run === run.id;
     };
+    // Anyone can copy a marker; only a summary from SlopCop's account is edited.
+    const ownSummary = (comment: GhComment) => marked(comment) && (ghLogin === null || comment.author === ghLogin);
     const issue = read.issues.find(ownSummary);
     const posted = issue ?? read.reviews.find(ownSummary);
     if (posted === undefined) {
+      // Only another account's copy: this run has no summary of its own yet.
+      if ([...read.issues, ...read.reviews].some(marked)) return null;
       throw new Error("this run's summary was verified but missing from the read that checks carried off-diff findings");
     }
     const amended = summaryToPost({
@@ -2664,9 +2669,8 @@ export default async function plugin(bb: BbPluginApi) {
           const read = await readCarry(run, run.startedAt);
           if (read.carried.length > 0) {
             const hasSummary = result.comments.some(comment => comment.kind === "summary" && comment.attribution === "marker");
-            result = hasSummary
-              ? await amendPostedSummary(run, read, result, runVerify)
-              : {
+            const amended = hasSummary ? await amendPostedSummary(run, read, result, runVerify) : null;
+            result = amended ?? {
                   status: "failed",
                   detail: `${read.carried.length} carried off-diff finding(s) have no summary from this run — dispatch a new review`,
                   comments: result.comments,

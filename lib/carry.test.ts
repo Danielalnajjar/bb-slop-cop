@@ -83,6 +83,10 @@ describe("review round 1 regressions", () => {
     });
     expect(parseFindingBullet("- `LICENSE` — **Restore the notice.**")).toMatchObject({ path: "LICENSE", line: null });
     expect(parseFindingBullet("- `docs/my notes.md:3` — **Fix the link.**")).toMatchObject({ path: "docs/my notes.md", line: 3 });
+    expect(parseFindingBullet("- Makefile:12 — Preserve the build target. Explanation.")).toMatchObject({
+      path: "Makefile", line: 12, title: "Preserve the build target",
+    });
+    expect(parseFindingBullet("- Note: keep this short.")).toMatchObject({ path: "" });
     expect(parseFindingBullet("- src/user-profile.ts:42: Keep the avatar. It vanishes.")).toMatchObject({
       path: "src/user-profile.ts", line: 42, title: "Keep the avatar",
     });

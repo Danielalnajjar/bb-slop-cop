@@ -38,13 +38,14 @@ function stripSuffix(text: string): string {
 /**
  * The bullet's location and the text after it. A backticked location is taken
  * whole, so `LICENSE` and `src/user-profile.ts` stay intact; a bare one must
- * look like a path and end at whitespace or `: `.
+ * look like a path (or name a line) and end at whitespace or `: `.
  */
 function splitLocation(first: string): { location: string; rest: string } | null {
   const quoted = /^`([^`]+)`(?:\s*(?:—|–|:|-)\s*|\s+|$)(.*)$/u.exec(first);
   if (quoted !== null) return { location: quoted[1]!.trim(), rest: quoted[2]! };
   const bare = /^([^\s`*]+?)(?::\s+|\s+(?:—|–|-|:)\s+|\s+)(.*)$/u.exec(first);
-  if (bare !== null && /[./]/.test(bare[1]!)) return { location: bare[1]!, rest: bare[2]! };
+  // A root-level file such as `Makefile:12` counts once it carries a line.
+  if (bare !== null && /[./]|^[^:]+:\d+/.test(bare[1]!)) return { location: bare[1]!, rest: bare[2]! };
   return null;
 }
 
