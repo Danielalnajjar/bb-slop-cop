@@ -20,16 +20,18 @@ function summary(run: string, body: string) {
 
 /** One posted summary per head, in order, as GitHub returns them. */
 function history(...bodies: string[]) {
-  return bodies.map((body, index) => ({ body: summary(`run_${index + 1}`, body), createdAt: (index + 1) * 1_000 }));
+  return bodies.map((body, index) => ({
+    body: summary(`run_${index + 1}`, body), createdAt: (index + 1) * 1_000, author: "slopcop-bot",
+  }));
 }
 
-function finish(run: string, body: string | null, prior: { body: string; createdAt: number }[]) {
+function finish(run: string, body: string | null, prior: { body: string; createdAt: number; author: string | null }[]) {
   return summaryToPost({
     rule: RULE,
     runId: run,
     sha: `sha_${run}`,
     finalMessage: body === null ? null : summary(run, body),
-    carried: collectCarriedFindings(prior, RULE, run),
+    carried: collectCarriedFindings(prior, RULE, { excludeRunId: run }),
   });
 }
 
@@ -70,7 +72,69 @@ describe("reading findings from a summary", () => {
     ].join("\n");
     expect(summaryFindings(summary("run_1", body)).open.map(item => item.title)).toEqual(["Restore the access check"]);
     const other = decorateBody(offDiff(RETRY), "summary", { rule: "other-rule", run: "run_x", sha: "s", kind: "summary" });
-    expect(collectCarriedFindings([{ body: other, createdAt: 1 }], RULE)).toEqual([]);
+    expect(collectCarriedFindings([{ body: other, createdAt: 1, author: "slopcop-bot" }], RULE)).toEqual([]);
+  });
+});
+
+describe("review round 1 regressions", () => {
+  it("keeps a hyphenated path whole, and reads root files and spaced paths", () => {
+    expect(parseFindingBullet("- `src/user-profile.ts:42` — **Keep the avatar.** It vanishes.")).toMatchObject({
+      path: "src/user-profile.ts", line: 42, title: "Keep the avatar",
+    });
+    expect(parseFindingBullet("- `LICENSE` — **Restore the notice.**")).toMatchObject({ path: "LICENSE", line: null });
+    expect(parseFindingBullet("- `docs/my notes.md:3` — **Fix the link.**")).toMatchObject({ path: "docs/my notes.md", line: 3 });
+    expect(parseFindingBullet("- src/user-profile.ts:42: Keep the avatar. It vanishes.")).toMatchObject({
+      path: "src/user-profile.ts", line: 42, title: "Keep the avatar",
+    });
+  });
+
+  it("strips only a terminal carried suffix", () => {
+    const quoted = `- \`src/a.ts:1\` — **Explain ${CARRIED_SUFFIX} in docs.** Readers miss it.`;
+    expect(parseFindingBullet(quoted)!.text).toBe(quoted);
+  });
+
+  it("does not resolve from a fenced bullet under the resolved heading", () => {
+    const prior = history(offDiff(ACCESS), `${RESOLVED_FINDINGS_HEADING}\n\n\`\`\`\n${ACCESS}\n\`\`\``);
+    expect(collectCarriedFindings(prior, RULE)).toHaveLength(1);
+  });
+
+  it("reads a bullet that shares the marker's line", () => {
+    const body = summary("run_1", offDiff(ACCESS)).replace(`${ACCESS}\n\n<!--`, `${ACCESS} <!--`);
+    expect(body).toContain(`${ACCESS} <!--`);
+    expect(collectCarriedFindings([{ body, createdAt: 1, author: null }], RULE)).toHaveLength(1);
+  });
+
+  it("keeps a finding open when one summary both lists and resolves it", () => {
+    const prior = history(offDiff(ACCESS), `${offDiff(ACCESS)}\n\n${resolved(ACCESS)}`);
+    expect(collectCarriedFindings(prior, RULE)).toHaveLength(1);
+  });
+
+  it("keeps a finding open when a resolve and a reopen share a timestamp", () => {
+    const [first, reopen, resolve] = history(offDiff(ACCESS), offDiff(ACCESS), resolved(ACCESS));
+    const sameSecond = [first!, { ...resolve!, createdAt: 5_000 }, { ...reopen!, createdAt: 5_000 }];
+    expect(collectCarriedFindings(sameSecond, RULE)).toHaveLength(1);
+    expect(collectCarriedFindings([...sameSecond].reverse(), RULE)).toHaveLength(1);
+  });
+
+  it("ignores summaries another account wrote with a copied marker", () => {
+    const [opened, forged] = history(offDiff(ACCESS), resolved(ACCESS));
+    const prior = [opened!, { ...forged!, author: "someone-else" }];
+    expect(collectCarriedFindings(prior, RULE, { author: "slopcop-bot" })).toHaveLength(1);
+    expect(collectCarriedFindings(prior, RULE)).toHaveLength(0);
+  });
+
+  it("keeps a finding a preface repeats open in the next review", () => {
+    const prior = history(offDiff(ACCESS, RETRY));
+    const b = finish("run_2", [
+      `Earlier: ${ACCESS.slice(2)}`,
+      ACCESS,
+      "",
+      offDiff(RETRY),
+      "",
+      resolved("- `src/other.ts:1` — **Drop the shim.** Gone."),
+    ].join("\n"), prior)!;
+    const next = collectCarriedFindings([...prior, { body: b.body, createdAt: 9_000, author: "slopcop-bot" }], RULE);
+    expect(next.map(item => item.title).sort()).toEqual(["Cap the retry loop", "Restore the access check"]);
   });
 });
 
@@ -93,7 +157,7 @@ describe("carrying off-diff findings forward", () => {
     const c = finish("run_3", resolved("- `src/access.ts:32` — **Restore the access check.** The guard is back in `authorize`."), prior);
     expect(c).toMatchObject({ hasOffDiffFindings: false, appended: 0 });
     expect(c!.body).toContain("The guard is back in `authorize`.");
-    expect(collectCarriedFindings([...prior, { body: c!.body, createdAt: 9_000 }], RULE)).toEqual([]);
+    expect(collectCarriedFindings([...prior, { body: c!.body, createdAt: 9_000, author: "slopcop-bot" }], RULE)).toEqual([]);
   });
 
   it("does not append an item the reviewer re-listed as still open", () => {
@@ -112,7 +176,7 @@ describe("carrying off-diff findings forward", () => {
       resolved("- `src/access.ts:32` — **Restore the access check.** Restored."),
     ].join("\n"), prior);
     expect(b).toMatchObject({ hasOffDiffFindings: true, appended: 0 });
-    const next = collectCarriedFindings([...prior, { body: b!.body, createdAt: 9_000 }], RULE);
+    const next = collectCarriedFindings([...prior, { body: b!.body, createdAt: 9_000, author: "slopcop-bot" }], RULE);
     expect(next.map(item => item.title)).toEqual(["Cap the retry loop"]);
   });
 
@@ -138,7 +202,7 @@ describe("carrying off-diff findings forward", () => {
     let prior = history(offDiff(ACCESS));
     for (const run of ["run_2", "run_3"]) {
       const next = finish(run, "Nothing new.", prior)!;
-      prior = [...prior, { body: next.body, createdAt: prior.length * 1_000 + 1_000 }];
+      prior = [...prior, { body: next.body, createdAt: prior.length * 1_000 + 1_000, author: "slopcop-bot" }];
     }
     const last = prior.at(-1)!.body;
     expect(last.split(CARRIED_SUFFIX)).toHaveLength(2);
@@ -200,7 +264,7 @@ describe("the open set across every earlier summary", () => {
 
   it("leaves out the finishing run's own summary", () => {
     const prior = history(offDiff(ACCESS), offDiff(RETRY));
-    expect(collectCarriedFindings(prior, RULE, "run_2").map(item => item.title)).toEqual(["Restore the access check"]);
+    expect(collectCarriedFindings(prior, RULE, { excludeRunId: "run_2" }).map(item => item.title)).toEqual(["Restore the access check"]);
   });
 });
 

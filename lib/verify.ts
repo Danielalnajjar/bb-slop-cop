@@ -14,10 +14,9 @@ import {
   markerBelongsToRule,
   OFF_DIFF_FINDINGS_HEADING,
   parseMarker,
-  RESOLVED_FINDINGS_HEADING,
   restampMarker,
 } from "./marker";
-import { CARRIED_SUFFIX, findingKey, findSection, type CarriedFinding } from "./carry";
+import { CARRIED_SUFFIX, findingKey, findSection, summaryFindings, type CarriedFinding } from "./carry";
 import type { GhClient, GhComment } from "./gh";
 import type { CommentKind, RunComment, RunStatus } from "./types";
 
@@ -272,8 +271,8 @@ function appendUnaccounted(
   if (carried.length === 0) return { lines, appended: 0 };
   const markerLine = lines.findIndex(line => line.includes(markerText));
   const open = findSection(lines, OFF_DIFF_FINDINGS_HEADING, markerLine);
-  const resolved = findSection(lines, RESOLVED_FINDINGS_HEADING, markerLine);
-  const accounted = new Set([...open?.items ?? [], ...resolved?.items ?? []].map(findingKey));
+  const listed = summaryFindings(lines.join("\n"));
+  const accounted = new Set([...listed.open, ...listed.resolved].map(findingKey));
   const missing = carried.filter(finding => !accounted.has(findingKey(finding))).map(withCarriedSuffix);
   if (missing.length === 0) return { lines, appended: 0 };
   const next = [...lines];

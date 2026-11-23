@@ -49,6 +49,8 @@ function liveRun(): Run {
 
 /** Endpoints written to, in order, with the body each carried. */
 let writes: { endpoint: string; body: unknown }[];
+/** `METHOD endpoint` for each write, in order. */
+let methods: string[];
 /** Issue comments GitHub currently returns. Grows when the plugin posts one. */
 let issueComments: unknown[];
 /** Inline review comments GitHub currently returns — the agent's findings. */
@@ -62,6 +64,7 @@ let releaseCommentRead: (() => void) | undefined;
 
 beforeEach(() => {
   writes = [];
+  methods = [];
   issueComments = [];
   reviewComments = [];
   reviews = [];
@@ -124,6 +127,7 @@ beforeEach(() => {
       end: (body: string) => {
         const parsed: unknown = JSON.parse(body);
         writes.push({ endpoint, body: parsed });
+        methods.push(`${args[args.indexOf("--method") + 1]} ${endpoint}`);
         if (endpoint.endsWith("/pulls/42/comments")) {
           const finding = parsed as { path: string; line: number; body: string };
           if (finding.path !== "src/changed.ts" || finding.line !== 10) {
@@ -726,7 +730,50 @@ describe("carrying open off-diff findings", () => {
         endpoint: surface === "review" ? "repos/acme/widgets/pulls/42/reviews/9" : "repos/acme/widgets/issues/comments/9",
         body: { body: amended },
       }]);
+      expect(methods.filter(method => !method.includes("check-runs"))).toEqual([
+        surface === "review" ? "PUT repos/acme/widgets/pulls/42/reviews/9" : "PATCH repos/acme/widgets/issues/comments/9",
+      ]);
       expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: 1 });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("moves the heading first in a prefaced summary the reviewer posted, even with nothing to append", async () => {
+    priorSummary();
+    const prefaced = decorateBody(`Review complete.\n\n${offDiff("- `src/access.ts:40` — **Restore the access check.** Still gone.")}`, "summary", fields);
+    issueComments.push({ id: 9, body: prefaced, html_url: "https://github.com/acme/widgets/pull/42#x", user: { login: "slopcop-bot" }, created_at: new Date(2_000).toISOString() });
+    const { harness } = await finishThreadWith(prefaced);
+    try {
+      expect(writes.filter(write => !write.endpoint.includes("check-runs"))).toEqual([{
+        endpoint: "repos/acme/widgets/issues/comments/9",
+        body: { body: decorateBody(`${offDiff("- `src/access.ts:40` — **Restore the access check.** Still gone.")}\n\nReview complete.`, "summary", fields) },
+      }]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it.each([true, false])("holds a manual verify to the carried findings (own summary: %s)", async (hasSummary) => {
+    priorSummary();
+    if (hasSummary) {
+      issueComments.push({ id: 9, body: summaryBody(), html_url: "https://github.com/acme/widgets/pull/42#x", user: { login: "slopcop-bot" }, created_at: new Date(2_000).toISOString() });
+    } else {
+      await postInline();
+    }
+    const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    store.insertRun({ ...liveRun(), status: "failed", finishedAt: 5_000 });
+    try {
+      await harness.behavior.runCli(["verify", RUN_ID]);
+      if (hasSummary) {
+        expect(methods).toContain("PATCH repos/acme/widgets/issues/comments/9");
+        expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented" });
+      } else {
+        expect(store.getRun(RUN_ID)).toMatchObject({ status: "failed", detail: expect.stringContaining("1 carried off-diff finding") });
+      }
     } finally {
       await harness.lifecycle.dispose();
     }
