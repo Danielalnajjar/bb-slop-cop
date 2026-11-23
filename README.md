@@ -241,9 +241,10 @@ Plugin settings: `defaultThreadSection` accepts a BB thread section name or ID.
 SlopCop fails a run with a clear error if that section no longer exists. `botGhPath`
 switches every GitHub call to a bot identity — see above.
 
-Rule flags: `--name --repo --project --provider --model --reasoning --permission
+Rule flags: `--name --repo --project --machine --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --trigger --settle-minutes
---live --shadow --disabled --hidden --visible`. Add `--json` to any command.
+--live --shadow --disabled --hidden --visible`. `--machine <host id|name>` pins the
+BB machine the rule's review worktrees run on. Add `--json` to any command.
 
 `check` explains the rule match and reports whether the head is waiting to settle
 or a previous head was skipped or cancelled because it was superseded.
