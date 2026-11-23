@@ -12,7 +12,7 @@ import {
 import { isDeepStrictEqual } from "node:util";
 import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
-import { createGhClient, type GhClient } from "./lib/gh";
+import { createGhClient, type GhClient, type GhComment } from "./lib/gh";
 import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment, resolveReviewMachine } from "./lib/review-input";
@@ -25,8 +25,9 @@ import {
   THREAD_ARCHIVED_REASON,
   THREAD_DELETED_REASON,
 } from "./lib/lifecycle";
-import { markerRuleName } from "./lib/marker";
+import { markerRuleName, parseMarker } from "./lib/marker";
 import { collectPriorComments } from "./lib/prior";
+import { collectCarriedFindings, type CarriedFinding } from "./lib/carry";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome, homeRelative } from "./lib/paths";
 import {
@@ -591,6 +592,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     let priorComments: ReturnType<typeof collectPriorComments> = [];
+    let carriedFindings: CarriedFinding[] = [];
     try {
       const [issues, review, reviews] = await waitForWork(() => Promise.all([
         gh.listIssueComments(rule.repo, pullRequest.number),
@@ -601,6 +603,7 @@ export default async function plugin(bb: BbPluginApi) {
         [...issues, ...review, ...reviews],
         rule.name,
       );
+      carriedFindings = collectCarriedFindings([...issues, ...reviews], rule.name);
     } catch (error) {
       throwIfDispatchAborted();
       bb.log.warn(
@@ -684,6 +687,7 @@ export default async function plugin(bb: BbPluginApi) {
         runId,
         ghCommand: botGhPath,
         priorComments,
+        carriedFindings,
       };
       if (!stillExpected()) return { runId, threadId: null };
       const hostId = environment.machine.type === "existing" ? environment.machine.hostId : null;
@@ -1531,20 +1535,34 @@ export default async function plugin(bb: BbPluginApi) {
                   return { status: "cancelled" as const, detail: incomplete, comments: await incompleteComments() };
                 }
               }
+              // Summaries are re-read here, not kept from dispatch, so a
+              // restarted or recovered run still accounts for every finding.
+              const readSummaries = () => waitForWork(() => Promise.all([
+                gh.listIssueComments(run.repo, run.prNumber),
+                gh.listReviews(run.repo, run.prNumber),
+              ]));
+              const [priorIssues, priorReviews] = await readSummaries();
+              const carried = collectCarriedFindings([...priorIssues, ...priorReviews], run.ruleName, run.id);
               const summary = summaryToPost({
                 rule: run.ruleName,
                 runId: run.id,
                 sha: run.headSha,
                 finalMessage,
+                carried,
               });
               // Reads can lag a newly posted comment. Recheck before treating
               // an empty review as final or publishing a missing body.
-              if (verified.status === "no_comment" || (summary?.hasOffDiffFindings && !hasMarkedSummary(verified))) {
+              const mustPost = summary !== null && (summary.hasOffDiffFindings || carried.length > 0);
+              if (verified.status === "no_comment" || (mustPost && !hasMarkedSummary(verified))) {
                 await sleep(4_000, watcherSignal);
                 verified = await waitForWork(() => runVerify());
               }
-              if (summary === null || hasMarkedSummary(verified)) return verified;
-              if (!summary.hasOffDiffFindings && verified.comments.length > 0) return verified;
+              if (hasMarkedSummary(verified)) {
+                if (carried.length === 0) return verified;
+                return amendPostedSummary(run, carried, readSummaries, () => waitForWork(() => runVerify()), verified);
+              }
+              if (summary === null) return verified;
+              if (!mustPost && verified.comments.length > 0) return verified;
               await waitForWork(() => gh.request(
                 "POST",
                 `repos/${run.repo}/issues/${run.prNumber}/comments`,
@@ -1583,6 +1601,42 @@ export default async function plugin(bb: BbPluginApi) {
         await finalizeRun(selected);
       }
     }
+  }
+
+  /**
+   * The reviewer posted this run's summary itself. Edit that comment to add
+   * any carried finding it left out: the gate reads one summary per head, so
+   * a second summary would not do.
+   */
+  async function amendPostedSummary(
+    run: Run,
+    carried: CarriedFinding[],
+    readSummaries: () => Promise<[GhComment[], GhComment[]]>,
+    reverify: () => Promise<VerifyResult>,
+    verified: VerifyResult,
+  ): Promise<VerifyResult> {
+    const [issues, reviews] = await readSummaries();
+    const ownSummary = (comment: GhComment) => {
+      const marker = parseMarker(comment.body);
+      return marker?.kind === "summary" && marker.run === run.id;
+    };
+    const issue = issues.find(ownSummary);
+    const review = issue === undefined ? reviews.find(ownSummary) : undefined;
+    const posted = issue ?? review;
+    if (posted === undefined) return verified;
+    const amended = summaryToPost({
+      rule: run.ruleName,
+      runId: run.id,
+      sha: run.headSha,
+      finalMessage: posted.body,
+      carried,
+    });
+    if (amended === null || amended.appended === 0) return verified;
+    await waitForWork(() => issue !== undefined
+      ? gh.request("PATCH", `repos/${run.repo}/issues/comments/${issue.id}`, { body: amended.body })
+      : gh.request("PUT", `repos/${run.repo}/pulls/${run.prNumber}/reviews/${posted.id}`, { body: amended.body }));
+    bb.log.info(`run ${run.id}: added ${amended.appended} carried off-diff finding(s) to the posted summary`);
+    return reverify();
   }
 
   function finishRun(

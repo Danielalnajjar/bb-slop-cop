@@ -4,7 +4,7 @@
 // clean review with the summary as its final message. `gh` is the only seam
 // that matters here, so `node:child_process` is mocked and the plugin drives
 // its real gh client.
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { execFile, spawn } from "node:child_process";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
@@ -53,6 +53,8 @@ let writes: { endpoint: string; body: unknown }[];
 let issueComments: unknown[];
 /** Inline review comments GitHub currently returns — the agent's findings. */
 let reviewComments: unknown[];
+/** Pull request reviews GitHub currently returns. */
+let reviews: { id: number; body: string }[];
 let openPullRequests: unknown[];
 let commentReadError: Error | undefined;
 let deferCommentRead: boolean;
@@ -62,6 +64,7 @@ beforeEach(() => {
   writes = [];
   issueComments = [];
   reviewComments = [];
+  reviews = [];
   openPullRequests = [];
   commentReadError = undefined;
   deferCommentRead = false;
@@ -98,7 +101,9 @@ beforeEach(() => {
       ? issueComments
       : endpoint.includes("/pulls/42/comments")
         ? reviewComments
-        : [];
+        : endpoint.includes("/pulls/42/reviews")
+          ? reviews
+          : [];
     callback(null, JSON.stringify(rows), "");
     return undefined as never;
   }) as never);
@@ -141,6 +146,11 @@ beforeEach(() => {
             html_url: "https://github.com/acme/widgets/pull/42#discussion_r11",
             user: { login: "slopcop-bot" }, created_at: new Date(2_000).toISOString(),
           });
+        }
+        const edited = /\/(?:issues\/comments|pulls\/42\/reviews)\/(\d+)$/.exec(endpoint);
+        if (edited !== null) {
+          const rows = (endpoint.includes("/reviews/") ? reviews : issueComments) as { id: number; body: string }[];
+          rows.find(row => row.id === Number(edited[1]))!.body = (parsed as { body: string }).body;
         }
         if (endpoint.includes("/issues/42/comments")) {
           issueComments.push({
@@ -630,4 +640,105 @@ it("reconciles an already-posted live summary without fetching its transcript", 
     await service.done;
     await harness.lifecycle.dispose();
   }
+});
+
+describe("carrying open off-diff findings", () => {
+  const ACCESS = "- `src/access.ts:32` — **Restore the access check.** The guard was removed.";
+  const SUFFIX = "_(carried forward without a re-check)_";
+  const fields = { rule: "restraint-review", run: RUN_ID, sha: "abc123", kind: "summary" } as const;
+  const offDiff = (...items: string[]) => ["### Findings outside the PR diff", "", ...items].join("\n");
+
+  /** Head A's summary, posted by an earlier run before this one started. */
+  function priorSummary(body = offDiff(ACCESS)) {
+    issueComments.push({
+      id: 3,
+      body: decorateBody(body, "summary", { rule: "restraint-review", run: "run_a", sha: "aaa111", kind: "summary" }),
+      html_url: "https://github.com/acme/widgets/pull/42#issuecomment-3",
+      user: { login: "slopcop-bot" },
+      created_at: new Date(0).toISOString(),
+    });
+  }
+
+  async function postInline() {
+    await createGhClient("fake-slopcop-gh").request("POST", "repos/acme/widgets/pulls/42/comments", {
+      commit_id: "abc123", path: "src/changed.ts", line: 10, side: "RIGHT",
+      body: decorateBody("**Fix the changed line.**", "inline", { ...fields, kind: "inline" }),
+    });
+  }
+
+  const posted = () => writes.filter(write => write.endpoint === "repos/acme/widgets/issues/42/comments");
+
+  it("keeps A's finding in B's summary when B's review is clean", async () => {
+    priorSummary();
+    const { store, harness } = await finishThreadWith(summaryBody());
+    try {
+      expect(posted()).toEqual([{
+        endpoint: "repos/acme/widgets/issues/42/comments",
+        body: { body: decorateBody(`${offDiff(`${ACCESS} ${SUFFIX}`)}\n\nNothing survives the review.`, "summary", fields) },
+      }]);
+      expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: 1 });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("posts a resolved-only summary even when inline findings exist", async () => {
+    priorSummary();
+    await postInline();
+    const body = decorateBody(
+      "### Resolved since the last review\n\n- `src/access.ts:32` — **Restore the access check.** The guard is back.",
+      "summary", fields,
+    );
+    const { store, harness } = await finishThreadWith(body);
+    try {
+      expect(posted()).toEqual([{ endpoint: "repos/acme/widgets/issues/42/comments", body: { body } }]);
+      expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: 2 });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("writes the summary itself when the reviewer ended with only inline findings", async () => {
+    priorSummary();
+    await postInline();
+    const { store, harness } = await finishThreadWith("Posted 1 finding: https://github.com/acme/widgets/pull/42#discussion_r11");
+    try {
+      expect(posted()).toEqual([{
+        endpoint: "repos/acme/widgets/issues/42/comments",
+        body: { body: decorateBody(offDiff(`${ACCESS} ${SUFFIX}`), "summary", fields) },
+      }]);
+      expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: 2 });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it.each(["issue comment", "review"] as const)("edits a %s summary the reviewer posted that left a carried finding out", async (surface) => {
+    priorSummary();
+    const own = { id: 9, body: summaryBody(), html_url: "https://github.com/acme/widgets/pull/42#x", user: { login: "slopcop-bot" } };
+    if (surface === "review") reviews.push({ ...own, submitted_at: new Date(2_000).toISOString() } as never);
+    else issueComments.push({ ...own, created_at: new Date(2_000).toISOString() });
+    const { store, harness } = await finishThreadWith(summaryBody());
+    try {
+      const amended = decorateBody(`${offDiff(`${ACCESS} ${SUFFIX}`)}\n\nNothing survives the review.`, "summary", fields);
+      expect(posted()).toEqual([]);
+      expect(writes.filter(write => !write.endpoint.includes("check-runs"))).toEqual([{
+        endpoint: surface === "review" ? "repos/acme/widgets/pulls/42/reviews/9" : "repos/acme/widgets/issues/comments/9",
+        body: { body: amended },
+      }]);
+      expect(store.getRun(RUN_ID)).toMatchObject({ status: "commented", commentCount: 1 });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("posts nothing for a cancelled run with carried findings", async () => {
+    priorSummary();
+    const { harness } = await finishThreadWith("Review incomplete: worktree is dirty.");
+    try {
+      expect(posted()).toEqual([]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
 });

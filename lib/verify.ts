@@ -8,13 +8,16 @@ import {
   attributeBody,
   buildHeader,
   buildMarker,
+  decorateBody,
   hasVisibleHeader,
   headerRuleName,
   markerBelongsToRule,
   OFF_DIFF_FINDINGS_HEADING,
   parseMarker,
+  RESOLVED_FINDINGS_HEADING,
   restampMarker,
 } from "./marker";
+import { CARRIED_SUFFIX, findingKey, findSection, type CarriedFinding } from "./carry";
 import type { GhClient, GhComment } from "./gh";
 import type { CommentKind, RunComment, RunStatus } from "./types";
 
@@ -212,49 +215,92 @@ export function incompleteReviewReason(finalMessage: string | null): string | nu
 /**
  * The Conversation body SlopCop posts. The agent supplies its content and
  * rule; SlopCop stamps the recorded run id and head before publishing.
+ *
+ * `carried` holds the off-diff findings still open from earlier summaries. Any
+ * the body neither re-lists nor resolves is appended to the off-diff section,
+ * and with no usable body SlopCop writes the summary itself, so a carried
+ * finding can only leave the latest summary through a reviewer's resolution.
  */
 export function summaryToPost(options: {
   rule: string;
   runId: string;
   sha: string;
   finalMessage: string | null;
-}): { body: string; hasOffDiffFindings: boolean } | null {
+  carried?: CarriedFinding[];
+}): { body: string; hasOffDiffFindings: boolean; appended: number } | null {
   if (incompleteReviewReason(options.finalMessage) !== null) return null;
+  const carried = options.carried ?? [];
   const body = (options.finalMessage ?? "").trim();
   const marker = parseMarker(body);
-  if (marker === null) return null;
-  if (!markerBelongsToRule(marker, options.rule)) return null;
-  if (marker.kind !== "summary") return null;
   const canonicalMarker = {
     rule: options.rule,
     run: options.runId,
     sha: options.sha,
     kind: "summary" as const,
   };
-  const stamped = restampMarker(body, canonicalMarker);
+  if (marker === null || !markerBelongsToRule(marker, options.rule) || marker.kind !== "summary") {
+    if (carried.length === 0) return null;
+    return {
+      body: decorateBody(
+        `${OFF_DIFF_FINDINGS_HEADING}\n\n${carried.map(withCarriedSuffix).join("\n")}`,
+        "summary",
+        canonicalMarker,
+      ),
+      hasOffDiffFindings: true,
+      appended: carried.length,
+    };
+  }
   const markerText = buildMarker(canonicalMarker);
-  const lines = stamped.split(/\r?\n/);
+  const { lines, appended } = appendUnaccounted(
+    restampMarker(body, canonicalMarker).split(/\r?\n/),
+    markerText,
+    carried,
+  );
+  return { ...normalizeSummary(lines, options.rule, markerText), appended };
+}
+
+function withCarriedSuffix(finding: CarriedFinding): string {
+  return `${finding.text} ${CARRIED_SUFFIX}`;
+}
+
+/** Adds each carried finding the body does not account for to its off-diff section. */
+function appendUnaccounted(
+  lines: string[],
+  markerText: string,
+  carried: CarriedFinding[],
+): { lines: string[]; appended: number } {
+  if (carried.length === 0) return { lines, appended: 0 };
+  const markerLine = lines.findIndex(line => line.includes(markerText));
+  const open = findSection(lines, OFF_DIFF_FINDINGS_HEADING, markerLine);
+  const resolved = findSection(lines, RESOLVED_FINDINGS_HEADING, markerLine);
+  const accounted = new Set([...open?.items ?? [], ...resolved?.items ?? []].map(findingKey));
+  const missing = carried.filter(finding => !accounted.has(findingKey(finding))).map(withCarriedSuffix);
+  if (missing.length === 0) return { lines, appended: 0 };
+  const next = [...lines];
+  if (open !== null) {
+    next.splice(open.end, 0, ...(open.items.length === 0 ? ["", ...missing] : missing));
+  } else {
+    // Normalizing below moves the new section to the first content line.
+    const header = lines.slice(0, markerLine).findIndex(line => line.trim().startsWith("🚨") && hasVisibleHeader(line));
+    if (header === -1) next.unshift(OFF_DIFF_FINDINGS_HEADING, "", ...missing, "");
+    else next.splice(header + 1, 0, "", OFF_DIFF_FINDINGS_HEADING, "", ...missing);
+  }
+  return { lines: next, appended: missing.length };
+}
+
+function normalizeSummary(
+  lines: string[],
+  rule: string,
+  markerText: string,
+): { body: string; hasOffDiffFindings: boolean } {
+  const stamped = lines.join("\n");
   const markerLineIndex = lines.findIndex(line => line.includes(markerText));
   if (markerLineIndex === -1) return { body: stamped, hasOffDiffFindings: false };
   // A must-fix off-diff summary must never be lost to layout drift: the
   // heading counts as its own complete line anywhere before the marker's
   // line, whatever wrapper text the model put above it. A heading quoted
   // inside a fenced block is an example, not the section itself.
-  let headingIndex = -1;
-  let fenceChar: string | null = null;
-  for (let index = 0; index < markerLineIndex; index += 1) {
-    const trimmed = lines[index]!.trim();
-    const fence = /^(`{3,}|~{3,})/.exec(trimmed)?.[1]?.[0];
-    if (fence !== undefined) {
-      if (fenceChar === null) fenceChar = fence;
-      else if (fenceChar === fence) fenceChar = null;
-      continue;
-    }
-    if (fenceChar === null && trimmed === OFF_DIFF_FINDINGS_HEADING) {
-      headingIndex = index;
-      break;
-    }
-  }
+  const headingIndex = findSection(lines, OFF_DIFF_FINDINGS_HEADING, markerLineIndex)?.heading ?? -1;
   if (headingIndex === -1) return { body: stamped, hasOffDiffFindings: false };
   // Normalize to one layout every consumer can parse: branding header,
   // heading with its findings and notes, any preface moved below them (kept,
@@ -263,7 +309,7 @@ export function summaryToPost(options: {
     .slice(0, headingIndex)
     .findIndex(line => line.trim().startsWith("🚨") && hasVisibleHeader(line));
   const header = headerIndex === -1
-    ? buildHeader("summary", options.rule)
+    ? buildHeader("summary", rule)
     : lines[headerIndex]!.trim();
   const preface = lines
     .filter((_, index) => index < headingIndex && index !== headerIndex)
