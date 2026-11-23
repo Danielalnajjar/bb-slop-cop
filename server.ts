@@ -2168,7 +2168,7 @@ export default async function plugin(bb: BbPluginApi) {
         name: "rules-add",
         summary: "Create a rule",
         usage:
-          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,…>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--settle-minutes <N>] [--live] [--hidden]",
+          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--machine <host id|name>] [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,…>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--settle-minutes <N>] [--live] [--hidden]",
       },
       {
         name: "rules-edit",
@@ -2373,7 +2373,7 @@ export default async function plugin(bb: BbPluginApi) {
 
           // Agent configuration from the CLI, so another BB agent can create a
           // dispatchable rule without opening the panel.
-          const executionFlags = ["project", "provider", "model", "permission", "reasoning"];
+          const executionFlags = ["project", "provider", "model", "permission", "reasoning", "machine"];
           for (const name of executionFlags.filter(has)) {
             const value = flag(name);
             if (!value?.trim() || value.startsWith("--")) return fail(`--${name} requires a value`);
@@ -2393,9 +2393,35 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (projectId === undefined) return fail("use --project to configure the rule's agent");
 
+            let environment: unknown;
+            const machineFlag = flag("machine");
+            if (machineFlag !== undefined) {
+              const hosts = await bb.sdk.hosts.list();
+              const host = hosts.find(entry => entry.id === machineFlag)
+                ?? hosts.find(entry => entry.name === machineFlag);
+              if (host === undefined) {
+                return fail(`no machine named '${machineFlag}'. Available: ${hosts.map(entry => entry.name).join(", ")}`);
+              }
+              // Dispatch rebuilds a fresh git-worktree environment and keeps
+              // only the machine (see buildReviewEnvironment), so pinning the
+              // machine is the whole placement. Keep a prior provider
+              // selection's provider id and inputs.
+              const priorEnvironment = previous?.environment;
+              const prior = priorEnvironment !== null && typeof priorEnvironment === "object" && !Array.isArray(priorEnvironment)
+                ? priorEnvironment as Record<string, unknown> : {};
+              environment = {
+                ...(prior.type === "provider" ? prior : {}),
+                type: "provider",
+                environmentProviderId: typeof prior.environmentProviderId === "string" && prior.environmentProviderId !== ""
+                  ? prior.environmentProviderId : "git-worktree",
+                machine: { type: "existing", hostId: host.id },
+              };
+            }
+
             const request = {
               ...previous,
               projectId,
+              ...(environment === undefined ? {} : { environment }),
               providerId: flag("provider") ?? previous?.providerId ?? "claude-code",
               model: flag("model") ?? previous?.model ?? "claude-opus-5-5[1m]",
               reasoningLevel: flag("reasoning") ?? (previous === null ? "high" : previous.reasoningLevel),

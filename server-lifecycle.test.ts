@@ -3086,6 +3086,41 @@ it("persists permission and reasoning as independent rule edits", async () => {
   }
 });
 
+it("pins a rule's review machine through the CLI and keeps it on later edits", async () => {
+  const { harness } = await setupSettling(0);
+  harness.inspection.sdk.stub("hosts.list", () => [
+    { id: "host_default", name: "WSL" },
+    { id: "host_box", name: "pc-box-1" },
+  ]);
+  try {
+    const edit = (...flags: string[]) => harness.behavior.runCli(["rules", "edit", "settling-review", ...flags]);
+    const read = async () => JSON.parse((await harness.behavior.runCli(["rules", "--json"])).stdout!)[0].request;
+    const original = await read();
+    const pinned = (hostId: string) => ({
+      ...original,
+      environment: {
+        type: "provider", environmentProviderId: "git-worktree",
+        machine: { type: "existing", hostId },
+      },
+    });
+
+    expect((await edit("--machine", "pc-box-1")).exitCode).toBe(0);
+    expect(await read()).toEqual(pinned("host_box"));
+    expect((await edit("--machine", "host_default")).exitCode).toBe(0);
+    expect(await read()).toEqual(pinned("host_default"));
+
+    const unknown = await edit("--machine", "nope");
+    expect(unknown).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/WSL.*pc-box-1/) });
+    expect(await read()).toEqual(pinned("host_default"));
+    expect((await edit("--machine")).exitCode).toBe(1);
+
+    expect((await edit("--prompt", "Review the patch")).exitCode).toBe(0);
+    expect(await read()).toEqual(pinned("host_default"));
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
 it("retains a path-filtered wait when GitHub temporarily fails to list changed files", async () => {
   let files: string[] | null = ["src/feature.ts"];
   const { bb, harness, push, writes } = await setupSettling(1, { pollFiles: () => files });

@@ -39,9 +39,10 @@ bb slopcop rules add \
   --prompt "Review the diff for auth and payment issues."
 ```
 
-Flags: `--name --repo --project --provider --model --reasoning --permission
+Flags: `--name --repo --project --machine --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe
 --trigger --settle-minutes --live --shadow --disabled --hidden --visible`.
+`--machine <host id|name>` pins the BB machine the review worktrees run on.
 
 `--hidden` spawns review threads with `visibility: "hidden"`: they stay out of
 sidebar organization and raise no unread or notification attention. Right for a
