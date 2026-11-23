@@ -12,7 +12,7 @@ import {
 import { isDeepStrictEqual } from "node:util";
 import { sleep, waitForAbort } from "./lib/abort";
 import { z } from "zod";
-import { createGhClient, type GhClient } from "./lib/gh";
+import { createGhClient, type GhClient, type GhComment } from "./lib/gh";
 import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, type ProvisionDispatchOptions, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment, resolveReviewMachine } from "./lib/review-input";
@@ -25,8 +25,9 @@ import {
   THREAD_ARCHIVED_REASON,
   THREAD_DELETED_REASON,
 } from "./lib/lifecycle";
-import { markerRuleName } from "./lib/marker";
+import { markerRuleName, parseMarker } from "./lib/marker";
 import { collectPriorComments } from "./lib/prior";
+import { collectCarriedFindings, type CarriedFinding } from "./lib/carry";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome, homeRelative } from "./lib/paths";
 import {
@@ -591,6 +592,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     let priorComments: ReturnType<typeof collectPriorComments> = [];
+    let carriedFindings: CarriedFinding[] = [];
     try {
       const [issues, review, reviews] = await waitForWork(() => Promise.all([
         gh.listIssueComments(rule.repo, pullRequest.number),
@@ -601,6 +603,7 @@ export default async function plugin(bb: BbPluginApi) {
         [...issues, ...review, ...reviews],
         rule.name,
       );
+      carriedFindings = collectCarriedFindings([...issues, ...reviews], rule.name, { author: ghLogin });
     } catch (error) {
       throwIfDispatchAborted();
       bb.log.warn(
@@ -684,6 +687,7 @@ export default async function plugin(bb: BbPluginApi) {
         runId,
         ghCommand: botGhPath,
         priorComments,
+        carriedFindings,
       };
       if (!stillExpected()) return { runId, threadId: null };
       const hostId = environment.machine.type === "existing" ? environment.machine.hostId : null;
@@ -1531,20 +1535,40 @@ export default async function plugin(bb: BbPluginApi) {
                   return { status: "cancelled" as const, detail: incomplete, comments: await incompleteComments() };
                 }
               }
-              const summary = summaryToPost({
-                rule: run.ruleName,
-                runId: run.id,
-                sha: run.headSha,
-                finalMessage,
-              });
+              // Summaries are re-read here, not kept from dispatch, so a
+              // restarted or recovered run still accounts for every finding.
+              // An older run of this rule still publishing goes first, so its
+              // findings are in the history this run reads.
+              await waitForOlderFinalizers(run, threadId);
+              const account = async () => {
+                const read = await readCarry(run);
+                return {
+                  read,
+                  summary: summaryToPost({
+                    rule: run.ruleName,
+                    runId: run.id,
+                    sha: run.headSha,
+                    finalMessage,
+                    carried: read.carried,
+                  }),
+                };
+              };
+              let { read, summary } = await account();
+              const mustPost = () => summary !== null && (summary.hasOffDiffFindings || read.carried.length > 0);
               // Reads can lag a newly posted comment. Recheck before treating
               // an empty review as final or publishing a missing body.
-              if (verified.status === "no_comment" || (summary?.hasOffDiffFindings && !hasMarkedSummary(verified))) {
+              if (verified.status === "no_comment" || (mustPost() && !hasMarkedSummary(verified))) {
                 await sleep(4_000, watcherSignal);
                 verified = await waitForWork(() => runVerify());
+                ({ read, summary } = await account());
               }
-              if (summary === null || hasMarkedSummary(verified)) return verified;
-              if (!summary.hasOffDiffFindings && verified.comments.length > 0) return verified;
+              if (hasMarkedSummary(verified)) {
+                if (read.carried.length === 0) return verified;
+                const amended = await amendPostedSummary(run, read, verified, () => waitForWork(() => runVerify()));
+                if (amended !== null) return amended;
+              }
+              if (summary === null) return verified;
+              if (!mustPost() && verified.comments.length > 0) return verified;
               await waitForWork(() => gh.request(
                 "POST",
                 `repos/${run.repo}/issues/${run.prNumber}/comments`,
@@ -1583,6 +1607,78 @@ export default async function plugin(bb: BbPluginApi) {
         await finalizeRun(selected);
       }
     }
+  }
+
+  interface CarryRead {
+    issues: GhComment[];
+    reviews: GhComment[];
+    carried: CarriedFinding[];
+  }
+
+  /** This PR's summaries, and the off-diff findings `run` must carry. */
+  async function readCarry(run: Run, before?: number): Promise<CarryRead> {
+    const [issues, reviews] = await waitForWork(() => Promise.all([
+      gh.listIssueComments(run.repo, run.prNumber),
+      gh.listReviews(run.repo, run.prNumber),
+    ]));
+    const history = [...issues, ...reviews].filter(comment => before === undefined || comment.createdAt < before);
+    return {
+      issues,
+      reviews,
+      carried: collectCarriedFindings(history, run.ruleName, { excludeRunId: run.id, author: ghLogin }),
+    };
+  }
+
+  async function waitForOlderFinalizers(run: Run, threadId: string): Promise<void> {
+    const older = [...finalizing].flatMap(([otherThread, promise]) => {
+      if (otherThread === threadId) return [];
+      const other = store.findRunByThread(otherThread);
+      const isOlder = other !== null &&
+        other.ruleId === run.ruleId && other.repo === run.repo && other.prNumber === run.prNumber &&
+        (other.startedAt < run.startedAt || (other.startedAt === run.startedAt && other.id < run.id));
+      return isOlder ? [promise] : [];
+    });
+    await waitForWork(() => Promise.allSettled(older));
+  }
+
+  /**
+   * The reviewer posted this run's summary itself. Edit that comment to add
+   * any carried finding it left out, and to put the off-diff heading where
+   * the gate reads it: the gate reads one summary per head, so a second
+   * summary would not do.
+   */
+  async function amendPostedSummary(
+    run: Run,
+    read: CarryRead,
+    verified: VerifyResult,
+    reverify: () => Promise<VerifyResult>,
+  ): Promise<VerifyResult | null> {
+    const marked = (comment: GhComment) => {
+      const marker = parseMarker(comment.body);
+      return marker?.kind === "summary" && marker.run === run.id;
+    };
+    // Anyone can copy a marker; only a summary from SlopCop's account is edited.
+    const ownSummary = (comment: GhComment) => marked(comment) && (ghLogin === null || comment.author === ghLogin);
+    const issue = read.issues.find(ownSummary);
+    const posted = issue ?? read.reviews.find(ownSummary);
+    if (posted === undefined) {
+      // Only another account's copy: this run has no summary of its own yet.
+      if ([...read.issues, ...read.reviews].some(marked)) return null;
+      throw new Error("this run's summary was verified but missing from the read that checks carried off-diff findings");
+    }
+    const amended = summaryToPost({
+      rule: run.ruleName,
+      runId: run.id,
+      sha: run.headSha,
+      finalMessage: posted.body,
+      carried: read.carried,
+    });
+    if (amended === null || amended.body === posted.body.trim()) return verified;
+    await waitForWork(() => issue !== undefined
+      ? gh.request("PATCH", `repos/${run.repo}/issues/comments/${issue.id}`, { body: amended.body })
+      : gh.request("PUT", `repos/${run.repo}/pulls/${run.prNumber}/reviews/${posted.id}`, { body: amended.body }));
+    bb.log.info(`run ${run.id}: edited the posted summary to carry ${amended.appended} more off-diff finding(s)`);
+    return reverify();
   }
 
   function finishRun(
@@ -2556,7 +2652,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (run === undefined || run === null) return fail("no such run");
           const blocked = liveVerifyBlockReason(run);
           if (blocked !== null) return fail(blocked);
-          const result = await verifyLive({
+          const runVerify = () => verifyLive({
             gh,
             repo: run.repo,
             prNumber: run.prNumber,
@@ -2567,6 +2663,19 @@ export default async function plugin(bb: BbPluginApi) {
             startedAt: run.startedAt,
             authenticatedLogin: ghLogin,
           });
+          let result = await runVerify();
+          // A run that left a carried finding out is not done, however its
+          // comments verify: hold it to the same account as the finalizer.
+          const read = await readCarry(run, run.startedAt);
+          if (read.carried.length > 0) {
+            const hasSummary = result.comments.some(comment => comment.kind === "summary" && comment.attribution === "marker");
+            const amended = hasSummary ? await amendPostedSummary(run, read, result, runVerify) : null;
+            result = amended ?? {
+                  status: "failed",
+                  detail: `${read.carried.length} carried off-diff finding(s) have no summary from this run — dispatch a new review`,
+                  comments: result.comments,
+                };
+          }
           store.replaceComments(run.id, result.comments);
           store.updateRun(run.id, {
             status: result.status,

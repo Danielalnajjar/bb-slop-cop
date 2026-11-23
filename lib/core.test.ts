@@ -830,7 +830,7 @@ describe("the summary SlopCop posts", () => {
     });
 
   it("takes the final message when it carries this rule's summary marker", () => {
-    expect(post(marked("summary"))).toEqual({ body: marked("summary"), hasOffDiffFindings: false });
+    expect(post(marked("summary"))).toEqual({ body: marked("summary"), hasOffDiffFindings: false, appended: 0 });
   });
 
   it("stamps the canonical marker over a mistyped run id or sha", () => {
@@ -876,6 +876,7 @@ describe("the summary SlopCop posts", () => {
         fields,
       ),
       hasOffDiffFindings: true,
+      appended: 0,
     });
   });
 

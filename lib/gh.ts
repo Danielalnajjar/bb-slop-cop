@@ -30,7 +30,7 @@ export interface GhClient {
   listReviews(repo: string, number: number): Promise<GhComment[]>;
   authenticatedLogin(): Promise<string | null>;
   request(
-    method: "GET" | "POST" | "PATCH",
+    method: "GET" | "POST" | "PATCH" | "PUT",
     endpoint: string,
     body?: unknown,
   ): Promise<unknown>;
