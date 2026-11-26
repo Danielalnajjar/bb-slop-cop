@@ -17,7 +17,13 @@ import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, t
 import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment, resolveReviewMachine } from "./lib/review-input";
 import {
-  formatIncrementalMiss, MAX_ATTACHED_PATCH_BYTES, reviewDeltaContract, type ReviewDelta,
+  buildLeanCodexArgs,
+  buildLeanCodexEnvEntries,
+  slopcopHostContract,
+  type CodexLaunchConfigResult,
+} from "./lib/codex-launch";
+import {
+  formatIncrementalMiss, MAX_ATTACHED_PATCH_BYTES, type ReviewDelta,
 } from "./lib/review-delta";
 import {
   archiveReviewThread,
@@ -270,14 +276,239 @@ export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   const store: Store = createStore(db as never);
-  const reviewHost = bb.hosts.experimental_client({ contract: reviewDeltaContract });
+  const reviewHost = bb.hosts.experimental_client({ contract: slopcopHostContract });
+
+  const THREAD_ORIGIN_CACHE_MAX = 512;
+  const HOST_LAUNCH_CACHE_MAX = 64;
+  const HOST_LAUNCH_CACHE_TTL_MS = 30_000;
+  const HOST_LAUNCH_RPC_TIMEOUT_MS = 3_000;
+  const PROJECT_LAUNCH_ENV_CONFLICTS = new Set([
+    "BB_CODEX_BRIDGE_APP_SERVER_COMMAND",
+    "BB_CODEX_BRIDGE_APP_SERVER_ARGS",
+    "CODEX_HOME",
+    "HOME",
+    "PATH",
+    "PATHEXT",
+    "USERPROFILE",
+  ]);
+  const threadOriginCache = new Map<string, boolean>();
+  const hostLaunchCache = new Map<
+    string,
+    { expiresAt: number; value: Extract<CodexLaunchConfigResult, { kind: "ready" }> }
+  >();
+  const hostLaunchInFlight = new Map<string, Promise<Extract<CodexLaunchConfigResult, { kind: "ready" }> | null>>();
+  const providerEnvDispose = new AbortController();
+  let watcherSignal: AbortSignal | undefined;
+
+  function isPluginDisposing(): boolean {
+    return providerEnvDispose.signal.aborted || Boolean(watcherSignal?.aborted);
+  }
+
+  function createBoundedSignal(parent: AbortSignal, timeoutMs: number): {
+    signal: AbortSignal;
+    dispose(): void;
+  } {
+    const controller = new AbortController();
+    if (parent.aborted) {
+      controller.abort(parent.reason);
+      return { signal: controller.signal, dispose: () => {} };
+    }
+    const onParentAbort = () => controller.abort(parent.reason);
+    parent.addEventListener("abort", onParentAbort, { once: true });
+    const timer = setTimeout(() => {
+      controller.abort(new DOMException("Timed out", "TimeoutError"));
+    }, timeoutMs);
+    timer.unref?.();
+    return {
+      signal: controller.signal,
+      dispose: () => {
+        clearTimeout(timer);
+        parent.removeEventListener("abort", onParentAbort);
+      },
+    };
+  }
+
+  function raceWithAbort<T>(promise: PromiseLike<T> | T, signal: AbortSignal): Promise<T> {
+    const pending = Promise.resolve(promise);
+    if (signal.aborted) {
+      pending.catch(() => {});
+      return Promise.reject(signal.reason ?? new Error("Aborted"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(signal.reason ?? new Error("Aborted"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      pending.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  async function isSlopCopThread(threadId: string, signal: AbortSignal): Promise<boolean> {
+    const cached = threadOriginCache.get(threadId);
+    if (cached !== undefined) return cached;
+    try {
+      const thread = await raceWithAbort(bb.sdk.threads.get({ threadId, signal }), signal);
+      if (providerEnvDispose.signal.aborted || signal.aborted) return false;
+      const isOwned = thread.originPluginId === bb.pluginId;
+      if (!threadOriginCache.has(threadId) && threadOriginCache.size >= THREAD_ORIGIN_CACHE_MAX) {
+        const oldestKey = threadOriginCache.keys().next().value;
+        if (oldestKey !== undefined) threadOriginCache.delete(oldestKey);
+      } else {
+        threadOriginCache.delete(threadId);
+      }
+      threadOriginCache.set(threadId, isOwned);
+      return isOwned;
+    } catch (error) {
+      if (!providerEnvDispose.signal.aborted) {
+        const label = error instanceof Error ? error.name : "Error";
+        bb.log.warn(`could not inspect thread origin for ${threadId}: ${label}`);
+      }
+      return false;
+    }
+  }
+
+  async function hasConflictingProjectEnv(projectId: string, signal: AbortSignal): Promise<boolean> {
+    try {
+      const envList = await raceWithAbort(bb.sdk.projects.machineEnvironment({ projectId }), signal);
+      if (providerEnvDispose.signal.aborted || signal.aborted) return true;
+      const conflicts = envList.variables
+        .map((entry) => entry.name)
+        .filter((name) => PROJECT_LAUNCH_ENV_CONFLICTS.has(name.toUpperCase()));
+      if (conflicts.length > 0) {
+        bb.log.warn(
+          `skipping lean Codex overrides for project ${projectId}: project-scoped ${[...new Set(conflicts)].sort().join(", ")} is configured`,
+        );
+        return true;
+      }
+      return false;
+    } catch (error) {
+      if (!providerEnvDispose.signal.aborted) {
+        const label = error instanceof Error ? error.name : "Error";
+        bb.log.warn(`could not inspect project machine environment for ${projectId}: ${label}`);
+      }
+      return true;
+    }
+  }
+
+  function loadHostCodexLaunch(
+    hostId: string,
+  ): Promise<Extract<CodexLaunchConfigResult, { kind: "ready" }> | null> {
+    const rpcBudget = createBoundedSignal(providerEnvDispose.signal, HOST_LAUNCH_RPC_TIMEOUT_MS);
+    let rawCall: PromiseLike<CodexLaunchConfigResult> | CodexLaunchConfigResult;
+    try {
+      rawCall = reviewHost.call("codexLaunchConfig", {}, {
+        hostId,
+        timeoutMs: HOST_LAUNCH_RPC_TIMEOUT_MS,
+        signal: rpcBudget.signal,
+      });
+    } catch (error) {
+      rawCall = Promise.reject(error);
+    }
+    const shared = raceWithAbort(rawCall, rpcBudget.signal)
+      .then((result) => {
+        if (providerEnvDispose.signal.aborted) return null;
+        if (result.kind !== "ready") {
+          bb.log.warn(`lean Codex launch unavailable on ${hostId}: ${result.reason}`);
+          return null;
+        }
+        if (hostLaunchCache.has(hostId)) {
+          hostLaunchCache.delete(hostId);
+        } else if (hostLaunchCache.size >= HOST_LAUNCH_CACHE_MAX) {
+          const oldestHostId = hostLaunchCache.keys().next().value;
+          if (oldestHostId !== undefined) hostLaunchCache.delete(oldestHostId);
+        }
+        hostLaunchCache.set(hostId, {
+          expiresAt: Date.now() + HOST_LAUNCH_CACHE_TTL_MS,
+          value: result,
+        });
+        return result;
+      })
+      .catch((error) => {
+        if (!providerEnvDispose.signal.aborted) {
+          const label = error instanceof Error ? error.name : "Error";
+          bb.log.warn(`codexLaunchConfig failed on ${hostId}: ${label}`);
+        }
+        return null;
+      })
+      .finally(() => {
+        rpcBudget.dispose();
+        if (hostLaunchInFlight.get(hostId) === shared) {
+          hostLaunchInFlight.delete(hostId);
+        }
+      });
+    hostLaunchInFlight.set(hostId, shared);
+    return shared;
+  }
+
+  async function resolveHostCodexLaunch(
+    hostId: string,
+    callerSignal: AbortSignal,
+  ): Promise<Extract<CodexLaunchConfigResult, { kind: "ready" }> | null> {
+    const cached = hostLaunchCache.get(hostId);
+    if (cached !== undefined) {
+      if (cached.expiresAt > Date.now()) {
+        // Refresh LRU order on active hit.
+        hostLaunchCache.delete(hostId);
+        hostLaunchCache.set(hostId, cached);
+        return cached.value;
+      }
+      hostLaunchCache.delete(hostId);
+    }
+
+    const shared = hostLaunchInFlight.get(hostId) ?? loadHostCodexLaunch(hostId);
+    try {
+      return await raceWithAbort(shared, callerSignal);
+    } catch {
+      return null;
+    }
+  }
+
+  bb.providers.experimental_contributeEnv("codex", async (context) => {
+    if (context.threadId === null || isPluginDisposing()) return [];
+    const callerBudget = createBoundedSignal(providerEnvDispose.signal, HOST_LAUNCH_RPC_TIMEOUT_MS);
+    try {
+      if (!(await isSlopCopThread(context.threadId, callerBudget.signal))) return [];
+      if (
+        context.projectId !== null &&
+        (await hasConflictingProjectEnv(context.projectId, callerBudget.signal))
+      ) {
+        return [];
+      }
+      const launch = await resolveHostCodexLaunch(context.hostId, callerBudget.signal);
+      if (launch === null || isPluginDisposing() || callerBudget.signal.aborted) {
+        return [];
+      }
+      return buildLeanCodexEnvEntries(
+        launch.command,
+        buildLeanCodexArgs(launch.baseArgs, launch.mcpServers),
+      );
+    } finally {
+      callerBudget.dispose();
+    }
+  });
 
   let gh: GhClient = createGhClient("gh");
   let ghLogin: string | null = null;
   const inFlight = new Set<string>();
   const spawning = new Set<string>();
 
-  let watcherSignal: AbortSignal | undefined;
   let recoveringReviews: Promise<void> | undefined;
   let provisionDrainRequested = false;
   let wakeProvisionDrain: (() => void) | undefined;
@@ -3174,6 +3405,11 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.service("watcher", {
     async start(signal) {
       watcherSignal = signal;
+      if (signal.aborted) {
+        providerEnvDispose.abort(signal.reason);
+      } else {
+        signal.addEventListener("abort", () => providerEnvDispose.abort(signal.reason), { once: true });
+      }
       try {
         const initial = await readSettings();
         gh = createGhClient(initial.ghPath);
@@ -3214,5 +3450,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(() => {
     bb.log.info("disposed");
+  });
+
+  // Registered last so LIFO disposal aborts provider-env lookups before earlier hooks run.
+  bb.onDispose(() => {
+    providerEnvDispose.abort();
+    threadOriginCache.clear();
+    hostLaunchCache.clear();
+    hostLaunchInFlight.clear();
   });
 }

@@ -1,0 +1,512 @@
+import { defineRpcContract, type ExperimentalPluginProviderEnvEntry } from "@get-bb/plugin-sdk";
+import { accessSync, constants, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
+import { z } from "zod";
+import { reviewDeltaContract } from "./review-delta";
+
+export const LEAN_CODEX_CONFIG_OVERRIDES = [
+  "skills.include_instructions=false",
+  "skills.bundled.enabled=false",
+  "include_collaboration_mode_instructions=false",
+  "include_apps_instructions=false",
+  "features.apps=false",
+  "features.multi_agent=false",
+  "features.multi_agent_v2=false",
+  "agents.enabled=false",
+  "features.memories=false",
+  'web_search="disabled"',
+] as const;
+
+export const codexLaunchContract = defineRpcContract({
+  codexLaunchConfig: {
+    input: z.object({}).strict(),
+    output: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("ready"),
+        command: z.string().min(1),
+        baseArgs: z.array(z.string()),
+        mcpServers: z.array(z.string()),
+      }),
+      z.object({
+        kind: z.literal("unavailable"),
+        reason: z.string().min(1),
+      }),
+    ]),
+  },
+});
+
+export const slopcopHostContract = {
+  ...reviewDeltaContract,
+  ...codexLaunchContract,
+};
+
+export type CodexLaunchConfigResult = z.infer<typeof codexLaunchContract.codexLaunchConfig.output>;
+
+const appServerArgsEnvSchema = z.array(z.string());
+const BARE_KEY_SEGMENT_RE = /^[A-Za-z0-9_-]+/;
+const WINDOWS_PATHEXT_DEFAULT = ".COM;.EXE;.BAT;.CMD";
+
+function skipWhitespace(line: string, index: number): number {
+  let cursor = index;
+  while (cursor < line.length && (line[cursor] === " " || line[cursor] === "\t")) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function parseBasicQuotedSegment(line: string, start: number): { value: string; next: number } | null {
+  let cursor = start + 1;
+  let decoded = "";
+  while (cursor < line.length) {
+    const ch = line[cursor]!;
+    if (ch === '"') {
+      return { value: decoded, next: cursor + 1 };
+    }
+    if (ch === "\\") {
+      cursor += 1;
+      if (cursor >= line.length) return null;
+      const esc = line[cursor]!;
+      switch (esc) {
+        case "\\":
+          decoded += "\\";
+          cursor += 1;
+          break;
+        case '"':
+          decoded += '"';
+          cursor += 1;
+          break;
+        case "b":
+          decoded += "\b";
+          cursor += 1;
+          break;
+        case "f":
+          decoded += "\f";
+          cursor += 1;
+          break;
+        case "n":
+          decoded += "\n";
+          cursor += 1;
+          break;
+        case "r":
+          decoded += "\r";
+          cursor += 1;
+          break;
+        case "t":
+          decoded += "\t";
+          cursor += 1;
+          break;
+        case "e":
+          decoded += "\x1b";
+          cursor += 1;
+          break;
+        case "x": {
+          const hex = line.slice(cursor + 1, cursor + 3);
+          if (hex.length !== 2 || !/^[0-9a-fA-F]{2}$/.test(hex)) return null;
+          decoded += String.fromCharCode(Number.parseInt(hex, 16));
+          cursor += 3;
+          break;
+        }
+        case "u":
+        case "U": {
+          const width = esc === "u" ? 4 : 8;
+          const hex = line.slice(cursor + 1, cursor + 1 + width);
+          if (hex.length !== width || !/^[0-9a-fA-F]+$/.test(hex)) return null;
+          const codePoint = Number.parseInt(hex, 16);
+          if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return null;
+          decoded += String.fromCodePoint(codePoint);
+          cursor += 1 + width;
+          break;
+        }
+        default:
+          return null;
+      }
+      continue;
+    }
+    if (ch.charCodeAt(0) < 0x20 && ch !== "\t") return null;
+    decoded += ch;
+    cursor += 1;
+  }
+  return null;
+}
+
+function parseLiteralQuotedSegment(line: string, start: number): { value: string; next: number } | null {
+  const close = line.indexOf("'", start + 1);
+  if (close === -1) return null;
+  const value = line.slice(start + 1, close);
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 && code !== 0x09) return null;
+  }
+  return { value, next: close + 1 };
+}
+
+function parseTableHeaderSegments(rawLine: string): string[] | null {
+  let cursor = skipWhitespace(rawLine, 0);
+  if (rawLine[cursor] !== "[" || rawLine[cursor + 1] === "[") return null;
+  cursor = skipWhitespace(rawLine, cursor + 1);
+
+  const segments: string[] = [];
+  while (cursor < rawLine.length) {
+    const ch = rawLine[cursor]!;
+    let parsed: { value: string; next: number } | null = null;
+    if (ch === '"') {
+      parsed = parseBasicQuotedSegment(rawLine, cursor);
+    } else if (ch === "'") {
+      parsed = parseLiteralQuotedSegment(rawLine, cursor);
+    } else {
+      const bare = BARE_KEY_SEGMENT_RE.exec(rawLine.slice(cursor))?.[0];
+      if (bare) parsed = { value: bare, next: cursor + bare.length };
+    }
+    if (!parsed) return null;
+    segments.push(parsed.value);
+    cursor = skipWhitespace(rawLine, parsed.next);
+    if (cursor >= rawLine.length) return null;
+    const sep = rawLine[cursor]!;
+    if (sep === "]") {
+      const after = skipWhitespace(rawLine, cursor + 1);
+      if (after >= rawLine.length || rawLine[after] === "#") return segments;
+      return null;
+    }
+    if (sep !== ".") return null;
+    cursor = skipWhitespace(rawLine, cursor + 1);
+  }
+  return null;
+}
+
+type MultilineStringState = "none" | "basic" | "literal";
+
+function countRepeating(line: string, start: number, target: string, maxCount: number): number {
+  let count = 0;
+  while (count < maxCount && line[start + count] === target) {
+    count += 1;
+  }
+  return count;
+}
+
+function advanceMultilineState(line: string, initialState: MultilineStringState): MultilineStringState {
+  let state = initialState;
+  let i = 0;
+  while (i < line.length) {
+    if (state === "basic") {
+      const ch = line[i]!;
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"' && line.startsWith('"""', i)) {
+        i += countRepeating(line, i, '"', 5);
+        state = "none";
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (state === "literal") {
+      if (line[i] === "'" && line.startsWith("'''", i)) {
+        i += countRepeating(line, i, "'", 5);
+        state = "none";
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    const ch = line[i]!;
+    if (ch === "#") break;
+    if (ch === '"' && line.startsWith('"""', i)) {
+      state = "basic";
+      i += 3;
+      continue;
+    }
+    if (ch === "'" && line.startsWith("'''", i)) {
+      state = "literal";
+      i += 3;
+      continue;
+    }
+    if (ch === '"') {
+      i += 1;
+      while (i < line.length) {
+        if (line[i] === "\\") {
+          i += 2;
+        } else if (line[i] === '"') {
+          i += 1;
+          break;
+        } else {
+          i += 1;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      i += 1;
+      while (i < line.length) {
+        if (line[i] === "'") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    i += 1;
+  }
+  return state;
+}
+
+/**
+ * Scan table-header lines only (`[mcp_servers.<name>]` and its subtables) without
+ * parsing the whole file as TOML, skipping lines inside multiline strings and returning
+ * unique sorted top-level server names.
+ */
+export function scanCodexMcpServerNamesFromText(text: string): string[] {
+  const names = new Set<string>();
+  const lines = text.split(/\r?\n/);
+  let multilineState: MultilineStringState = "none";
+  for (let i = 0; i < lines.length; i += 1) {
+    let line = lines[i]!;
+    if (i === 0 && line.startsWith("\uFEFF")) line = line.slice(1);
+    if (multilineState === "none") {
+      const segments = parseTableHeaderSegments(line);
+      if (segments !== null) {
+        if (segments.length >= 2 && segments[0] === "mcp_servers") {
+          names.add(segments[1]!);
+        }
+        continue;
+      }
+    }
+    multilineState = advanceMultilineState(line, multilineState);
+  }
+  return [...names].sort();
+}
+
+export function resolveCodexConfigPath(options: { env?: NodeJS.ProcessEnv; homeDir?: string; configPath?: string } = {}): string {
+  if (options.configPath) return options.configPath;
+  const env = options.env ?? process.env;
+  const codexHome = env.CODEX_HOME;
+  if (codexHome) return path.join(codexHome, "config.toml");
+  return path.join(options.homeDir ?? homedir(), ".codex", "config.toml");
+}
+
+function sanitizeFsErrorCode(error: unknown): string {
+  const raw = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : "";
+  return /^[A-Za-z0-9_]+$/.test(raw) ? raw.toUpperCase() : "READ_ERROR";
+}
+
+/** Read only `[mcp_servers.<name>]` header names from Codex config without surfacing file text. */
+export async function readCodexMcpServerNames(
+  options: { env?: NodeJS.ProcessEnv; homeDir?: string; configPath?: string; signal?: AbortSignal } = {},
+): Promise<{ ok: true; names: string[] } | { ok: false; code: string }> {
+  options.signal?.throwIfAborted();
+  const configPath = resolveCodexConfigPath(options);
+  try {
+    const content = await readFile(configPath, { encoding: "utf8", signal: options.signal });
+    return { ok: true, names: scanCodexMcpServerNamesFromText(content) };
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    const code = sanitizeFsErrorCode(error);
+    if (code === "ENOENT") return { ok: true, names: [] };
+    return { ok: false, code };
+  }
+}
+
+function defaultIsExecutableFile(candidate: string): boolean {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function candidateBinaryNames(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
+  if (platform !== "win32") return ["codex"];
+  const exts = (env.PATHEXT || WINDOWS_PATHEXT_DEFAULT)
+    .split(";")
+    .map((ext) => ext.trim())
+    .filter(Boolean);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const ext of exts) {
+    const dot = ext.startsWith(".") ? ext : `.${ext}`;
+    for (const suffix of [dot.toLowerCase(), dot]) {
+      const candidate = `codex${suffix}`;
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        candidates.push(candidate);
+      }
+    }
+  }
+  candidates.push("codex");
+  return candidates;
+}
+
+function defaultFallbackSearchDirs(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  homeDirOverride?: string,
+  nodePathOverride?: string,
+): string[] {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const home = (platform === "win32" ? env.USERPROFILE : env.HOME) || homeDirOverride || homedir();
+  const nodePath = nodePathOverride ?? process.execPath;
+  const dirs: string[] = [];
+  if (nodePath && /^node(?:\.exe)?$/iu.test(pathApi.basename(nodePath))) {
+    dirs.push(pathApi.dirname(nodePath));
+  }
+  dirs.push(
+    pathApi.join(home, ".local", "bin"),
+    pathApi.join(home, ".local", "share", "mise", "shims"),
+    pathApi.join(home, ".asdf", "shims"),
+    pathApi.join(home, ".asdf", "bin"),
+    pathApi.join(home, ".volta", "bin"),
+  );
+  if (platform === "darwin") dirs.push("/opt/homebrew/bin");
+  if (platform !== "win32") dirs.push("/usr/local/bin", "/usr/bin", "/bin");
+  return dirs;
+}
+
+export type CodexLaunchResolution =
+  | { ok: true; command: string; baseArgs: string[] }
+  | { ok: false; reason: string };
+
+/** Mirror BB `provider-codex`'s `resolveAppServerLaunch` command/args resolution on the target host. */
+export function resolveCodexAppServerLaunch(options: {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  homeDir?: string;
+  nodePath?: string;
+  fallbackDirs?: readonly string[];
+  isExecutableFile?: (candidate: string) => boolean;
+} = {}): CodexLaunchResolution {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const isExecutableFile = options.isExecutableFile ?? defaultIsExecutableFile;
+
+  const overrideCommand = env.BB_CODEX_BRIDGE_APP_SERVER_COMMAND;
+  if (overrideCommand) {
+    const rawArgs = env.BB_CODEX_BRIDGE_APP_SERVER_ARGS;
+    if (!rawArgs) {
+      return { ok: true, command: overrideCommand, baseArgs: [] };
+    }
+    try {
+      const parsed = appServerArgsEnvSchema.safeParse(JSON.parse(rawArgs));
+      if (!parsed.success) return { ok: false, reason: "invalid_app_server_args" };
+      return { ok: true, command: overrideCommand, baseArgs: parsed.data };
+    } catch {
+      return { ok: false, reason: "invalid_app_server_args" };
+    }
+  }
+
+  const pathDelimiter = platform === "win32" ? ";" : ":";
+  const pathDirs = (env.PATH ?? "").split(pathDelimiter).filter(Boolean);
+  const fallbackDirs = options.fallbackDirs ?? defaultFallbackSearchDirs(platform, env, options.homeDir, options.nodePath);
+  const seenDirs = new Set<string>();
+  const names = candidateBinaryNames(platform, env);
+
+  for (const dir of pathDirs) {
+    if (!pathApi.isAbsolute(dir)) {
+      return { ok: false, reason: "relative_path_entry" };
+    }
+    if (seenDirs.has(dir)) continue;
+    seenDirs.add(dir);
+    for (const name of names) {
+      const candidate = pathApi.join(dir, name);
+      if (isExecutableFile(candidate)) {
+        return { ok: true, command: candidate, baseArgs: ["app-server"] };
+      }
+    }
+  }
+
+  for (const dir of fallbackDirs) {
+    if (!dir || seenDirs.has(dir)) continue;
+    seenDirs.add(dir);
+    for (const name of names) {
+      const candidate = pathApi.join(dir, name);
+      if (isExecutableFile(candidate)) {
+        return { ok: true, command: candidate, baseArgs: ["app-server"] };
+      }
+    }
+  }
+
+  return { ok: false, reason: "codex_not_found" };
+}
+
+/** Encode a TOML basic string escaping ASCII control chars including U+007F DEL. */
+export function encodeTomlBasicString(value: string): string {
+  let encoded = '"';
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i]!;
+    const code = value.charCodeAt(i);
+    switch (ch) {
+      case "\\":
+        encoded += "\\\\";
+        break;
+      case '"':
+        encoded += '\\"';
+        break;
+      case "\b":
+        encoded += "\\b";
+        break;
+      case "\f":
+        encoded += "\\f";
+        break;
+      case "\n":
+        encoded += "\\n";
+        break;
+      case "\r":
+        encoded += "\\r";
+        break;
+      case "\t":
+        encoded += "\\t";
+        break;
+      default:
+        if (code < 0x20 || code === 0x7f) {
+          encoded += `\\u${code.toString(16).padStart(4, "0")}`;
+        } else {
+          encoded += ch;
+        }
+        break;
+    }
+  }
+  return encoded + '"';
+}
+
+/**
+ * Codex `-c` dotted-path overrides split on `.` without unquoting quotes, whereas
+ * an inline TOML table under `mcp_servers` merges cleanly for both bare and quoted names.
+ */
+export function buildLeanCodexArgs(baseArgs: readonly string[], mcpServers: readonly string[]): string[] {
+  const args = [...baseArgs];
+  for (const override of LEAN_CODEX_CONFIG_OVERRIDES) {
+    args.push("-c", override);
+  }
+  const uniqueNames = [...new Set(mcpServers)].sort();
+  if (uniqueNames.length > 0) {
+    const entries = uniqueNames.map((name) => `${encodeTomlBasicString(name)}={enabled=false}`).join(",");
+    args.push("-c", `mcp_servers={${entries}}`);
+  }
+  return args;
+}
+
+export function buildLeanCodexEnvEntries(
+  command: string,
+  args: readonly string[],
+): ExperimentalPluginProviderEnvEntry[] {
+  return [
+    {
+      name: "BB_CODEX_BRIDGE_APP_SERVER_COMMAND",
+      value: command,
+      reason: "SlopCop lean Codex reviewer launch binary",
+    },
+    {
+      name: "BB_CODEX_BRIDGE_APP_SERVER_ARGS",
+      value: JSON.stringify(args),
+      reason: "SlopCop lean Codex reviewer launch overrides",
+    },
+  ];
+}
