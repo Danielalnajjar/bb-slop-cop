@@ -417,9 +417,11 @@ describe("codex provider env contribution", () => {
         });
       },
     });
-    harness.inspection.sdk.stub("threads.get", ({ threadId }) =>
-      makeThreadResponse({ id: threadId, originPluginId: "slopcop" }),
-    );
+    let seenThreadSignal: AbortSignal | undefined;
+    harness.inspection.sdk.stub("threads.get", ({ threadId, signal }) => {
+      if (threadId === "thr_dispose_cached") seenThreadSignal = signal;
+      return makeThreadResponse({ id: threadId, originPluginId: "slopcop" });
+    });
     harness.inspection.sdk.stub("projects.machineEnvironment", ({ projectId }) => {
       if (projectId === "proj_slow") {
         return new Promise((resolve) => {
@@ -434,6 +436,7 @@ describe("codex provider env contribution", () => {
     });
 
     await plugin(bb);
+    const watcher = harness.behavior.runService("watcher");
     const registeredResolver = harness.inspection.registrations.providerEnvResolvers.get("codex");
     expect(registeredResolver).toBeTypeOf("function");
 
@@ -446,6 +449,16 @@ describe("codex provider env contribution", () => {
         hostId: "host_cached",
       }),
     ).toHaveLength(2);
+    expect(seenThreadSignal).toBeInstanceOf(AbortSignal);
+
+    let cacheHitDuringDispose: unknown;
+    bb.onDispose(async () => {
+      cacheHitDuringDispose = await registeredResolver!({
+        threadId: "thr_dispose_cached",
+        projectId: null,
+        hostId: "host_cached",
+      });
+    });
 
     const pendingRpc = harness.behavior.resolveProviderEnv("codex", {
       threadId: "thr_dispose",
@@ -464,7 +477,9 @@ describe("codex provider env contribution", () => {
     expect(seenSignal?.aborted).toBe(false);
 
     await harness.lifecycle.dispose();
+    await watcher.done.catch(() => {});
     expect(seenSignal?.aborted).toBe(true);
+    expect(cacheHitDuringDispose).toEqual([]);
 
     resolveRpc({
       kind: "ready",

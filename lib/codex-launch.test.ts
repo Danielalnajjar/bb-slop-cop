@@ -112,6 +112,25 @@ describe("readCodexMcpServerNames", () => {
     }
   });
 
+  it("preserves whitespace in CODEX_HOME without trimming", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "slopcop-codex-ws-"));
+    try {
+      const trimmedDir = join(dir, "home");
+      const spacedDir = join(dir, "home ");
+      mkdirSync(trimmedDir, { recursive: true });
+      mkdirSync(spacedDir, { recursive: true });
+      writeFileSync(join(trimmedDir, "config.toml"), '[mcp_servers.wrong]\ncommand = "true"\n');
+      writeFileSync(join(spacedDir, "config.toml"), '[mcp_servers.right]\ncommand = "true"\n');
+
+      expect(await readCodexMcpServerNames({ env: { CODEX_HOME: spacedDir } })).toEqual({
+        ok: true,
+        names: ["right"],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns only a sanitized error code on unreadable config paths without leaking contents", async () => {
     const dir = mkdtempSync(join(tmpdir(), "slopcop-codex-err-"));
     try {
@@ -231,6 +250,42 @@ describe("resolveCodexAppServerLaunch", () => {
       expect(winFound).toEqual({
         ok: true,
         command: "C:\\shim\\codex.cmd",
+        baseArgs: ["app-server"],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("withholds overrides when PATH contains a relative entry before any absolute match", () => {
+    const dir = mkdtempSync(join(tmpdir(), "slopcop-codex-rel-"));
+    try {
+      const absBin = join(dir, "abs");
+      mkdirSync(absBin, { recursive: true });
+      const absCodex = join(absBin, "codex");
+      writeFileSync(absCodex, "#!/bin/sh\n");
+      chmodSync(absCodex, 0o755);
+
+      expect(
+        resolveCodexAppServerLaunch({
+          platform: "linux",
+          env: { PATH: `tools:${absBin}` },
+          fallbackDirs: [absBin],
+        }),
+      ).toEqual({
+        ok: false,
+        reason: "relative_path_entry",
+      });
+
+      expect(
+        resolveCodexAppServerLaunch({
+          platform: "linux",
+          env: { PATH: `${absBin}:tools` },
+          fallbackDirs: [],
+        }),
+      ).toEqual({
+        ok: true,
+        command: absCodex,
         baseArgs: ["app-server"],
       });
     } finally {

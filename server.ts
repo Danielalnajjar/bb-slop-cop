@@ -298,6 +298,11 @@ export default async function plugin(bb: BbPluginApi) {
   >();
   const hostLaunchInFlight = new Map<string, Promise<Extract<CodexLaunchConfigResult, { kind: "ready" }> | null>>();
   const providerEnvDispose = new AbortController();
+  let watcherSignal: AbortSignal | undefined;
+
+  function isPluginDisposing(): boolean {
+    return providerEnvDispose.signal.aborted || Boolean(watcherSignal?.aborted);
+  }
 
   function createBoundedSignal(parent: AbortSignal, timeoutMs: number): {
     signal: AbortSignal;
@@ -359,7 +364,7 @@ export default async function plugin(bb: BbPluginApi) {
     const cached = threadOriginCache.get(threadId);
     if (cached !== undefined) return cached;
     try {
-      const thread = await raceWithAbort(bb.sdk.threads.get({ threadId }), signal);
+      const thread = await raceWithAbort(bb.sdk.threads.get({ threadId, signal }), signal);
       if (providerEnvDispose.signal.aborted || signal.aborted) return false;
       const isOwned = thread.originPluginId === bb.pluginId;
       if (!threadOriginCache.has(threadId) && threadOriginCache.size >= THREAD_ORIGIN_CACHE_MAX) {
@@ -476,7 +481,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.providers.experimental_contributeEnv("codex", async (context) => {
-    if (context.threadId === null || providerEnvDispose.signal.aborted) return [];
+    if (context.threadId === null || isPluginDisposing()) return [];
     const callerBudget = createBoundedSignal(providerEnvDispose.signal, HOST_LAUNCH_RPC_TIMEOUT_MS);
     try {
       if (!(await isSlopCopThread(context.threadId, callerBudget.signal))) return [];
@@ -487,7 +492,7 @@ export default async function plugin(bb: BbPluginApi) {
         return [];
       }
       const launch = await resolveHostCodexLaunch(context.hostId, callerBudget.signal);
-      if (launch === null || providerEnvDispose.signal.aborted || callerBudget.signal.aborted) {
+      if (launch === null || isPluginDisposing() || callerBudget.signal.aborted) {
         return [];
       }
       return buildLeanCodexEnvEntries(
@@ -499,19 +504,11 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
-  bb.onDispose(() => {
-    providerEnvDispose.abort();
-    threadOriginCache.clear();
-    hostLaunchCache.clear();
-    hostLaunchInFlight.clear();
-  });
-
   let gh: GhClient = createGhClient("gh");
   let ghLogin: string | null = null;
   const inFlight = new Set<string>();
   const spawning = new Set<string>();
 
-  let watcherSignal: AbortSignal | undefined;
   let recoveringReviews: Promise<void> | undefined;
   let provisionDrainRequested = false;
   let wakeProvisionDrain: (() => void) | undefined;
@@ -3408,6 +3405,11 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.service("watcher", {
     async start(signal) {
       watcherSignal = signal;
+      if (signal.aborted) {
+        providerEnvDispose.abort(signal.reason);
+      } else {
+        signal.addEventListener("abort", () => providerEnvDispose.abort(signal.reason), { once: true });
+      }
       try {
         const initial = await readSettings();
         gh = createGhClient(initial.ghPath);
@@ -3448,5 +3450,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(() => {
     bb.log.info("disposed");
+  });
+
+  // Registered last so LIFO disposal aborts provider-env lookups before earlier hooks run.
+  bb.onDispose(() => {
+    providerEnvDispose.abort();
+    threadOriginCache.clear();
+    hostLaunchCache.clear();
+    hostLaunchInFlight.clear();
   });
 }

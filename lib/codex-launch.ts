@@ -283,7 +283,7 @@ export function scanCodexMcpServerNamesFromText(text: string): string[] {
 export function resolveCodexConfigPath(options: { env?: NodeJS.ProcessEnv; homeDir?: string; configPath?: string } = {}): string {
   if (options.configPath) return options.configPath;
   const env = options.env ?? process.env;
-  const codexHome = env.CODEX_HOME?.trim();
+  const codexHome = env.CODEX_HOME;
   if (codexHome) return path.join(codexHome, "config.toml");
   return path.join(options.homeDir ?? homedir(), ".codex", "config.toml");
 }
@@ -408,7 +408,21 @@ export function resolveCodexAppServerLaunch(options: {
   const seenDirs = new Set<string>();
   const names = candidateBinaryNames(platform, env);
 
-  for (const dir of [...pathDirs, ...fallbackDirs]) {
+  for (const dir of pathDirs) {
+    if (!pathApi.isAbsolute(dir)) {
+      return { ok: false, reason: "relative_path_entry" };
+    }
+    if (seenDirs.has(dir)) continue;
+    seenDirs.add(dir);
+    for (const name of names) {
+      const candidate = pathApi.join(dir, name);
+      if (isExecutableFile(candidate)) {
+        return { ok: true, command: candidate, baseArgs: ["app-server"] };
+      }
+    }
+  }
+
+  for (const dir of fallbackDirs) {
     if (!dir || seenDirs.has(dir)) continue;
     seenDirs.add(dir);
     for (const name of names) {
