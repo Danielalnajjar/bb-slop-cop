@@ -29,11 +29,14 @@ import {
   buildCarriedReviewMarker,
   buildMarker,
   decorateBody,
+  markerBelongsToRule,
   markerRuleName,
+  OFF_DIFF_FINDINGS_HEADING,
+  parseAllMarkers,
   parseMarker,
 } from "./lib/marker";
 import { collectPriorComments } from "./lib/prior";
-import { collectCarriedFindings, type CarriedFinding } from "./lib/carry";
+import { CARRIED_SUFFIX, collectCarriedFindings, type CarriedFinding } from "./lib/carry";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome, homeRelative } from "./lib/paths";
 import {
@@ -485,17 +488,71 @@ export default async function plugin(bb: BbPluginApi) {
       announce();
       return { runId: skipped.id, threadId: null };
     }
-    const noChangesRaw = delta?.kind === "patch" && delta.patchBase64 === "";
-    const canCarry = noChangesRaw && prior !== null && prior.status === "commented" && options.force !== true;
-    if (noChangesRaw && !canCarry) {
-      delta = null;
-      scopeNote = formatIncrementalMiss(
-        "unverified_prior",
-        `prior review of ${previousVerifiedHead} had status ${prior?.status ?? "unknown"}`,
-      );
+    async function verifyCarryPrior(
+      targetRule: Rule,
+      targetPrNumber: number,
+      verifiedPrior: NonNullable<ReturnType<Store["latestVerifiedReview"]>>,
+    ): Promise<string | null> {
+      if (verifiedPrior.status !== "commented" || verifiedPrior.finishedAt === null) {
+        return `prior review of ${verifiedPrior.headSha} had status ${verifiedPrior.status}`;
+      }
+      const recorded = store.listComments(verifiedPrior.id);
+      if (recorded.length === 0) {
+        return `prior review ${verifiedPrior.id} recorded no GitHub comments`;
+      }
+      if (recorded.some(c => c.attribution !== "marker" || !c.githubId || (c.kind !== "summary" && c.kind !== "inline"))) {
+        return `prior review ${verifiedPrior.id} has unattributed or incomplete comments`;
+      }
+      try {
+        if (ghLogin === null) {
+          ghLogin = await waitForWork(() => gh.authenticatedLogin()).catch(() => null);
+          watcherSignal?.throwIfAborted();
+        }
+        if (ghLogin === null) {
+          return "could not determine authenticated GitHub login to verify prior review";
+        }
+        const [issues, reviewComments, reviews] = await waitForWork(() => Promise.all([
+          gh.listIssueComments(targetRule.repo, targetPrNumber),
+          gh.listReviewComments(targetRule.repo, targetPrNumber),
+          gh.listReviews(targetRule.repo, targetPrNumber),
+        ]));
+        const liveSummaries = [...issues, ...reviews];
+        for (const entry of recorded) {
+          const pool = entry.kind === "inline" ? reviewComments : liveSummaries;
+          const matched = pool.find(comment =>
+            comment.id === entry.githubId &&
+            comment.author === ghLogin &&
+            parseAllMarkers(comment.body).some(marker =>
+              markerBelongsToRule(marker, targetRule.name) &&
+              marker.run === verifiedPrior.id &&
+              marker.sha === verifiedPrior.headSha &&
+              marker.kind === entry.kind
+            ),
+          );
+          if (matched === undefined) {
+            return `prior review ${verifiedPrior.id} comment ${entry.githubId} (${entry.kind}) could not be verified on GitHub for head ${verifiedPrior.headSha}`;
+          }
+        }
+        return null;
+      } catch (error) {
+        watcherSignal?.throwIfAborted();
+        return `could not verify prior review ${verifiedPrior.id} on GitHub: ${error instanceof Error ? error.message : String(error)}`;
+      }
     }
-    if (canCarry) {
-      scopeNote = `${delta?.kind === "patch" && delta.baseMerged ? "carried: base merge with no" : "carried: no"} PR-owned changes since ${prior.headSha}`;
+
+    const noChangesRaw = delta?.kind === "patch" && delta.patchBase64 === "";
+    let canCarry = false;
+    if (noChangesRaw && options.force !== true) {
+      const priorMiss = prior === null
+        ? "no prior verified review found"
+        : await verifyCarryPrior(rule, prNumber, prior);
+      if (priorMiss === null) {
+        canCarry = true;
+        scopeNote = `${delta?.kind === "patch" && delta.baseMerged ? "carried: base merge with no" : "carried: no"} PR-owned changes since ${prior!.headSha}`;
+      } else {
+        delta = null;
+        scopeNote = formatIncrementalMiss("unverified_prior", priorMiss);
+      }
     }
     const pending = deferred();
     if (trigger !== "manual" && (
@@ -512,7 +569,7 @@ export default async function plugin(bb: BbPluginApi) {
     // perfectly ordinary review and the override is invisible in hindsight.
     const forcedReason = options.forcedReason ?? null;
     const detail = canCarry
-      ? `Carried review from ${prior.headSha.slice(0, 7)} (no PR-owned changes)`
+      ? `Carried review from ${prior!.headSha.slice(0, 7)} (no PR-owned changes)`
       : forcedReason === null ? null : `forced past the gate — ${forcedReason}`;
     const reservation = store.atomic(() => {
       const admitted = store.admitRun({
@@ -556,7 +613,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await Promise.all(replaced.map(run => finalizeRun(run)));
     if (canCarry) {
-      await carryReview(rule, pullRequest, reservation, prior.headSha, baseRefOid!);
+      await carryReview(rule, pullRequest, reservation, prior!.headSha, baseRefOid!);
       return { runId, threadId: null };
     }
     return startReview(rule, pullRequest, reservation, dispatchOptions, values, promoted, {
@@ -580,19 +637,18 @@ export default async function plugin(bb: BbPluginApi) {
       sha: run.headSha,
       kind: "summary" as const,
     };
-    const carriedMessage =
-      `No PR-owned changes since verified head \`${priorHeadSha.slice(0, 7)}\`; carried prior review.\n\n` +
-      buildCarriedReviewMarker(priorHeadSha);
+    const carriedTag = buildCarriedReviewMarker(priorHeadSha);
+    const carriedNote = `No PR-owned changes since verified head \`${priorHeadSha.slice(0, 7)}\`; carried prior review.`;
     const buildCarriedSummary = (carried: CarriedFinding[]) => {
-      const decorated = decorateBody(carriedMessage, "summary", canonicalMarker);
-      const formatted = summaryToPost({
-        rule: rule.name,
-        runId: run.id,
-        sha: run.headSha,
-        finalMessage: decorated,
-        carried,
-      });
-      return formatted?.body ?? decorated;
+      if (carried.length === 0) {
+        return `${decorateBody(carriedNote, "summary", canonicalMarker)}\n${carriedTag}`;
+      }
+      const findingsBlock = `${OFF_DIFF_FINDINGS_HEADING}\n\n${carried.map(finding => `${finding.text} ${CARRIED_SUFFIX}`).join("\n")}`;
+      return `${decorateBody(findingsBlock, "summary", canonicalMarker)}\n${carriedTag}\n\n${carriedNote}`;
+    };
+    const stillDispatched = () => {
+      const current = store.getRun(run.id);
+      return current !== null && isReviewInProgress(current);
     };
 
     if (run.mode === "shadow") {
@@ -607,6 +663,7 @@ export default async function plugin(bb: BbPluginApi) {
           }`,
         );
       }
+      if (!stillDispatched()) return;
       const summaryBody = buildCarriedSummary(carried);
       const shadow = verifyShadow({ runId: run.id, finalMessage: summaryBody });
       store.replaceComments(run.id, shadow.comments);
@@ -616,7 +673,8 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: shadow.comments.length,
         finishedAt: null,
       });
-      await finalizeRun(store.getRun(run.id)!);
+      const latest = store.getRun(run.id);
+      if (latest !== null && latest.finishedAt === null) await finalizeRun(latest);
       bb.log.info(`run ${run.id} (${rule.name} #${pullRequest.number}) -> ${shadow.status} (carried from ${priorHeadSha.slice(0, 7)})`);
       return;
     }
@@ -635,6 +693,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
     try {
       const read = await readCarry(run);
+      if (!stillDispatched()) return;
       const summaryBody = buildCarriedSummary(read.carried);
       await waitForWork(() => gh.request(
         "POST",
@@ -646,6 +705,7 @@ export default async function plugin(bb: BbPluginApi) {
         await sleep(4_000, watcherSignal);
         result = await waitForWork(() => runVerify());
       }
+      if (!stillDispatched()) return;
       store.replaceComments(run.id, result.comments);
       if (result.status !== "commented") {
         store.updateRun(run.id, {
@@ -664,6 +724,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     } catch (error) {
       watcherSignal?.throwIfAborted();
+      if (!stillDispatched()) return;
       const detail = error instanceof Error ? error.message : String(error);
       store.updateRun(run.id, {
         status: "failed",
@@ -672,7 +733,8 @@ export default async function plugin(bb: BbPluginApi) {
       });
       bb.log.error(`carry review failed for run ${run.id}: ${detail}`);
     }
-    await finalizeRun(store.getRun(run.id)!);
+    const latest = store.getRun(run.id);
+    if (latest !== null && latest.finishedAt === null) await finalizeRun(latest);
     bb.log.info(`run ${run.id} (${rule.name} #${pullRequest.number}) -> ${store.getRun(run.id)?.status} (carried from ${priorHeadSha.slice(0, 7)})`);
   }
 
@@ -2929,13 +2991,15 @@ export default async function plugin(bb: BbPluginApi) {
           });
           const run = store.getRun(dispatched.runId);
           const skippedReason = run?.status === "skipped" ? run.detail : null;
-          const carriedFrom = run?.scopeNote?.startsWith("carried:") ? run.previousVerifiedHead : null;
+          const carriedFrom = run?.scopeNote?.startsWith("carried:") &&
+            (run.status === "commented" || run.status === "shadowed")
+            ? run.previousVerifiedHead
+            : null;
           return ok(
             json
               ? JSON.stringify({
                 ...dispatched, headSha: pullRequest.headRefOid, skippedReason,
                 carriedFrom,
-                noChangesReason: run?.status === "no_pr_changes" ? run.detail : null,
               }, null, 2)
               : skippedReason !== null
                 ? `Skipped ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${skippedReason}`
@@ -2943,8 +3007,8 @@ export default async function plugin(bb: BbPluginApi) {
                   ? `Queued ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
                 : carriedFrom !== null
                   ? `Carried ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} from=${carriedFrom} run=${dispatched.runId}`
-                : run?.status === "no_pr_changes"
-                  ? `Not reviewed ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail}`
+                : run?.status === "failed"
+                  ? `Failed ${rule.name} for #${prNumber}. head=${pullRequest.headRefOid} run=${dispatched.runId}: ${run.detail ?? "unknown error"}`
                 : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). head=${pullRequest.headRefOid} run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }

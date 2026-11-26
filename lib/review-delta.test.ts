@@ -249,6 +249,59 @@ it("carries conflict-free rebases with no PR-owned changes and widens rebases wi
       reason: "history_changed",
       detail: `reviewed head ${conflictPrior} is not an ancestor of ${conflictRebaseHead}`,
     });
+
+    // Dropping two canceling commits (+x then -x) must widen, not carry.
+    git("switch", "-c", "feature-cancel", priorBase);
+    write("cancel.txt", "added");
+    commit("add cancel");
+    write("cancel.txt", "removed");
+    const cancelPrior = commit("revert cancel");
+    git("switch", "-c", "rebased-dropped", base);
+    const droppedHead = git("rev-parse", "HEAD");
+    expect(await delta(cancelPrior, priorBase, base, droppedHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${cancelPrior} is not an ancestor of ${droppedHead}`,
+    });
+
+    // A per-commit conflict whose later commit cancels it out must widen on replay.
+    git("switch", "-c", "feature-step-conflict", priorBase);
+    write("shared.txt", "side A");
+    commit("edit shared");
+    write("shared.txt", "shared v0");
+    const stepConflictPrior = commit("revert shared back");
+    git("switch", "-c", "rebased-step-conflict", conflictBase);
+    write("shared.txt", "temp manual conflict resolution");
+    commit("re-apply conflicting edit manually");
+    write("shared.txt", "main side");
+    const stepConflictHead = commit("re-apply clean end");
+    expect(await delta(stepConflictPrior, priorBase, conflictBase, stepConflictHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${stepConflictPrior} is not an ancestor of ${stepConflictHead}`,
+    });
+
+    // Criss-cross multiple merge bases on a direct descendant must widen.
+    git("switch", "-c", "cc-left", priorBase);
+    write("left.txt", "left");
+    const ccLeft = commit("cc left");
+    git("switch", "-c", "cc-right", priorBase);
+    write("right.txt", "right");
+    const ccRight = commit("cc right");
+    git("switch", "-c", "cc-a", ccLeft);
+    git("merge", "--no-ff", "-m", "merge right into left", ccRight);
+    const ccPrior = git("rev-parse", "HEAD");
+    git("switch", "-c", "cc-b", ccRight);
+    git("merge", "--no-ff", "-m", "merge left into right", ccLeft);
+    const ccBase = git("rev-parse", "HEAD");
+    git("switch", "-c", "cc-head", ccPrior);
+    git("merge", "--no-ff", "-m", "merge ccBase into ccPrior", ccBase);
+    const ccHead = git("rev-parse", "HEAD");
+    expect(await delta(ccPrior, priorBase, ccBase, ccHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `multiple or missing merge bases between ${ccPrior} and ${ccBase}`,
+    });
   } finally {
     await harness.experimental_dispose();
     rmSync(sourcePath, { recursive: true, force: true });

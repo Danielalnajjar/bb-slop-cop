@@ -64,8 +64,10 @@ it("resumes reviews queued before review bases were recorded without their cache
   });
   expect(store.getRun("run_follow")?.previousVerifiedHead).toBe("a".repeat(40));
   expect(store.latestVerifiedReview("rule_1", "acme/widgets", 7)).toEqual({
+    id: "run_follow",
     headSha: "c".repeat(40),
     baseSha: null,
     status: "commented_partial",
+    finishedAt: 5,
   });
 });

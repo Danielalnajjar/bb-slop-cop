@@ -1271,4 +1271,76 @@ describe("follow-up notes filtering", () => {
       kind: "summary",
     });
   });
+
+  it("drops fenced code blocks inside notes without leaking and keeps 4-backtick examples with blank lines verbatim", () => {
+    const body = [
+      buildHeader("summary", "placecard-pr-review"),
+      "",
+      "Example with nested fence and blank lines:",
+      "",
+      "````md",
+      "```md",
+      "### Findings outside the PR diff",
+      "",
+      "",
+      "```",
+      "````",
+      "",
+      "### Follow-up notes",
+      "- `ui.ts:1`: optional note.",
+      "",
+      "#### Sub-note",
+      "```ts",
+      "const leaked = 1;",
+      "```",
+      "",
+      "---",
+      "- `ui.ts:2`: trailing note after rule.",
+      "",
+      "### Findings outside the PR diff",
+      "- `billing.ts:40`: real off-diff bug.",
+      "",
+      "### Resolved since the last review",
+      "- `old.ts:3`: fixed.",
+      "",
+      marker,
+    ].join("\n");
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: body,
+      isFollowUp: true,
+    });
+    expect(result?.hasOffDiffFindings).toBe(true);
+    expect(result?.body).not.toContain("const leaked = 1;");
+    expect(result?.body).not.toContain("Sub-note");
+    expect(result?.body).not.toContain("optional note");
+    expect(result?.body).not.toContain("trailing note after rule");
+    expect(result?.body).toContain("````md\n```md\n### Findings outside the PR diff\n\n\n```\n````");
+    expect(result?.body).toContain("### Resolved since the last review");
+    expect(result?.body).toContain("real off-diff bug");
+    expect(PLACECARD_MARKER_RE.test(result?.body ?? "")).toBe(true);
+  });
+
+  it("keeps carried review note and slopcop-carried marker out of Placecard offDiffSection", () => {
+    const body = [
+      decorateBody(
+        "### Findings outside the PR diff\n\n- `billing.ts:12`: double charge. _(carried forward without a re-check)_",
+        "summary",
+        { rule: "placecard-pr-review", run: "run_2", sha, kind: "summary" },
+      ),
+      `<!-- slopcop-carried:from=${"b".repeat(40)} -->`,
+      "",
+      "No PR-owned changes since verified head `bbbbbbb`; carried prior review.",
+    ].join("\n");
+    const match = PLACECARD_MARKER_RE.exec(body);
+    expect(match).not.toBeNull();
+    const prefixLines = body.slice(0, match!.index).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const headingIdx = prefixLines.indexOf("### Findings outside the PR diff");
+    expect(headingIdx).toBeGreaterThanOrEqual(0);
+    expect(prefixLines.slice(headingIdx + 1)).toEqual([
+      "- `billing.ts:12`: double charge. _(carried forward without a re-check)_",
+    ]);
+  });
 });

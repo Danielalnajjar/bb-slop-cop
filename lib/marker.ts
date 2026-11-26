@@ -66,6 +66,17 @@ export function parseMarker(body: string): Marker | null {
   return { rule, run, sha: fields.get("sha") ?? "", kind };
 }
 
+/** Parses every valid SlopCop marker embedded in a comment body. */
+export function parseAllMarkers(body: string): Marker[] {
+  const globalPattern = new RegExp(MARKER_PATTERN.source, "g");
+  const markers: Marker[] = [];
+  for (const match of body.matchAll(globalPattern)) {
+    const parsed = parseMarker(match[0]);
+    if (parsed !== null) markers.push(parsed);
+  }
+  return markers;
+}
+
 /**
  * Replaces the body's marker with `marker`.
  *
@@ -141,4 +152,23 @@ export function attributeBody(body: string, runId: string): Attribution {
   if (marker !== null) return marker.run === runId ? "marker" : null;
   if (hasVisibleHeader(body)) return "header";
   return null;
+}
+
+export interface FenceState {
+  char: "`" | "~";
+  len: number;
+}
+
+/** Matches a CommonMark opening code fence (` ``` ` / `~~~` or longer) on a trimmed line. */
+export function matchFenceOpen(trimmed: string): FenceState | null {
+  const match = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+  if (match === null) return null;
+  const char = match[1]![0]! as "`" | "~";
+  if (char === "`" && (match[2] ?? "").includes("`")) return null;
+  return { char, len: match[1]!.length };
+}
+
+/** True only when a trimmed line closes an active CommonMark fence of the same char and >= length. */
+export function isFenceClose(trimmed: string, fence: FenceState): boolean {
+  return new RegExp(`^${fence.char}{${fence.len},}[ \\t]*$`).test(trimmed);
 }

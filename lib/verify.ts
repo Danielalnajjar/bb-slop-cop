@@ -11,10 +11,14 @@ import {
   decorateBody,
   hasVisibleHeader,
   headerRuleName,
+  isFenceClose,
   markerBelongsToRule,
+  matchFenceOpen,
   OFF_DIFF_FINDINGS_HEADING,
   parseMarker,
+  RESOLVED_FINDINGS_HEADING,
   restampMarker,
+  type FenceState,
 } from "./marker";
 import { CARRIED_SUFFIX, findingKey, findSection, summaryFindings, type CarriedFinding } from "./carry";
 import type { GhClient, GhComment } from "./gh";
@@ -220,8 +224,10 @@ export function incompleteReviewReason(finalMessage: string | null): string | nu
  * and with no usable body SlopCop writes the summary itself, so a carried
  * finding can only leave the latest summary through a reviewer's resolution.
  */
-const FOLLOW_UP_NOTES_HEADING =
-  /^(?:#{1,6}\s+(?:follow-up notes|non-blocking notes|notes(?:\s+outside\s+[^:\n]*)?)|(?:\*\*)(?:follow-up notes|non-blocking notes|notes(?:\s+outside\s+[^*:\n]*)?):?(?:\*\*))(?:\s*[:—-].*|\s*\([^)]*\)\s*:?)?\s*$/i;
+const ATX_NOTES_HEADING =
+  /^(#{1,6})\s+(?:follow-up notes|non-blocking notes|notes(?:\s+outside\s+[^:\n]*)?)(?:\s*[:—-].*|\s*\([^)]*\)\s*:?)?\s*$/i;
+const BOLD_NOTES_HEADING =
+  /^\*\*(?:follow-up notes|non-blocking notes|notes(?:\s+outside\s+[^*:\n]*)?):?\*\*(?:\s*[:—-].*|\s*\([^)]*\)\s*:?)?\s*$/i;
 
 /** Drops non-must-fix notes blocks outside code fences on follow-up summaries. */
 export function stripFollowUpNotes(
@@ -233,41 +239,71 @@ export function stripFollowUpNotes(
   const markerLineIndex = lines.findIndex(line => line.includes(markerText));
   const headEnd = markerLineIndex === -1 ? lines.length : markerLineIndex;
   const kept: string[] = [];
-  let fence: string | null = null;
+  let fence: FenceState | null = null;
   let skippingNotes = false;
+  let notesHeading: { isBold: boolean; level: number } | null = null;
 
   for (const line of lines.slice(0, headEnd)) {
     const trimmed = line.trim();
-    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
-    if (fenceMatch !== null) {
-      if (fence === null) fence = fenceMatch[1]![0]!;
-      else if (trimmed.startsWith(fence.repeat(3))) fence = null;
+    if (fence !== null) {
+      if (isFenceClose(trimmed, fence)) fence = null;
       if (!skippingNotes) kept.push(line);
       continue;
     }
-    if (fence === null) {
-      if (FOLLOW_UP_NOTES_HEADING.test(trimmed)) {
-        skippingNotes = true;
-        continue;
+    const open = matchFenceOpen(trimmed);
+    if (open !== null) {
+      fence = open;
+      if (!skippingNotes) kept.push(line);
+      continue;
+    }
+    const atxNotes = ATX_NOTES_HEADING.exec(trimmed);
+    if (atxNotes !== null) {
+      const level = atxNotes[1]!.length;
+      if (!skippingNotes || notesHeading === null || level <= notesHeading.level) {
+        notesHeading = { isBold: false, level };
       }
-      if (skippingNotes) {
-        if (
-          /^#{1,6}\s+\S/.test(trimmed) ||
-          trimmed.startsWith("<!--") ||
-          /^[-*_]{3,}$/.test(trimmed)
-        ) {
-          skippingNotes = false;
-        } else {
-          continue;
-        }
+      skippingNotes = true;
+      continue;
+    }
+    if (BOLD_NOTES_HEADING.test(trimmed)) {
+      if (!skippingNotes) notesHeading = { isBold: true, level: 3 };
+      skippingNotes = true;
+      continue;
+    }
+    if (skippingNotes) {
+      const heading = /^(#{1,6})\s+\S/.exec(trimmed);
+      const endsByHeading =
+        heading !== null && heading[1]!.length <= (notesHeading!.isBold ? 2 : notesHeading!.level);
+      if (
+        trimmed === OFF_DIFF_FINDINGS_HEADING ||
+        trimmed === RESOLVED_FINDINGS_HEADING ||
+        endsByHeading
+      ) {
+        skippingNotes = false;
+        notesHeading = null;
+      } else {
+        continue;
       }
     }
     kept.push(line);
   }
 
   const collapsed: string[] = [];
+  let collapseFence: FenceState | null = null;
   for (const line of kept) {
-    if (line.trim() === "" && (collapsed.length === 0 || collapsed.at(-1)!.trim() === "")) continue;
+    const trimmed = line.trim();
+    if (collapseFence !== null) {
+      if (isFenceClose(trimmed, collapseFence)) collapseFence = null;
+      collapsed.push(line);
+      continue;
+    }
+    const open = matchFenceOpen(trimmed);
+    if (open !== null) {
+      collapseFence = open;
+      collapsed.push(line);
+      continue;
+    }
+    if (trimmed === "" && (collapsed.length === 0 || collapsed.at(-1)!.trim() === "")) continue;
     collapsed.push(line);
   }
   while (collapsed.length > 0 && collapsed.at(-1)!.trim() === "") collapsed.pop();

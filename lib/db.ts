@@ -692,18 +692,20 @@ export function createStore(db: Database) {
       return row !== undefined;
     },
 
-    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { headSha: string; baseSha: string | null; status: RunStatus } | null {
+    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { id: string; headSha: string; baseSha: string | null; status: RunStatus; finishedAt: number | null } | null {
       const row = db.prepare(
-        `SELECT head_sha, review_base_sha, status FROM runs
+        `SELECT id, head_sha, review_base_sha, status, finished_at FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ? AND ${VERIFIED_REVIEW}
            AND head_sha != ''
          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
       ).get(ruleId, repo, prNumber) as Row | undefined;
       if (row === undefined) return null;
       return {
+        id: text(row, "id"),
         headSha: text(row, "head_sha"),
         baseSha: typeof row.review_base_sha === "string" ? row.review_base_sha : null,
         status: text(row, "status", "commented") as RunStatus,
+        finishedAt: typeof row.finished_at === "number" ? row.finished_at : null,
       };
     },
 
