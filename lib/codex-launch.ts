@@ -2,7 +2,7 @@ import { defineRpcContract, type ExperimentalPluginProviderEnvEntry } from "@get
 import { accessSync, constants, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import path from "node:path";
 import { z } from "zod";
 import { reviewDeltaContract } from "./review-delta";
 
@@ -97,6 +97,17 @@ function parseBasicQuotedSegment(line: string, start: number): { value: string; 
           decoded += "\t";
           cursor += 1;
           break;
+        case "e":
+          decoded += "\x1b";
+          cursor += 1;
+          break;
+        case "x": {
+          const hex = line.slice(cursor + 1, cursor + 3);
+          if (hex.length !== 2 || !/^[0-9a-fA-F]{2}$/.test(hex)) return null;
+          decoded += String.fromCharCode(Number.parseInt(hex, 16));
+          cursor += 3;
+          break;
+        }
         case "u":
         case "U": {
           const width = esc === "u" ? 4 : 8;
@@ -164,20 +175,107 @@ function parseTableHeaderSegments(rawLine: string): string[] | null {
   return null;
 }
 
+type MultilineStringState = "none" | "basic" | "literal";
+
+function countRepeating(line: string, start: number, target: string, maxCount: number): number {
+  let count = 0;
+  while (count < maxCount && line[start + count] === target) {
+    count += 1;
+  }
+  return count;
+}
+
+function advanceMultilineState(line: string, initialState: MultilineStringState): MultilineStringState {
+  let state = initialState;
+  let i = 0;
+  while (i < line.length) {
+    if (state === "basic") {
+      const ch = line[i]!;
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === '"' && line.startsWith('"""', i)) {
+        i += countRepeating(line, i, '"', 5);
+        state = "none";
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (state === "literal") {
+      if (line[i] === "'" && line.startsWith("'''", i)) {
+        i += countRepeating(line, i, "'", 5);
+        state = "none";
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    const ch = line[i]!;
+    if (ch === "#") break;
+    if (ch === '"' && line.startsWith('"""', i)) {
+      state = "basic";
+      i += 3;
+      continue;
+    }
+    if (ch === "'" && line.startsWith("'''", i)) {
+      state = "literal";
+      i += 3;
+      continue;
+    }
+    if (ch === '"') {
+      i += 1;
+      while (i < line.length) {
+        if (line[i] === "\\") {
+          i += 2;
+        } else if (line[i] === '"') {
+          i += 1;
+          break;
+        } else {
+          i += 1;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      i += 1;
+      while (i < line.length) {
+        if (line[i] === "'") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    i += 1;
+  }
+  return state;
+}
+
 /**
  * Scan table-header lines only (`[mcp_servers.<name>]` and its subtables) without
- * parsing the whole file as TOML, returning unique sorted top-level server names.
+ * parsing the whole file as TOML, skipping lines inside multiline strings and returning
+ * unique sorted top-level server names.
  */
 export function scanCodexMcpServerNamesFromText(text: string): string[] {
   const names = new Set<string>();
   const lines = text.split(/\r?\n/);
+  let multilineState: MultilineStringState = "none";
   for (let i = 0; i < lines.length; i += 1) {
     let line = lines[i]!;
     if (i === 0 && line.startsWith("\uFEFF")) line = line.slice(1);
-    const segments = parseTableHeaderSegments(line);
-    if (segments !== null && segments.length >= 2 && segments[0] === "mcp_servers" && segments[1]!.length > 0) {
-      names.add(segments[1]!);
+    if (multilineState === "none") {
+      const segments = parseTableHeaderSegments(line);
+      if (segments !== null) {
+        if (segments.length >= 2 && segments[0] === "mcp_servers") {
+          names.add(segments[1]!);
+        }
+        continue;
+      }
     }
+    multilineState = advanceMultilineState(line, multilineState);
   }
   return [...names].sort();
 }
@@ -186,8 +284,8 @@ export function resolveCodexConfigPath(options: { env?: NodeJS.ProcessEnv; homeD
   if (options.configPath) return options.configPath;
   const env = options.env ?? process.env;
   const codexHome = env.CODEX_HOME?.trim();
-  if (codexHome) return join(codexHome, "config.toml");
-  return join(options.homeDir ?? homedir(), ".codex", "config.toml");
+  if (codexHome) return path.join(codexHome, "config.toml");
+  return path.join(options.homeDir ?? homedir(), ".codex", "config.toml");
 }
 
 function sanitizeFsErrorCode(error: unknown): string {
@@ -230,7 +328,45 @@ function candidateBinaryNames(platform: NodeJS.Platform, env: NodeJS.ProcessEnv)
     .split(";")
     .map((ext) => ext.trim())
     .filter(Boolean);
-  return ["codex", ...exts.map((ext) => `codex${ext.startsWith(".") ? ext : `.${ext}`}`)];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const ext of exts) {
+    const dot = ext.startsWith(".") ? ext : `.${ext}`;
+    for (const suffix of [dot.toLowerCase(), dot]) {
+      const candidate = `codex${suffix}`;
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        candidates.push(candidate);
+      }
+    }
+  }
+  candidates.push("codex");
+  return candidates;
+}
+
+function defaultFallbackSearchDirs(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  homeDirOverride?: string,
+  nodePathOverride?: string,
+): string[] {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const home = (platform === "win32" ? env.USERPROFILE : env.HOME) || homeDirOverride || homedir();
+  const nodePath = nodePathOverride ?? process.execPath;
+  const dirs: string[] = [];
+  if (nodePath && /^node(?:\.exe)?$/iu.test(pathApi.basename(nodePath))) {
+    dirs.push(pathApi.dirname(nodePath));
+  }
+  dirs.push(
+    pathApi.join(home, ".local", "bin"),
+    pathApi.join(home, ".local", "share", "mise", "shims"),
+    pathApi.join(home, ".asdf", "shims"),
+    pathApi.join(home, ".asdf", "bin"),
+    pathApi.join(home, ".volta", "bin"),
+  );
+  if (platform === "darwin") dirs.push("/opt/homebrew/bin");
+  if (platform !== "win32") dirs.push("/usr/local/bin", "/usr/bin", "/bin");
+  return dirs;
 }
 
 export type CodexLaunchResolution =
@@ -241,16 +377,20 @@ export type CodexLaunchResolution =
 export function resolveCodexAppServerLaunch(options: {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
+  homeDir?: string;
+  nodePath?: string;
+  fallbackDirs?: readonly string[];
   isExecutableFile?: (candidate: string) => boolean;
 } = {}): CodexLaunchResolution {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
   const isExecutableFile = options.isExecutableFile ?? defaultIsExecutableFile;
 
-  const overrideCommand = env.BB_CODEX_BRIDGE_APP_SERVER_COMMAND?.trim();
+  const overrideCommand = env.BB_CODEX_BRIDGE_APP_SERVER_COMMAND;
   if (overrideCommand) {
     const rawArgs = env.BB_CODEX_BRIDGE_APP_SERVER_ARGS;
-    if (rawArgs === undefined) {
+    if (!rawArgs) {
       return { ok: true, command: overrideCommand, baseArgs: [] };
     }
     try {
@@ -262,14 +402,17 @@ export function resolveCodexAppServerLaunch(options: {
     }
   }
 
-  const pathValue = env.PATH ?? "";
-  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const pathDelimiter = platform === "win32" ? ";" : ":";
+  const pathDirs = (env.PATH ?? "").split(pathDelimiter).filter(Boolean);
+  const fallbackDirs = options.fallbackDirs ?? defaultFallbackSearchDirs(platform, env, options.homeDir, options.nodePath);
+  const seenDirs = new Set<string>();
   const names = candidateBinaryNames(platform, env);
-  for (const dir of pathValue.split(pathDelimiter)) {
-    const trimmed = dir.trim();
-    if (!trimmed) continue;
+
+  for (const dir of [...pathDirs, ...fallbackDirs]) {
+    if (!dir || seenDirs.has(dir)) continue;
+    seenDirs.add(dir);
     for (const name of names) {
-      const candidate = join(trimmed, name);
+      const candidate = pathApi.join(dir, name);
       if (isExecutableFile(candidate)) {
         return { ok: true, command: candidate, baseArgs: ["app-server"] };
       }
@@ -277,6 +420,46 @@ export function resolveCodexAppServerLaunch(options: {
   }
 
   return { ok: false, reason: "codex_not_found" };
+}
+
+/** Encode a TOML basic string escaping ASCII control chars including U+007F DEL. */
+export function encodeTomlBasicString(value: string): string {
+  let encoded = '"';
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i]!;
+    const code = value.charCodeAt(i);
+    switch (ch) {
+      case "\\":
+        encoded += "\\\\";
+        break;
+      case '"':
+        encoded += '\\"';
+        break;
+      case "\b":
+        encoded += "\\b";
+        break;
+      case "\f":
+        encoded += "\\f";
+        break;
+      case "\n":
+        encoded += "\\n";
+        break;
+      case "\r":
+        encoded += "\\r";
+        break;
+      case "\t":
+        encoded += "\\t";
+        break;
+      default:
+        if (code < 0x20 || code === 0x7f) {
+          encoded += `\\u${code.toString(16).padStart(4, "0")}`;
+        } else {
+          encoded += ch;
+        }
+        break;
+    }
+  }
+  return encoded + '"';
 }
 
 /**
@@ -288,9 +471,9 @@ export function buildLeanCodexArgs(baseArgs: readonly string[], mcpServers: read
   for (const override of LEAN_CODEX_CONFIG_OVERRIDES) {
     args.push("-c", override);
   }
-  const uniqueNames = [...new Set(mcpServers.filter((name) => name.length > 0))].sort();
+  const uniqueNames = [...new Set(mcpServers)].sort();
   if (uniqueNames.length > 0) {
-    const entries = uniqueNames.map((name) => `${JSON.stringify(name)}={enabled=false}`).join(",");
+    const entries = uniqueNames.map((name) => `${encodeTomlBasicString(name)}={enabled=false}`).join(",");
     args.push("-c", `mcp_servers={${entries}}`);
   }
   return args;
