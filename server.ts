@@ -17,7 +17,13 @@ import { createStore, MIGRATIONS, SUPERSEDED_DETAIL, WAITING_CANCELLED_DETAIL, t
 import { buildPrompt, buildThreadTitle, type DispatchContext } from "./lib/dispatch";
 import { buildReviewEnvironment, resolveReviewMachine } from "./lib/review-input";
 import {
-  formatIncrementalMiss, MAX_ATTACHED_PATCH_BYTES, reviewDeltaContract, type ReviewDelta,
+  buildLeanCodexArgs,
+  buildLeanCodexEnvEntries,
+  slopcopHostContract,
+  type CodexLaunchConfigResult,
+} from "./lib/codex-launch";
+import {
+  formatIncrementalMiss, MAX_ATTACHED_PATCH_BYTES, type ReviewDelta,
 } from "./lib/review-delta";
 import {
   archiveReviewThread,
@@ -270,7 +276,110 @@ export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   const store: Store = createStore(db as never);
-  const reviewHost = bb.hosts.experimental_client({ contract: reviewDeltaContract });
+  const reviewHost = bb.hosts.experimental_client({ contract: slopcopHostContract });
+
+  const THREAD_ORIGIN_CACHE_MAX = 512;
+  const HOST_LAUNCH_CACHE_MAX = 64;
+  const HOST_LAUNCH_CACHE_TTL_MS = 30_000;
+  const HOST_LAUNCH_RPC_TIMEOUT_MS = 3_000;
+  const threadOriginCache = new Map<string, boolean>();
+  const hostLaunchCache = new Map<
+    string,
+    { expiresAt: number; value: Extract<CodexLaunchConfigResult, { kind: "ready" }> }
+  >();
+  const hostLaunchInFlight = new Map<string, Promise<CodexLaunchConfigResult>>();
+  const providerEnvDispose = new AbortController();
+
+  async function isSlopCopThread(threadId: string): Promise<boolean> {
+    const cached = threadOriginCache.get(threadId);
+    if (cached !== undefined) return cached;
+    try {
+      const thread = await bb.sdk.threads.get({
+        threadId,
+        signal: providerEnvDispose.signal,
+      });
+      if (providerEnvDispose.signal.aborted) return false;
+      const isOwned = thread.originPluginId === bb.pluginId;
+      if (threadOriginCache.size >= THREAD_ORIGIN_CACHE_MAX) {
+        const oldestKey = threadOriginCache.keys().next().value;
+        if (oldestKey !== undefined) threadOriginCache.delete(oldestKey);
+      }
+      threadOriginCache.set(threadId, isOwned);
+      return isOwned;
+    } catch (error) {
+      if (!providerEnvDispose.signal.aborted) {
+        const label = error instanceof Error ? error.name : "Error";
+        bb.log.warn(`could not inspect thread origin for ${threadId}: ${label}`);
+      }
+      return false;
+    }
+  }
+
+  async function resolveHostCodexLaunch(
+    hostId: string,
+  ): Promise<Extract<CodexLaunchConfigResult, { kind: "ready" }> | null> {
+    const cached = hostLaunchCache.get(hostId);
+    if (cached !== undefined && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+    if (cached !== undefined) hostLaunchCache.delete(hostId);
+
+    let pending = hostLaunchInFlight.get(hostId);
+    if (pending === undefined) {
+      const signal = AbortSignal.any([
+        providerEnvDispose.signal,
+        AbortSignal.timeout(HOST_LAUNCH_RPC_TIMEOUT_MS),
+      ]);
+      pending = reviewHost.call("codexLaunchConfig", {}, { hostId, signal });
+      hostLaunchInFlight.set(hostId, pending);
+    }
+
+    try {
+      const result = await pending;
+      if (providerEnvDispose.signal.aborted) return null;
+      if (result.kind !== "ready") {
+        bb.log.warn(`lean Codex launch unavailable on ${hostId}: ${result.reason}`);
+        return null;
+      }
+      if (hostLaunchCache.size >= HOST_LAUNCH_CACHE_MAX) {
+        const oldestHostId = hostLaunchCache.keys().next().value;
+        if (oldestHostId !== undefined) hostLaunchCache.delete(oldestHostId);
+      }
+      hostLaunchCache.set(hostId, {
+        expiresAt: Date.now() + HOST_LAUNCH_CACHE_TTL_MS,
+        value: result,
+      });
+      return result;
+    } catch (error) {
+      if (!providerEnvDispose.signal.aborted) {
+        const label = error instanceof Error ? error.name : "Error";
+        bb.log.warn(`codexLaunchConfig failed on ${hostId}: ${label}`);
+      }
+      return null;
+    } finally {
+      if (hostLaunchInFlight.get(hostId) === pending) {
+        hostLaunchInFlight.delete(hostId);
+      }
+    }
+  }
+
+  bb.providers.experimental_contributeEnv("codex", async (context) => {
+    if (context.threadId === null || providerEnvDispose.signal.aborted) return [];
+    if (!(await isSlopCopThread(context.threadId))) return [];
+    const launch = await resolveHostCodexLaunch(context.hostId);
+    if (launch === null) return [];
+    return buildLeanCodexEnvEntries(
+      launch.command,
+      buildLeanCodexArgs(launch.baseArgs, launch.mcpServers),
+    );
+  });
+
+  bb.onDispose(() => {
+    providerEnvDispose.abort();
+    threadOriginCache.clear();
+    hostLaunchCache.clear();
+    hostLaunchInFlight.clear();
+  });
 
   let gh: GhClient = createGhClient("gh");
   let ghLogin: string | null = null;

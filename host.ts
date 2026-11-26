@@ -1,6 +1,7 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { execFile } from "node:child_process";
-import { MAX_ATTACHED_PATCH_BYTES, REVIEW_GIT_OPTIONS, reviewDeltaContract, reviewSha } from "./lib/review-delta";
+import { readCodexMcpServerNames, resolveCodexAppServerLaunch, slopcopHostContract } from "./lib/codex-launch";
+import { MAX_ATTACHED_PATCH_BYTES, REVIEW_GIT_OPTIONS, reviewSha } from "./lib/review-delta";
 
 class GitFailure extends Error {
   constructor(command: string, readonly oversize: boolean) {
@@ -9,7 +10,7 @@ class GitFailure extends Error {
 }
 
 export default experimental_defineHostEntry({
-  contract: reviewDeltaContract,
+  contract: slopcopHostContract,
   handlers: {
     async reviewDelta({ repo, sourcePath, prior, priorBase, base, head }, context) {
       const signal = AbortSignal.any([context.signal, context.lifecycle.signal]);
@@ -158,6 +159,20 @@ export default experimental_defineHostEntry({
         signal.throwIfAborted();
         return { kind: "miss", reason: "git_error", detail: error instanceof Error ? error.message : String(error) };
       }
+    },
+    async codexLaunchConfig(_input, context) {
+      const signal = AbortSignal.any([context.signal, context.lifecycle.signal]);
+      signal.throwIfAborted();
+      const launch = resolveCodexAppServerLaunch();
+      if (!launch.ok) return { kind: "unavailable", reason: launch.reason };
+      const mcp = await readCodexMcpServerNames({ signal });
+      if (!mcp.ok) return { kind: "unavailable", reason: `config_read_${mcp.code}` };
+      return {
+        kind: "ready",
+        command: launch.command,
+        baseArgs: launch.baseArgs,
+        mcpServers: mcp.names,
+      };
     },
   },
 });
