@@ -83,8 +83,12 @@ gate, so trust and conditions still decide, while `--force` lifts all of them.
 A draft-time run counts for dedupe: under `once_per_pr` it is the PR's one
 review, and under `once_per_head_sha` marking the PR ready on the same head does
 not review it again. Every review after a GitHub-verified head, including a
-dispatch or the readiness review, covers only the changes since that head.
-`--force` re-reviews a head in full, even one that was already reviewed.
+dispatch or the readiness review, covers only the changes since that head; when
+a conflict-free merge or rebase refresh makes no PR-owned changes since a
+commented prior review, SlopCop carries that review onto the new head instead
+of running a new thread. Follow-up reviews post must-fix findings only (first
+reviews keep notes). `--force` re-reviews a head in full, even one that was
+already reviewed.
 
 ## Run statuses
 

@@ -4,6 +4,7 @@ import {
   buildHeader,
   buildMarker,
   decorateBody,
+  hasCanonicalMarker,
   hasVisibleHeader,
   parseMarker,
 } from "./marker";
@@ -1153,4 +1154,204 @@ it("identifies each dispatch run in its recovery title", () => {
   const context = { rule: { name: "review", mode: "shadow" as const }, pullRequest: { number: 42 } };
   expect(buildThreadTitle({ ...context, runId: "run_one" })).toBe("SlopCop (shadow): review — PR #42 [run_one]");
   expect(buildThreadTitle({ ...context, runId: "run_two" })).toBe("SlopCop (shadow): review — PR #42 [run_two]");
+});
+
+describe("follow-up notes filtering", () => {
+  const PLACECARD_MARKER_RE = /<!-- slopcop:rule=(\S+)\s+run=(\S+)\s+sha=([0-9a-f]{40})\s+kind=(summary|inline)\s*-->/;
+  const sha = "a".repeat(40);
+  const marker = buildMarker({ rule: "placecard-pr-review", run: "run_1", sha, kind: "summary" });
+
+  it("keeps non-blocking notes on a first review (isFollowUp: false)", () => {
+    const body = [
+      buildHeader("summary", "placecard-pr-review"),
+      "",
+      "No must-fix issues found.",
+      "",
+      "**Follow-up notes**",
+      "- `app.ts:12`: consider extracting a helper.",
+      "",
+      marker,
+    ].join("\n");
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: body,
+      isFollowUp: false,
+    });
+    expect(result?.body).toContain("**Follow-up notes**");
+    expect(result?.body).toContain("consider extracting a helper");
+  });
+
+  it("strips notes sections on a follow-up while preserving off-diff findings, resolved items, and fenced examples", () => {
+    const body = [
+      buildHeader("summary", "placecard-pr-review"),
+      "",
+      "### Findings outside the PR diff",
+      "- `billing.ts:40`: double charge on retry.",
+      "",
+      "Example snippet:",
+      "```md",
+      "**Follow-up notes**",
+      "- kept inside fence",
+      "```",
+      "",
+      "### Resolved since the last review",
+      "- `old.ts:3`: fixed.",
+      "",
+      "**Follow-up notes**",
+      "- `ui.ts:10`: tweak label.",
+      "",
+      "### Notes",
+      "- `ui.ts:20`: style suggestion.",
+      "",
+      "**Notes outside the follow-up changes**",
+      "- `util.ts:5`: naming nit.",
+      "",
+      "### Non-blocking notes:",
+      "- `util.ts:9`: minor docstring nit.",
+      "",
+      marker,
+    ].join("\n");
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: body,
+      isFollowUp: true,
+    });
+    expect(result?.hasOffDiffFindings).toBe(true);
+    expect(result?.body).toContain("double charge on retry");
+    expect(result?.body).toContain("kept inside fence");
+    expect(result?.body).toContain("### Resolved since the last review");
+    expect(result?.body).not.toContain("tweak label");
+    expect(result?.body).not.toContain("style suggestion");
+    expect(result?.body).not.toContain("naming nit");
+    expect(result?.body).not.toContain("minor docstring nit");
+    expect(PLACECARD_MARKER_RE.test(result?.body ?? "")).toBe(true);
+  });
+
+  it("falls back to a single clean sentence when a follow-up summary held only notes", () => {
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: [
+        "**Follow-up notes:**",
+        "- `ui.ts:10`: tweak label.",
+        "**Low priority:**",
+        `- \`ui.ts:11\`: keep optional nit stripped. ${marker}`,
+      ].join("\n"),
+      isFollowUp: true,
+    });
+    expect(result?.hasOffDiffFindings).toBe(false);
+    expect(result?.body).toContain("No must-fix issues found.");
+    expect(result?.body).not.toContain("**Follow-up notes");
+    expect(result?.body).not.toContain("tweak label");
+    expect(result?.body).not.toContain("Low priority");
+    expect(result?.body).not.toContain("keep optional nit stripped");
+    expect(PLACECARD_MARKER_RE.test(result?.body ?? "")).toBe(true);
+  });
+
+  it("preserves the strict Placecard marker syntax alongside a separate carried marker", () => {
+    const carriedBody = decorateBody(
+      `No PR-owned changes since verified head \`aaaaaaa\`; carried prior review.\n\n<!-- slopcop-carried:from=${"b".repeat(40)} -->`,
+      "summary",
+      { rule: "placecard-pr-review", run: "run_2", sha, kind: "summary" },
+    );
+    expect(PLACECARD_MARKER_RE.exec(carriedBody)?.slice(1)).toEqual([
+      "placecard-pr-review",
+      "run_2",
+      sha,
+      "summary",
+    ]);
+    expect(parseMarker(carriedBody)).toEqual({
+      rule: "placecard-pr-review",
+      run: "run_2",
+      sha,
+      kind: "summary",
+    });
+  });
+
+  it("drops fenced code blocks inside notes without leaking and keeps 4-backtick examples with blank lines verbatim", () => {
+    const body = [
+      buildHeader("summary", "placecard-pr-review"),
+      "",
+      "Example with nested fence and blank lines:",
+      "",
+      "````md",
+      "```md",
+      "### Findings outside the PR diff",
+      "",
+      "",
+      "```",
+      "````",
+      "",
+      "### Follow-up notes",
+      "- `ui.ts:1`: optional note.",
+      "",
+      "#### Sub-note",
+      "```ts",
+      "const leaked = 1;",
+      "```",
+      "",
+      "---",
+      "- `ui.ts:2`: trailing note after rule.",
+      "",
+      "### Findings outside the PR diff",
+      "- `billing.ts:40`: real off-diff bug.",
+      "",
+      "### Resolved since the last review",
+      "- `old.ts:3`: fixed.",
+      "",
+      marker,
+    ].join("\n");
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: body,
+      isFollowUp: true,
+    });
+    expect(result?.hasOffDiffFindings).toBe(true);
+    expect(result?.body).not.toContain("const leaked = 1;");
+    expect(result?.body).not.toContain("Sub-note");
+    expect(result?.body).not.toContain("optional note");
+    expect(result?.body).not.toContain("trailing note after rule");
+    expect(result?.body).toContain("````md\n```md\n### Findings outside the PR diff\n\n\n```\n````");
+    expect(result?.body).toContain("### Resolved since the last review");
+    expect(result?.body).toContain("real off-diff bug");
+    expect(PLACECARD_MARKER_RE.test(result?.body ?? "")).toBe(true);
+  });
+
+  it("keeps carried review note and slopcop-carried marker out of Placecard offDiffSection", () => {
+    const body = [
+      decorateBody(
+        "### Findings outside the PR diff\n\n- `billing.ts:12`: double charge. _(carried forward without a re-check)_",
+        "summary",
+        { rule: "placecard-pr-review", run: "run_2", sha, kind: "summary" },
+      ),
+      `<!-- slopcop-carried:from=${"b".repeat(40)} -->`,
+      "",
+      "No PR-owned changes since verified head `bbbbbbb`; carried prior review.",
+    ].join("\n");
+    const match = PLACECARD_MARKER_RE.exec(body);
+    expect(match).not.toBeNull();
+    const prefixLines = body.slice(0, match!.index).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const headingIdx = prefixLines.indexOf("### Findings outside the PR diff");
+    expect(headingIdx).toBeGreaterThanOrEqual(0);
+    expect(prefixLines.slice(headingIdx + 1)).toEqual([
+      "- `billing.ts:12`: double charge. _(carried forward without a re-check)_",
+    ]);
+  });
+
+  it("hasCanonicalMarker requires strict field order and a 40-hex sha", () => {
+    const expected = { rule: "placecard-pr-review", run: "run_2", sha, kind: "inline" as const };
+    expect(hasCanonicalMarker(`body\n<!--  slopcop:rule=placecard-pr-review  run=run_2  sha=${sha}  kind=inline  -->`, expected)).toBe(true);
+    expect(hasCanonicalMarker(`<!-- slopcop:kind=inline sha=${sha} run=run_2 rule=placecard-pr-review -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=placecard-pr-review run=run_2 sha=${sha.slice(0, 7)} kind=inline -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=placecard-pr-review run=run_2 sha=${sha} kind=inline extra=1 -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=other-rule run=run_2 sha=${sha} kind=inline -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=placecard-pr-review run=run_2 sha=${sha} kind=summary -->`, expected)).toBe(false);
+  });
 });

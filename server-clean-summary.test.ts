@@ -40,6 +40,8 @@ function liveRun(): Run {
     status: "reviewing",
     mode: "live",
     detail: null,
+    scopeNote: null,
+    previousVerifiedHead: null,
     threadId: THREAD_ID,
     commentCount: 0,
     startedAt: 1,
@@ -808,6 +810,87 @@ describe("carrying open off-diff findings", () => {
     const { harness } = await finishThreadWith("Review incomplete: worktree is dirty.");
     try {
       expect(posted()).toEqual([]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  async function finishFollowUp(
+    previousVerifiedHead: string | null,
+    finalMessage: string | null,
+    pre?: () => Promise<void> | void,
+  ) {
+    vi.useFakeTimers();
+    const { bb, harness } = createFakePluginHost();
+    harness.inspection.sdk.stub("threads.queue.list", () => []);
+    harness.inspection.sdk.stub("threads.archive", () => ({ ok: true }));
+    await plugin(bb);
+    const store = createStore(bb.storage.database() as never);
+    store.insertRun({ ...liveRun(), previousVerifiedHead });
+    if (pre) await pre();
+
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD_ID, status: "idle" }),
+      lastAssistantText: finalMessage,
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    return { store, harness };
+  }
+
+  it("keeps Follow-up notes on a first review (previousVerifiedHead: null)", async () => {
+    const withNotes = decorateBody("No must-fix issues found.\n\n**Follow-up notes**\n- `a.ts:1`: naming suggestion.", "summary", fields);
+    const { harness } = await finishFollowUp(null, withNotes);
+    try {
+      expect(posted()).toHaveLength(1);
+      expect(posted()[0]!.body).toEqual({ body: withNotes });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("strips Follow-up notes from a follow-up summary before posting", async () => {
+    const withNotes = decorateBody("No must-fix issues found.\n\n**Follow-up notes**\n- `a.ts:1`: naming suggestion.", "summary", fields);
+    const clean = decorateBody("No must-fix issues found.", "summary", fields);
+    const { harness } = await finishFollowUp("b".repeat(40), withNotes);
+    try {
+      expect(posted()).toEqual([{
+        endpoint: "repos/acme/widgets/issues/42/comments",
+        body: { body: clean },
+      }]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("skips posting a notes-only follow-up summary when inline comments exist", async () => {
+    const withNotes = decorateBody("No other issues.\n\n**Follow-up notes**\n- `a.ts:1`: naming suggestion.", "summary", fields);
+    const { harness } = await finishFollowUp("b".repeat(40), withNotes, () => postInline());
+    try {
+      expect(posted()).toEqual([]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("amends a self-posted follow-up summary to strip Follow-up notes", async () => {
+    const withNotes = decorateBody(`${offDiff(ACCESS)}\n\n**Follow-up notes**\n- \`a.ts:1\`: nit.`, "summary", fields);
+    const stripped = decorateBody(offDiff(ACCESS), "summary", fields);
+    issueComments.push({
+      id: 11,
+      body: withNotes,
+      html_url: "https://github.com/acme/widgets/pull/42#issuecomment-11",
+      user: { login: "slopcop-bot" },
+      created_at: new Date(2_000).toISOString(),
+    });
+    const { harness } = await finishFollowUp("b".repeat(40), withNotes);
+    try {
+      expect(writes.filter(write => !write.endpoint.includes("check-runs"))).toEqual([{
+        endpoint: "repos/acme/widgets/issues/comments/11",
+        body: { body: stripped },
+      }]);
+      expect(methods.filter(method => !method.includes("check-runs"))).toContain(
+        "PATCH repos/acme/widgets/issues/comments/11",
+      );
     } finally {
       await harness.lifecycle.dispose();
     }

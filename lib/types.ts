@@ -173,6 +173,8 @@ export interface Run {
   detail: string | null;
   /** Why a review after a verified head had no attached incremental patch. */
   scopeNote: string | null;
+  /** Prior verified head SHA when admitted as a follow-up (or carried) run. */
+  previousVerifiedHead: string | null;
   threadId: string | null;
   commentCount: number;
   startedAt: number;

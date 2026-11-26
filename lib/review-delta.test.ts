@@ -178,3 +178,132 @@ it("returns an oversize patch's tree that another clone reproduces, and names ot
     rmSync(clonePath, { recursive: true, force: true });
   }
 });
+
+it("carries conflict-free rebases with no PR-owned changes and widens rebases with edits or conflicts", async () => {
+  const sourcePath = mkdtempSync(join(tmpdir(), "slopcop-rebase-"));
+  const harness = experimental_createHostEntryHarness(reviewHost);
+  const git = (...args: string[]) => execFileSync("git", ["-C", sourcePath, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const write = (file: string, text: string) => writeFileSync(join(sourcePath, file), text + "\n");
+  const commit = (message: string) => {
+    git("add", "--all");
+    git("commit", "-m", message);
+    return git("rev-parse", "HEAD");
+  };
+  try {
+    git("init", "--initial-branch=master");
+    git("config", "user.name", "Review Fixture");
+    git("config", "user.email", "fixture@example.invalid");
+    git("remote", "add", "origin", "https://github.com/acme/widgets.git");
+    write("base.txt", "initial");
+    write("shared.txt", "shared v0");
+    const priorBase = commit("initial");
+
+    git("switch", "-c", "feature");
+    write("feat.txt", "feature v1");
+    const prior = commit("feature v1");
+
+    git("switch", "master");
+    write("base.txt", "main moved");
+    const base = commit("advance main");
+
+    git("switch", "-c", "rebased-clean", base);
+    write("feat.txt", "feature v1");
+    const cleanRebaseHead = commit("rebased feature cleanly");
+
+    const delta = (p: string, pb: string, b: string, h: string) =>
+      harness.experimental_call("reviewDelta", {
+        repo: "acme/widgets", sourcePath, prior: p, priorBase: pb, base: b, head: h,
+      });
+
+    const cleanResult = await delta(prior, priorBase, base, cleanRebaseHead);
+    expect(cleanResult).toMatchObject({
+      kind: "patch",
+      patchBase64: "",
+      baseMerged: true,
+      tree: git("rev-parse", `${cleanRebaseHead}^{tree}`),
+    });
+
+    write("feat.txt", "feature v1 + edit after rebase");
+    const editedRebaseHead = commit("edit after rebase");
+    expect(await delta(prior, priorBase, base, editedRebaseHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${prior} is not an ancestor of ${editedRebaseHead}`,
+    });
+
+    git("switch", "-c", "feature-conflict", priorBase);
+    write("shared.txt", "feature side");
+    const conflictPrior = commit("feature shared edit");
+
+    git("switch", "master");
+    write("shared.txt", "main side");
+    const conflictBase = commit("main shared edit");
+
+    git("switch", "-c", "rebased-conflict", conflictBase);
+    write("shared.txt", "resolved conflict");
+    const conflictRebaseHead = commit("resolved rebase conflict");
+    expect(await delta(conflictPrior, priorBase, conflictBase, conflictRebaseHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${conflictPrior} is not an ancestor of ${conflictRebaseHead}`,
+    });
+
+    // Dropping two canceling commits (+x then -x) must widen, not carry.
+    git("switch", "-c", "feature-cancel", priorBase);
+    write("cancel.txt", "added");
+    commit("add cancel");
+    write("cancel.txt", "removed");
+    const cancelPrior = commit("revert cancel");
+    git("switch", "-c", "rebased-dropped", base);
+    const droppedHead = git("rev-parse", "HEAD");
+    expect(await delta(cancelPrior, priorBase, base, droppedHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${cancelPrior} is not an ancestor of ${droppedHead}`,
+    });
+
+    // A per-commit conflict whose later commit cancels it out must widen on replay.
+    git("switch", "-c", "feature-step-conflict", priorBase);
+    write("shared.txt", "side A");
+    commit("edit shared");
+    write("shared.txt", "shared v0");
+    const stepConflictPrior = commit("revert shared back");
+    git("switch", "-c", "rebased-step-conflict", conflictBase);
+    write("shared.txt", "temp manual conflict resolution");
+    commit("re-apply conflicting edit manually");
+    write("shared.txt", "main side");
+    const stepConflictHead = commit("re-apply clean end");
+    expect(await delta(stepConflictPrior, priorBase, conflictBase, stepConflictHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${stepConflictPrior} is not an ancestor of ${stepConflictHead}`,
+    });
+
+    // Criss-cross multiple merge bases on a direct descendant must widen.
+    git("switch", "-c", "cc-left", priorBase);
+    write("left.txt", "left");
+    const ccLeft = commit("cc left");
+    git("switch", "-c", "cc-right", priorBase);
+    write("right.txt", "right");
+    const ccRight = commit("cc right");
+    git("switch", "-c", "cc-a", ccLeft);
+    git("merge", "--no-ff", "-m", "merge right into left", ccRight);
+    const ccPrior = git("rev-parse", "HEAD");
+    git("switch", "-c", "cc-b", ccRight);
+    git("merge", "--no-ff", "-m", "merge left into right", ccLeft);
+    const ccBase = git("rev-parse", "HEAD");
+    git("switch", "-c", "cc-head", ccPrior);
+    git("merge", "--no-ff", "-m", "merge ccBase into ccPrior", ccBase);
+    const ccHead = git("rev-parse", "HEAD");
+    expect(await delta(ccPrior, priorBase, ccBase, ccHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `multiple or missing merge bases between ${ccPrior} and ${ccBase}`,
+    });
+  } finally {
+    await harness.experimental_dispose();
+    rmSync(sourcePath, { recursive: true, force: true });
+  }
+});

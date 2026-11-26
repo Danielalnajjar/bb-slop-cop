@@ -24,6 +24,8 @@ function makeReviewRun(overrides: Partial<Run> = {}): Run {
     status: "reviewing",
     mode: "shadow",
     detail: null,
+    scopeNote: null,
+    previousVerifiedHead: null,
     threadId: THREAD_ID,
     commentCount: 0,
     startedAt: 1,

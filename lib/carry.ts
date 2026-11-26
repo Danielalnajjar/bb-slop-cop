@@ -7,10 +7,13 @@
 // them from this rule's earlier summaries, the reviewer re-checks each one,
 // and the finalizer appends any the reviewer did not account for.
 import {
+  isFenceClose,
   markerBelongsToRule,
+  matchFenceOpen,
   OFF_DIFF_FINDINGS_HEADING,
   parseMarker,
   RESOLVED_FINDINGS_HEADING,
+  type FenceState,
 } from "./marker";
 
 export interface CarriedFinding {
@@ -77,23 +80,23 @@ export interface SummarySection {
   items: CarriedFinding[];
 }
 
-const isFence = (line: string) => /^\s*(`{3,}|~{3,})/.exec(line)?.[1]?.[0];
-
 /**
  * Finds the section under `heading`, outside fenced blocks and above the
  * marker. It ends at the next heading, a bold-only line such as
  * `**Follow-up notes**`, or the marker.
  */
 export function findSection(lines: string[], heading: string, markerLine: number): SummarySection | null {
-  let fenceChar: string | undefined;
+  let fence: FenceState | null = null;
   let start = -1;
   for (let index = 0; index < markerLine; index += 1) {
-    const fence = isFence(lines[index]!);
-    if (fence !== undefined) {
-      fenceChar = fenceChar === undefined ? fence : fenceChar === fence ? undefined : fenceChar;
+    const trimmed = lines[index]!.trim();
+    if (fence !== null) {
+      if (isFenceClose(trimmed, fence)) fence = null;
       continue;
     }
-    if (fenceChar === undefined && lines[index]!.trim() === heading) {
+    fence = matchFenceOpen(trimmed);
+    if (fence !== null) continue;
+    if (trimmed === heading) {
       start = index;
       break;
     }
@@ -108,17 +111,21 @@ export function findSection(lines: string[], heading: string, markerLine: number
     if (item !== null) items.push(item);
     current = null;
   };
-  let sectionFence: string | undefined;
+  let sectionFence: FenceState | null = null;
   for (let index = start + 1; index < markerLine; index += 1) {
     const line = lines[index]!;
     const trimmed = line.trim();
     // A fenced block inside the section is quoted text, never a finding.
-    const fence = isFence(line);
-    if (fence !== undefined || sectionFence !== undefined) {
+    if (sectionFence !== null) {
       flush();
-      if (fence !== undefined) {
-        sectionFence = sectionFence === undefined ? fence : sectionFence === fence ? undefined : sectionFence;
-      }
+      if (isFenceClose(trimmed, sectionFence)) sectionFence = null;
+      if (trimmed !== "") end = index + 1;
+      continue;
+    }
+    const opened = matchFenceOpen(trimmed);
+    if (opened !== null) {
+      flush();
+      sectionFence = opened;
       if (trimmed !== "") end = index + 1;
       continue;
     }

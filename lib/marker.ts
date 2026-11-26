@@ -19,9 +19,17 @@ export interface Marker {
 }
 
 const MARKER_PATTERN = /<!--\s*slopcop:([^>]*?)\s*-->/;
+const CANONICAL_MARKER_PATTERN =
+  /<!--\s*slopcop:rule=(\S+)\s+run=(\S+)\s+sha=([0-9a-f]{40})\s+kind=(summary|inline)\s*-->/g;
 export const OFF_DIFF_FINDINGS_HEADING = "### Findings outside the PR diff";
 /** Carried off-diff findings the reviewer re-checked and found fixed or moot. */
 export const RESOLVED_FINDINGS_HEADING = "### Resolved since the last review";
+/** Separate metadata tag identifying a summary carried forward without a new review. */
+export const CARRIED_REVIEW_MARKER_PREFIX = "<!-- slopcop-carried:from=";
+
+export function buildCarriedReviewMarker(fromSha: string): string {
+  return `${CARRIED_REVIEW_MARKER_PREFIX}${fromSha} -->`;
+}
 
 /** Values are constrained so a rule name can never break out of the marker. */
 function sanitize(value: string): string {
@@ -58,6 +66,24 @@ export function parseMarker(body: string): Marker | null {
     return null;
   }
   return { rule, run, sha: fields.get("sha") ?? "", kind };
+}
+
+/** Returns true when `body` contains a canonical marker in strict field order matching rule, run, 40-hex sha, and kind. */
+export function hasCanonicalMarker(
+  body: string,
+  expected: { rule: string; run: string; sha: string; kind: "summary" | "inline" },
+): boolean {
+  for (const match of body.matchAll(CANONICAL_MARKER_PATTERN)) {
+    if (
+      match[1] === expected.rule &&
+      match[2] === expected.run &&
+      match[3] === expected.sha &&
+      match[4] === expected.kind
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -135,4 +161,23 @@ export function attributeBody(body: string, runId: string): Attribution {
   if (marker !== null) return marker.run === runId ? "marker" : null;
   if (hasVisibleHeader(body)) return "header";
   return null;
+}
+
+export interface FenceState {
+  char: "`" | "~";
+  len: number;
+}
+
+/** Matches a CommonMark opening code fence (` ``` ` / `~~~` or longer) on a trimmed line. */
+export function matchFenceOpen(trimmed: string): FenceState | null {
+  const match = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+  if (match === null) return null;
+  const char = match[1]![0]! as "`" | "~";
+  if (char === "`" && (match[2] ?? "").includes("`")) return null;
+  return { char, len: match[1]!.length };
+}
+
+/** True only when a trimmed line closes an active CommonMark fence of the same char and >= length. */
+export function isFenceClose(trimmed: string, fence: FenceState): boolean {
+  return new RegExp(`^${fence.char}{${fence.len},}[ \\t]*$`).test(trimmed);
 }
