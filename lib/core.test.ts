@@ -1154,3 +1154,121 @@ it("identifies each dispatch run in its recovery title", () => {
   expect(buildThreadTitle({ ...context, runId: "run_one" })).toBe("SlopCop (shadow): review — PR #42 [run_one]");
   expect(buildThreadTitle({ ...context, runId: "run_two" })).toBe("SlopCop (shadow): review — PR #42 [run_two]");
 });
+
+describe("follow-up notes filtering", () => {
+  const PLACECARD_MARKER_RE = /<!-- slopcop:rule=(\S+)\s+run=(\S+)\s+sha=([0-9a-f]{40})\s+kind=(summary|inline)\s*-->/;
+  const sha = "a".repeat(40);
+  const marker = buildMarker({ rule: "placecard-pr-review", run: "run_1", sha, kind: "summary" });
+
+  it("keeps non-blocking notes on a first review (isFollowUp: false)", () => {
+    const body = [
+      buildHeader("summary", "placecard-pr-review"),
+      "",
+      "No must-fix issues found.",
+      "",
+      "**Follow-up notes**",
+      "- `app.ts:12`: consider extracting a helper.",
+      "",
+      marker,
+    ].join("\n");
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: body,
+      isFollowUp: false,
+    });
+    expect(result?.body).toContain("**Follow-up notes**");
+    expect(result?.body).toContain("consider extracting a helper");
+  });
+
+  it("strips notes sections on a follow-up while preserving off-diff findings, resolved items, and fenced examples", () => {
+    const body = [
+      buildHeader("summary", "placecard-pr-review"),
+      "",
+      "### Findings outside the PR diff",
+      "- `billing.ts:40`: double charge on retry.",
+      "",
+      "Example snippet:",
+      "```md",
+      "**Follow-up notes**",
+      "- kept inside fence",
+      "```",
+      "",
+      "### Resolved since the last review",
+      "- `old.ts:3`: fixed.",
+      "",
+      "**Follow-up notes**",
+      "- `ui.ts:10`: tweak label.",
+      "",
+      "### Notes",
+      "- `ui.ts:20`: style suggestion.",
+      "",
+      "**Notes outside the follow-up changes**",
+      "- `util.ts:5`: naming nit.",
+      "",
+      "### Non-blocking notes:",
+      "- `util.ts:9`: minor docstring nit.",
+      "",
+      marker,
+    ].join("\n");
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: body,
+      isFollowUp: true,
+    });
+    expect(result?.hasOffDiffFindings).toBe(true);
+    expect(result?.body).toContain("double charge on retry");
+    expect(result?.body).toContain("kept inside fence");
+    expect(result?.body).toContain("### Resolved since the last review");
+    expect(result?.body).not.toContain("tweak label");
+    expect(result?.body).not.toContain("style suggestion");
+    expect(result?.body).not.toContain("naming nit");
+    expect(result?.body).not.toContain("minor docstring nit");
+    expect(PLACECARD_MARKER_RE.test(result?.body ?? "")).toBe(true);
+  });
+
+  it("falls back to a single clean sentence when a follow-up summary held only notes", () => {
+    const result = summaryToPost({
+      rule: "placecard-pr-review",
+      runId: "run_1",
+      sha,
+      finalMessage: [
+        "**Follow-up notes:**",
+        "- `ui.ts:10`: tweak label.",
+        "**Low priority:**",
+        `- \`ui.ts:11\`: keep optional nit stripped. ${marker}`,
+      ].join("\n"),
+      isFollowUp: true,
+    });
+    expect(result?.hasOffDiffFindings).toBe(false);
+    expect(result?.body).toContain("No must-fix issues found.");
+    expect(result?.body).not.toContain("**Follow-up notes");
+    expect(result?.body).not.toContain("tweak label");
+    expect(result?.body).not.toContain("Low priority");
+    expect(result?.body).not.toContain("keep optional nit stripped");
+    expect(PLACECARD_MARKER_RE.test(result?.body ?? "")).toBe(true);
+  });
+
+  it("preserves the strict Placecard marker syntax alongside a separate carried marker", () => {
+    const carriedBody = decorateBody(
+      `No PR-owned changes since verified head \`aaaaaaa\`; carried prior review.\n\n<!-- slopcop-carried:from=${"b".repeat(40)} -->`,
+      "summary",
+      { rule: "placecard-pr-review", run: "run_2", sha, kind: "summary" },
+    );
+    expect(PLACECARD_MARKER_RE.exec(carriedBody)?.slice(1)).toEqual([
+      "placecard-pr-review",
+      "run_2",
+      sha,
+      "summary",
+    ]);
+    expect(parseMarker(carriedBody)).toEqual({
+      rule: "placecard-pr-review",
+      run: "run_2",
+      sha,
+      kind: "summary",
+    });
+  });
+});

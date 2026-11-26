@@ -178,3 +178,79 @@ it("returns an oversize patch's tree that another clone reproduces, and names ot
     rmSync(clonePath, { recursive: true, force: true });
   }
 });
+
+it("carries conflict-free rebases with no PR-owned changes and widens rebases with edits or conflicts", async () => {
+  const sourcePath = mkdtempSync(join(tmpdir(), "slopcop-rebase-"));
+  const harness = experimental_createHostEntryHarness(reviewHost);
+  const git = (...args: string[]) => execFileSync("git", ["-C", sourcePath, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const write = (file: string, text: string) => writeFileSync(join(sourcePath, file), text + "\n");
+  const commit = (message: string) => {
+    git("add", "--all");
+    git("commit", "-m", message);
+    return git("rev-parse", "HEAD");
+  };
+  try {
+    git("init", "--initial-branch=master");
+    git("config", "user.name", "Review Fixture");
+    git("config", "user.email", "fixture@example.invalid");
+    git("remote", "add", "origin", "https://github.com/acme/widgets.git");
+    write("base.txt", "initial");
+    write("shared.txt", "shared v0");
+    const priorBase = commit("initial");
+
+    git("switch", "-c", "feature");
+    write("feat.txt", "feature v1");
+    const prior = commit("feature v1");
+
+    git("switch", "master");
+    write("base.txt", "main moved");
+    const base = commit("advance main");
+
+    git("switch", "-c", "rebased-clean", base);
+    write("feat.txt", "feature v1");
+    const cleanRebaseHead = commit("rebased feature cleanly");
+
+    const delta = (p: string, pb: string, b: string, h: string) =>
+      harness.experimental_call("reviewDelta", {
+        repo: "acme/widgets", sourcePath, prior: p, priorBase: pb, base: b, head: h,
+      });
+
+    const cleanResult = await delta(prior, priorBase, base, cleanRebaseHead);
+    expect(cleanResult).toMatchObject({
+      kind: "patch",
+      patchBase64: "",
+      baseMerged: true,
+      tree: git("rev-parse", `${cleanRebaseHead}^{tree}`),
+    });
+
+    write("feat.txt", "feature v1 + edit after rebase");
+    const editedRebaseHead = commit("edit after rebase");
+    expect(await delta(prior, priorBase, base, editedRebaseHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${prior} is not an ancestor of ${editedRebaseHead}`,
+    });
+
+    git("switch", "-c", "feature-conflict", priorBase);
+    write("shared.txt", "feature side");
+    const conflictPrior = commit("feature shared edit");
+
+    git("switch", "master");
+    write("shared.txt", "main side");
+    const conflictBase = commit("main shared edit");
+
+    git("switch", "-c", "rebased-conflict", conflictBase);
+    write("shared.txt", "resolved conflict");
+    const conflictRebaseHead = commit("resolved rebase conflict");
+    expect(await delta(conflictPrior, priorBase, conflictBase, conflictRebaseHead)).toEqual({
+      kind: "miss",
+      reason: "history_changed",
+      detail: `reviewed head ${conflictPrior} is not an ancestor of ${conflictRebaseHead}`,
+    });
+  } finally {
+    await harness.experimental_dispose();
+    rmSync(sourcePath, { recursive: true, force: true });
+  }
+});

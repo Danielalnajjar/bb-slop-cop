@@ -28,6 +28,8 @@ function makeReviewRun(overrides: Partial<Run> = {}): Run {
     status: "reviewing",
     mode: "shadow",
     detail: null,
+    scopeNote: null,
+    previousVerifiedHead: null,
     threadId: THREAD_ID,
     commentCount: 0,
     startedAt: 1,
@@ -70,6 +72,13 @@ function stubGh(options: {
   mergeBase?: () => string;
   pollOpen?: () => boolean;
   pollFiles?: () => string[] | null;
+  issueComments?: {
+    id: number;
+    body: string;
+    user?: { login: string };
+    html_url?: string;
+    created_at?: string;
+  }[];
   reviewComments?: () => { id: number; body: string; path: string; line: number }[];
   existingChecks?: () => { id: number; status: string; external_id: string }[];
 } = {}): void {
@@ -123,6 +132,8 @@ function stubGh(options: {
       response = JSON.stringify({ check_runs: options.existingChecks() });
     } else if (options.reviewComments && args.some(arg => arg.includes("/pulls/7/comments?"))) {
       response = JSON.stringify(options.reviewComments());
+    } else if (options.issueComments && args.some(arg => arg.includes("/issues/7/comments"))) {
+      response = JSON.stringify(options.issueComments);
     } else if (args.some((arg) => arg.includes("pulls?"))) {
       capturedHead = options.pollHead?.() ?? "sha-7";
       response =
@@ -139,7 +150,19 @@ function stubGh(options: {
   }) as unknown as typeof execFile);
 }
 
-function stubCheckWrites(distinctIds = false): Record<string, unknown>[] {
+function stubCheckWrites(
+  distinctIds = false,
+  extra?: {
+    issueComments?: {
+      id: number;
+      body: string;
+      user?: { login: string };
+      html_url?: string;
+      created_at?: string;
+    }[];
+    failCommentPost?: boolean;
+  },
+): Record<string, unknown>[] {
   const writes: Record<string, unknown>[] = [];
   let nextId = 47;
   vi.mocked(spawn).mockImplementation(((_bin: string, args: string[]) => {
@@ -151,8 +174,24 @@ function stubCheckWrites(distinctIds = false): Record<string, unknown>[] {
     child.stderr = new EventEmitter();
     child.kill = () => {};
     child.stdin = { on: () => {}, end: (body) => {
-      writes.push({ ...JSON.parse(body), endpoint: args[3] });
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      const endpoint = args[3];
+      writes.push({ ...parsed, endpoint });
+      if (extra?.failCommentPost && endpoint?.includes("/issues/") && endpoint.endsWith("/comments")) {
+        child.stderr.emit("data", Buffer.from("502 Bad Gateway"));
+        child.emit("close", 1);
+        return;
+      }
       const id = distinctIds && args.includes("POST") ? nextId++ : 47;
+      if (extra?.issueComments && args.includes("POST") && endpoint?.endsWith("/comments")) {
+        extra.issueComments.push({
+          id,
+          body: String(parsed.body ?? ""),
+          user: { login: "test-user" },
+          html_url: `https://github.com/acme/widgets/issues/7#issuecomment-${id}`,
+          created_at: new Date().toISOString(),
+        });
+      }
       child.stdout.emit("data", Buffer.from(JSON.stringify({ id })));
       child.emit("close", 0);
     } };
@@ -1812,8 +1851,9 @@ describe("automatic review ranges", () => {
   ])("handles a $scenario using only the computed PR-owned patch", async ({ patch }) => {
     vi.useFakeTimers();
     let head = priorHead;
-    stubGh({ readyPullRequest: true, pollHead: () => head, pollDraft: () => false });
-    const writes = stubCheckWrites(true);
+    const issueComments: NonNullable<Parameters<typeof stubGh>[0]["issueComments"]> = [];
+    stubGh({ readyPullRequest: true, pollHead: () => head, pollDraft: () => false, issueComments });
+    const writes = stubCheckWrites(true, { issueComments });
     const { bb, harness } = reviewHost(patchResult(patch, true));
     try {
       await plugin(bb);
@@ -1830,12 +1870,14 @@ describe("automatic review ranges", () => {
         if (patch === "") {
           expect(spawns).toEqual([]);
           expect(uploads).toEqual([]);
+          expect(issueComments).toHaveLength(1);
+          expect(issueComments[0]?.body).toContain(`<!-- slopcop-carried:from=${priorHead} -->`);
+          expect(issueComments[0]?.body).toContain(`sha=${pushedHead} kind=summary -->`);
           expect(writes).toContainEqual(expect.objectContaining({
             head_sha: pushedHead, status: "completed", conclusion: "success",
-            output: expect.objectContaining({ summary: `Base merge with no PR-owned change since reviewed head ${priorHead}.` }),
           }));
           expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
-            status: "no_pr_changes", threadId: null, finishedAt: expect.any(Number),
+            status: "commented", threadId: null, commentCount: 1, previousVerifiedHead: priorHead, finishedAt: expect.any(Number),
           });
         } else {
           expect(spawns).toHaveLength(1);
@@ -2019,10 +2061,11 @@ describe("automatic review ranges", () => {
     }
   });
 
-  it.each(["cli", "json", "panel"] as const)("reports an empty %s dispatch and reviews a forced one in full", async (surface) => {
+  it.each(["cli", "json", "panel"] as const)("carries an unchanged %s dispatch and reviews a forced one in full", async (surface) => {
     vi.useFakeTimers();
-    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false });
-    stubCheckWrites(true);
+    const issueComments: NonNullable<Parameters<typeof stubGh>[0]["issueComments"]> = [];
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false, issueComments });
+    stubCheckWrites(true, { issueComments });
     const { bb, harness } = reviewHost(patchResult("", true));
     try {
       await plugin(bb);
@@ -2032,20 +2075,24 @@ describe("automatic review ranges", () => {
       const service = harness.behavior.runService("watcher");
       try {
         await vi.advanceTimersByTimeAsync(0);
-        const empty = `Base merge with no PR-owned change since reviewed head ${priorHead}.`;
         if (surface === "cli") {
           const unforced = await harness.behavior.runCli(["dispatch", ruleName, "7"]);
           expect(unforced.exitCode).toBe(0);
-          expect(unforced.stdout).toContain(`Not reviewed ${ruleName} for #7. head=${pushedHead}`);
-          expect(unforced.stdout).toContain(empty);
+          expect(unforced.stdout).toContain(`Carried ${ruleName} for #7 (live mode). head=${pushedHead} from=${priorHead}`);
         } else if (surface === "json") {
           const unforced = await harness.behavior.runCli(["dispatch", ruleName, "7", "--json"]);
-          expect(JSON.parse(unforced.stdout!)).toMatchObject({ threadId: null, skippedReason: null, noChangesReason: empty });
+          expect(JSON.parse(unforced.stdout!)).toMatchObject({
+            threadId: null, skippedReason: null, carriedFrom: priorHead,
+          });
         } else {
           expect(await harness.behavior.callRpc("dispatchNow", { ruleId, prNumber: 7 }))
-            .toMatchObject({ threadId: null, blockedReason: empty });
+            .toMatchObject({ threadId: null, blockedReason: null });
         }
-        expect(store.listRuns().find(run => run.headSha === pushedHead)?.status).toBe("no_pr_changes");
+        expect(issueComments).toHaveLength(1);
+        expect(issueComments[0]?.body).toContain(`<!-- slopcop-carried:from=${priorHead} -->`);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "commented", commentCount: 1, previousVerifiedHead: priorHead,
+        });
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
         expect((await harness.behavior.runCli(["dispatch", ruleName, "7", "--force"])).exitCode).toBe(0);
         expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
@@ -2053,6 +2100,118 @@ describe("automatic review ranges", () => {
         expect(promptAt(harness, 0)).toContain(`Inspect \`git diff ${fullBase}...${pushedHead}\``);
         expect(store.listRuns().find(run => run.status === "reviewing")?.scopeNote)
           .toBe("forced: a forced dispatch reviews the full diff");
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("carries still-open off-diff findings forward when carrying an unchanged refresh", async () => {
+    vi.useFakeTimers();
+    const issueComments: NonNullable<Parameters<typeof stubGh>[0]["issueComments"]> = [{
+      id: 9,
+      body: [
+        `🚨 SlopCop \`${ruleName}\` summary — generated by AI`,
+        "",
+        "### Findings outside the PR diff",
+        "- `billing.ts:12`: double charge on retry.",
+        "",
+        `<!-- slopcop:rule=${ruleName} run=run_verified sha=${priorHead} kind=summary -->`,
+      ].join("\n"),
+      user: { login: "test-user" },
+      html_url: "https://github.com/acme/widgets/issues/7#issuecomment-9",
+      created_at: new Date(1_000).toISOString(),
+    }];
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false, issueComments });
+    stubCheckWrites(true, { issueComments });
+    const { bb, harness } = reviewHost(patchResult("", true));
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        expect(issueComments).toHaveLength(2);
+        const carriedBody = issueComments[1]!.body;
+        expect(carriedBody).toContain("### Findings outside the PR diff");
+        expect(carriedBody).toContain("- `billing.ts:12`: double charge on retry. _(carried forward without a re-check)_");
+        expect(carriedBody).toContain(`<!-- slopcop-carried:from=${priorHead} -->`);
+        expect(carriedBody).toContain(`sha=${pushedHead} kind=summary -->`);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "commented", commentCount: 1, threadId: null,
+        });
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("does not carry a commented_partial prior review and instead runs a full review", async () => {
+    vi.useFakeTimers();
+    const issueComments: NonNullable<Parameters<typeof stubGh>[0]["issueComments"]> = [];
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false, issueComments });
+    stubCheckWrites(true, { issueComments });
+    const { bb, harness } = reviewHost(patchResult("", true));
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId, { status: "commented_partial" });
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+        expect(promptAt(harness, 0)).toContain("- Review scope: full");
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "reviewing",
+          scopeNote: `unverified_prior: prior review of ${priorHead} had status commented_partial`,
+        });
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("marks a carried live review failed without spawning a thread when posting to GitHub fails", async () => {
+    vi.useFakeTimers();
+    const issueComments: NonNullable<Parameters<typeof stubGh>[0]["issueComments"]> = [];
+    stubGh({ readyPullRequest: true, pollHead: () => pushedHead, pollDraft: () => false, issueComments });
+    const writes = stubCheckWrites(true, { issueComments, failCommentPost: true });
+    const { bb, harness } = reviewHost(patchResult("", true));
+    try {
+      await plugin(bb);
+      const ruleId = await saveRule(harness, { mode: "live" });
+      const store = createStore(bb.storage.database() as never);
+      insertBaseline(store, ruleId);
+      const service = harness.behavior.runService("watcher");
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect((await harness.behavior.runCli(["dispatch", ruleName, "7"])).exitCode).toBe(0);
+        expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+        expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
+          status: "failed",
+          threadId: null,
+          finishedAt: expect.any(Number),
+        });
+        expect(writes).toContainEqual(expect.objectContaining({
+          head_sha: pushedHead,
+          status: "completed",
+          conclusion: "failure",
+        }));
       } finally {
         service.controller.abort();
         await service.done;
@@ -2245,7 +2404,9 @@ describe("automatic review ranges", () => {
         await vi.advanceTimersByTimeAsync(0);
         head = emptyHead;
         await vi.advanceTimersByTimeAsync(15_000);
-        expect(store.listRuns().find(run => run.headSha === emptyHead)?.status).toBe("no_pr_changes");
+        expect(store.listRuns().find(run => run.headSha === emptyHead)).toMatchObject({
+          status: "shadowed", threadId: null, commentCount: 1,
+        });
         release();
         expect((await stale).exitCode).toBe(0);
         expect(store.listRuns().find(run => run.headSha === pushedHead)).toMatchObject({
@@ -2284,7 +2445,9 @@ describe("automatic review ranges", () => {
         await vi.advanceTimersByTimeAsync(0);
         head = emptyHead;
         await vi.advanceTimersByTimeAsync(15_000);
-        expect(store.listRuns().find(run => run.headSha === emptyHead)?.status).toBe("no_pr_changes");
+        expect(store.listRuns().find(run => run.headSha === emptyHead)).toMatchObject({
+          status: "shadowed", threadId: null, commentCount: 1,
+        });
         expect(store.getDeferredReview(ruleId, "acme/widgets", 7)).toBeNull();
         release();
         expect((await stale).exitCode).toBe(0);

@@ -22,6 +22,12 @@ const MARKER_PATTERN = /<!--\s*slopcop:([^>]*?)\s*-->/;
 export const OFF_DIFF_FINDINGS_HEADING = "### Findings outside the PR diff";
 /** Carried off-diff findings the reviewer re-checked and found fixed or moot. */
 export const RESOLVED_FINDINGS_HEADING = "### Resolved since the last review";
+/** Separate metadata tag identifying a summary carried forward without a new review. */
+export const CARRIED_REVIEW_MARKER_PREFIX = "<!-- slopcop-carried:from=";
+
+export function buildCarriedReviewMarker(fromSha: string): string {
+  return `${CARRIED_REVIEW_MARKER_PREFIX}${fromSha} -->`;
+}
 
 /** Values are constrained so a rule name can never break out of the marker. */
 function sanitize(value: string): string {

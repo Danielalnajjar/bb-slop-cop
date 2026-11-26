@@ -220,12 +220,82 @@ export function incompleteReviewReason(finalMessage: string | null): string | nu
  * and with no usable body SlopCop writes the summary itself, so a carried
  * finding can only leave the latest summary through a reviewer's resolution.
  */
+const FOLLOW_UP_NOTES_HEADING =
+  /^(?:#{1,6}\s+(?:follow-up notes|non-blocking notes|notes(?:\s+outside\s+[^:\n]*)?)|(?:\*\*)(?:follow-up notes|non-blocking notes|notes(?:\s+outside\s+[^*:\n]*)?):?(?:\*\*))(?:\s*[:—-].*|\s*\([^)]*\)\s*:?)?\s*$/i;
+
+/** Drops non-must-fix notes blocks outside code fences on follow-up summaries. */
+export function stripFollowUpNotes(
+  lines: string[],
+  markerText: string,
+  rule: string,
+  allowEmpty: boolean,
+): string[] {
+  const markerLineIndex = lines.findIndex(line => line.includes(markerText));
+  const headEnd = markerLineIndex === -1 ? lines.length : markerLineIndex;
+  const kept: string[] = [];
+  let fence: string | null = null;
+  let skippingNotes = false;
+
+  for (const line of lines.slice(0, headEnd)) {
+    const trimmed = line.trim();
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (fenceMatch !== null) {
+      if (fence === null) fence = fenceMatch[1]![0]!;
+      else if (trimmed.startsWith(fence.repeat(3))) fence = null;
+      if (!skippingNotes) kept.push(line);
+      continue;
+    }
+    if (fence === null) {
+      if (FOLLOW_UP_NOTES_HEADING.test(trimmed)) {
+        skippingNotes = true;
+        continue;
+      }
+      if (skippingNotes) {
+        if (
+          /^#{1,6}\s+\S/.test(trimmed) ||
+          trimmed.startsWith("<!--") ||
+          /^[-*_]{3,}$/.test(trimmed)
+        ) {
+          skippingNotes = false;
+        } else {
+          continue;
+        }
+      }
+    }
+    kept.push(line);
+  }
+
+  const collapsed: string[] = [];
+  for (const line of kept) {
+    if (line.trim() === "" && (collapsed.length === 0 || collapsed.at(-1)!.trim() === "")) continue;
+    collapsed.push(line);
+  }
+  while (collapsed.length > 0 && collapsed.at(-1)!.trim() === "") collapsed.pop();
+
+  const hasBodyContent = collapsed.some(line => {
+    const t = line.trim();
+    return t !== "" && !(t.startsWith("🚨") && hasVisibleHeader(t)) && !t.startsWith("<!--");
+  });
+  if (!hasBodyContent && !allowEmpty) {
+    if (collapsed.length === 0) collapsed.push(buildHeader("summary", rule));
+    collapsed.push("", "No must-fix issues found.");
+  }
+
+  if (markerLineIndex === -1) return collapsed;
+  const markerLine = lines[markerLineIndex]!;
+  const tailLines = skippingNotes
+    ? [markerLine.slice(markerLine.indexOf(markerText)), ...lines.slice(markerLineIndex + 1)]
+    : lines.slice(markerLineIndex);
+  return [...collapsed, ...(collapsed.length === 0 ? [] : [""]), ...tailLines];
+}
+
 export function summaryToPost(options: {
   rule: string;
   runId: string;
   sha: string;
   finalMessage: string | null;
   carried?: CarriedFinding[];
+  isFollowUp?: boolean;
 }): { body: string; hasOffDiffFindings: boolean; appended: number } | null {
   if (incompleteReviewReason(options.finalMessage) !== null) return null;
   const carried = options.carried ?? [];
@@ -250,8 +320,12 @@ export function summaryToPost(options: {
     };
   }
   const markerText = buildMarker(canonicalMarker);
+  const rawLines = restampMarker(body, canonicalMarker).split(/\r?\n/);
+  const filteredLines = options.isFollowUp === true
+    ? stripFollowUpNotes(rawLines, markerText, options.rule, carried.length > 0)
+    : rawLines;
   const { lines, appended } = appendUnaccounted(
-    restampMarker(body, canonicalMarker).split(/\r?\n/),
+    filteredLines,
     markerText,
     carried,
   );

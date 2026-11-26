@@ -23,6 +23,7 @@ export type IncrementalMiss =
   | "history_changed"
   | "base_conflict"
   | "base_moved"
+  | "unverified_prior"
   | "forced";
 
 export function formatIncrementalMiss(reason: IncrementalMiss, detail: string): string {

@@ -157,6 +157,7 @@ export const MIGRATIONS: string[] = [
   `UPDATE review_provisioning SET waiting_options = json_remove(waiting_options, '$.reviewInputs')
    WHERE waiting_options IS NOT NULL`,
   `ALTER TABLE runs ADD COLUMN scope_note TEXT`,
+  `ALTER TABLE runs ADD COLUMN previous_verified_head TEXT`,
 ];
 
 type Row = Record<string, unknown>;
@@ -248,6 +249,7 @@ export function rowToRun(row: Row): Run {
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     detail: typeof row.detail === "string" ? row.detail : null,
     scopeNote: typeof row.scope_note === "string" ? row.scope_note : null,
+    previousVerifiedHead: typeof row.previous_verified_head === "string" ? row.previous_verified_head : null,
     threadId: typeof row.thread_id === "string" ? row.thread_id : null,
     commentCount: num(row, "comment_count"),
     startedAt: num(row, "started_at"),
@@ -510,9 +512,9 @@ export function createStore(db: Database) {
     insertRun(run: Run): void {
       db.prepare(
         `INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
-           pr_author, head_sha, status, mode, detail, thread_id, comment_count,
-           started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           pr_author, head_sha, status, mode, detail, previous_verified_head,
+           thread_id, comment_count, started_at, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         run.id,
         run.ruleId,
@@ -525,6 +527,7 @@ export function createStore(db: Database) {
         run.status,
         run.mode,
         run.detail,
+        run.previousVerifiedHead,
         run.threadId,
         run.commentCount,
         run.startedAt,
@@ -689,9 +692,9 @@ export function createStore(db: Database) {
       return row !== undefined;
     },
 
-    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { headSha: string; baseSha: string | null } | null {
+    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { headSha: string; baseSha: string | null; status: RunStatus } | null {
       const row = db.prepare(
-        `SELECT head_sha, review_base_sha FROM runs
+        `SELECT head_sha, review_base_sha, status FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ? AND ${VERIFIED_REVIEW}
            AND head_sha != ''
          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
@@ -700,6 +703,7 @@ export function createStore(db: Database) {
       return {
         headSha: text(row, "head_sha"),
         baseSha: typeof row.review_base_sha === "string" ? row.review_base_sha : null,
+        status: text(row, "status", "commented") as RunStatus,
       };
     },
 
@@ -709,6 +713,10 @@ export function createStore(db: Database) {
 
     setScopeNote(runId: string, note: string | null): void {
       db.prepare(`UPDATE runs SET scope_note = ? WHERE id = ?`).run(note, runId);
+    },
+
+    setPreviousVerifiedHead(runId: string, headSha: string | null): void {
+      db.prepare(`UPDATE runs SET previous_verified_head = ? WHERE id = ?`).run(headSha, runId);
     },
 
     listComments(runId: string): RunComment[] {
