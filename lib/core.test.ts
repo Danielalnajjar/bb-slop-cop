@@ -4,6 +4,7 @@ import {
   buildHeader,
   buildMarker,
   decorateBody,
+  hasCanonicalMarker,
   hasVisibleHeader,
   parseMarker,
 } from "./marker";
@@ -1342,5 +1343,15 @@ describe("follow-up notes filtering", () => {
     expect(prefixLines.slice(headingIdx + 1)).toEqual([
       "- `billing.ts:12`: double charge. _(carried forward without a re-check)_",
     ]);
+  });
+
+  it("hasCanonicalMarker requires strict field order and a 40-hex sha", () => {
+    const expected = { rule: "placecard-pr-review", run: "run_2", sha, kind: "inline" as const };
+    expect(hasCanonicalMarker(`body\n<!--  slopcop:rule=placecard-pr-review  run=run_2  sha=${sha}  kind=inline  -->`, expected)).toBe(true);
+    expect(hasCanonicalMarker(`<!-- slopcop:kind=inline sha=${sha} run=run_2 rule=placecard-pr-review -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=placecard-pr-review run=run_2 sha=${sha.slice(0, 7)} kind=inline -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=placecard-pr-review run=run_2 sha=${sha} kind=inline extra=1 -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=other-rule run=run_2 sha=${sha} kind=inline -->`, expected)).toBe(false);
+    expect(hasCanonicalMarker(`<!-- slopcop:rule=placecard-pr-review run=run_2 sha=${sha} kind=summary -->`, expected)).toBe(false);
   });
 });

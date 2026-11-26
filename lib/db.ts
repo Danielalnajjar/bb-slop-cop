@@ -692,9 +692,9 @@ export function createStore(db: Database) {
       return row !== undefined;
     },
 
-    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { id: string; headSha: string; baseSha: string | null; status: RunStatus; finishedAt: number | null } | null {
+    latestVerifiedReview(ruleId: string, repo: string, prNumber: number): { id: string; ruleName: string; headSha: string; baseSha: string | null; status: RunStatus; finishedAt: number | null } | null {
       const row = db.prepare(
-        `SELECT id, head_sha, review_base_sha, status, finished_at FROM runs
+        `SELECT id, rule_name, head_sha, review_base_sha, status, finished_at FROM runs
          WHERE rule_id = ? AND repo = ? AND pr_number = ? AND ${VERIFIED_REVIEW}
            AND head_sha != ''
          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
@@ -702,6 +702,7 @@ export function createStore(db: Database) {
       if (row === undefined) return null;
       return {
         id: text(row, "id"),
+        ruleName: text(row, "rule_name"),
         headSha: text(row, "head_sha"),
         baseSha: typeof row.review_base_sha === "string" ? row.review_base_sha : null,
         status: text(row, "status", "commented") as RunStatus,

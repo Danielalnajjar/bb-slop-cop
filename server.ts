@@ -29,10 +29,9 @@ import {
   buildCarriedReviewMarker,
   buildMarker,
   decorateBody,
-  markerBelongsToRule,
+  hasCanonicalMarker,
   markerRuleName,
   OFF_DIFF_FINDINGS_HEADING,
-  parseAllMarkers,
   parseMarker,
 } from "./lib/marker";
 import { collectPriorComments } from "./lib/prior";
@@ -496,6 +495,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (verifiedPrior.status !== "commented" || verifiedPrior.finishedAt === null) {
         return `prior review of ${verifiedPrior.headSha} had status ${verifiedPrior.status}`;
       }
+      if (verifiedPrior.ruleName !== targetRule.name) {
+        return `prior review ${verifiedPrior.id} ran under rule ${verifiedPrior.ruleName}, not ${targetRule.name}`;
+      }
       const recorded = store.listComments(verifiedPrior.id);
       if (recorded.length === 0) {
         return `prior review ${verifiedPrior.id} recorded no GitHub comments`;
@@ -511,23 +513,25 @@ export default async function plugin(bb: BbPluginApi) {
         if (ghLogin === null) {
           return "could not determine authenticated GitHub login to verify prior review";
         }
-        const [issues, reviewComments, reviews] = await waitForWork(() => Promise.all([
+        const [issues, reviewComments] = await waitForWork(() => Promise.all([
           gh.listIssueComments(targetRule.repo, targetPrNumber),
           gh.listReviewComments(targetRule.repo, targetPrNumber),
-          gh.listReviews(targetRule.repo, targetPrNumber),
         ]));
-        const liveSummaries = [...issues, ...reviews];
         for (const entry of recorded) {
-          const pool = entry.kind === "inline" ? reviewComments : liveSummaries;
+          if (entry.kind !== "summary" && entry.kind !== "inline") {
+            return `prior review ${verifiedPrior.id} has unsupported comment kind ${entry.kind}`;
+          }
+          const entryKind: "summary" | "inline" = entry.kind;
+          const pool = entryKind === "inline" ? reviewComments : issues;
           const matched = pool.find(comment =>
             comment.id === entry.githubId &&
             comment.author === ghLogin &&
-            parseAllMarkers(comment.body).some(marker =>
-              markerBelongsToRule(marker, targetRule.name) &&
-              marker.run === verifiedPrior.id &&
-              marker.sha === verifiedPrior.headSha &&
-              marker.kind === entry.kind
-            ),
+            hasCanonicalMarker(comment.body, {
+              rule: targetRule.name,
+              run: verifiedPrior.id,
+              sha: verifiedPrior.headSha,
+              kind: entryKind,
+            }),
           );
           if (matched === undefined) {
             return `prior review ${verifiedPrior.id} comment ${entry.githubId} (${entry.kind}) could not be verified on GitHub for head ${verifiedPrior.headSha}`;

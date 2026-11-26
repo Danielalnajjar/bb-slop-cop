@@ -19,6 +19,8 @@ export interface Marker {
 }
 
 const MARKER_PATTERN = /<!--\s*slopcop:([^>]*?)\s*-->/;
+const CANONICAL_MARKER_PATTERN =
+  /<!--\s*slopcop:rule=(\S+)\s+run=(\S+)\s+sha=([0-9a-f]{40})\s+kind=(summary|inline)\s*-->/g;
 export const OFF_DIFF_FINDINGS_HEADING = "### Findings outside the PR diff";
 /** Carried off-diff findings the reviewer re-checked and found fixed or moot. */
 export const RESOLVED_FINDINGS_HEADING = "### Resolved since the last review";
@@ -66,15 +68,22 @@ export function parseMarker(body: string): Marker | null {
   return { rule, run, sha: fields.get("sha") ?? "", kind };
 }
 
-/** Parses every valid SlopCop marker embedded in a comment body. */
-export function parseAllMarkers(body: string): Marker[] {
-  const globalPattern = new RegExp(MARKER_PATTERN.source, "g");
-  const markers: Marker[] = [];
-  for (const match of body.matchAll(globalPattern)) {
-    const parsed = parseMarker(match[0]);
-    if (parsed !== null) markers.push(parsed);
+/** Returns true when `body` contains a canonical marker in strict field order matching rule, run, 40-hex sha, and kind. */
+export function hasCanonicalMarker(
+  body: string,
+  expected: { rule: string; run: string; sha: string; kind: "summary" | "inline" },
+): boolean {
+  for (const match of body.matchAll(CANONICAL_MARKER_PATTERN)) {
+    if (
+      match[1] === expected.rule &&
+      match[2] === expected.run &&
+      match[3] === expected.sha &&
+      match[4] === expected.kind
+    ) {
+      return true;
+    }
   }
-  return markers;
+  return false;
 }
 
 /**
